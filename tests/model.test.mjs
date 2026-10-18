@@ -226,7 +226,7 @@ test('validation normalizes values, drops unknown fields and repairs dangling ac
   assert.equal(result.masterOpacity, 1); assert.equal(result.speed, 1); assert.ok(!('secret' in result));
   const clip = result.layers[0].clips[result.decks[0].id][0];
   assert.ok(clip.outPoint > clip.inPoint); assert.equal(clip.duration, 0.01);
-  assert.equal(clip.effects.length, 1); assert.equal(clip.effects[0].amount, 0.5);
+  assert.equal(clip.effects.length, 1); assert.equal(clip.effects[0].params.amount, 0.5);
   assert.equal(result.layers[0].activeClipId, null);
 });
 

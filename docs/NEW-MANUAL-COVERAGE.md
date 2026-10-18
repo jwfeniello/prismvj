@@ -6,6 +6,7 @@ This is a live coverage map, not a claim of feature parity. Existing detailed te
 
 | Newer manual area | PDF pages | Current status and next gap |
 | --- | --- | --- |
+| **2026-10-18 update** | — | Groups, the effect/source catalogs, ISF, audio effects, parameter animation/FFT/envelopes, multi-parameter dashboard links, shortcuts (keyboard/MIDI/OSC/DMX, MIDI out, presets), Advanced Output (slices, polygons, masks, warping, soft edge) and DMX fixtures are now implemented. See the README's manual-parity section; rows below predate this update. |
 | Clips, colors, transport, cues, BeatLoopr | 28–33, 65–71 | Triggering, transport, cue points and BeatLoopr work. Clip label highlights and persistent clips are editable and saved. Clip Snapshot exports transparent PNG and imports it to the first free bottom-layer slot. Image sequences and some trigger settings remain. |
 | Layers, groups, decks, composition | 37–65 | Layers, A/B crossfader assignment, transitions, decks and composition settings work in part. The manual's hierarchical groups and group-to-slice routing remain. |
 | Sources and live inputs | 75–86 | Five basic generated sources work. Text Animator, live cameras, NDI, Spout and Syphon remain. |

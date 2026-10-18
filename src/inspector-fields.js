@@ -18,7 +18,7 @@ export function numericField(label, key, value, minimum, maximum, step = '.01', 
 
 export function transformFields(target, project, scope) {
   let html = '<div class="section transform-fields"><h3>Transform</h3>';
-  if (scope!=='composition') {
+  if (scope==='clip'||scope==='layer') {
     for (const [key, label, native] of [['width','Width',target.nativeWidth||project.width],['height','Height',target.nativeHeight||project.height]]) {
       const enabled = scope==='layer' ? target[key+'Enabled'] : target[key]!==null && target[key]!==undefined;
       html += `<label class="dimension-toggle"><input data-dimension="${key}" type="checkbox" ${enabled?'checked':''}> ${label} override <small>pixels</small></label>`;

@@ -14,10 +14,10 @@ test('live workspace plays, changes decks, edits effects, pauses, and saves', as
   await page.locator('.clip-slot[data-clip]').first().click({button:'right'});
   await expect(page.locator('#inspector')).toContainText('Transport');
   await page.locator('[data-browser="effects"]').click();
-  await page.locator('[data-add-effect="invert"]').click();
+  await page.locator('[data-add-effect="invert-rgb"]').click();
   await expect(page.locator('#inspector .effect-card')).toHaveCount(1);
   await page.locator('[data-inspector="composition"]').click();
-  await page.locator('[data-add-effect="hue"]').click();
+  await page.locator('[data-add-effect="hue-rotate"]').click();
   await expect(page.locator('#inspector .effect-card')).toHaveCount(1);
   await page.locator('#pause').click();
   const paused=await page.evaluate(()=>window.prismDiagnostics().frames);

@@ -1,5 +1,25 @@
 import './style.css';
+import './ui/ui.css';
+import './fx/builtins.js';
 import { createProject, createLayer, createClip, validateProject, serializeProject, Transport, LIMITS } from './model.js';
+import { listEffects, listAudioEffects, listSources, effectDefinition, audioEffectDefinition, sourceDefinition, registerEffect, registerSource } from './fx/registry.js';
+import { defaultParams } from './fx/shader-template.js';
+import { parseISF } from './fx/isf.js';
+import { Animator } from './animation.js';
+import { applyAnimations } from './automation.js';
+import { PROPERTY_PARAMS, resolvePath, readOwner } from './params.js';
+import { effectStackHTML, bindEffectStacks, sourceParamsHTML, cogButton, refreshAnimatedControls, readPresets, applyPreset } from './ui/param-controls.js';
+import { openAnimationEditor, closeAnimationEditor } from './ui/animation-editor.js';
+import { ShortcutManager } from './ui/shortcuts.js';
+import { registerProjectExtension } from './model.js';
+import { normalizeOutputConfig, screenFromComposition } from './output/output-model.js';
+import { openAdvancedOutput } from './output/editor.js';
+import { OutputWindows } from './output/windows.js';
+import { normalizeDmxConfig, sampleFixtures, fixtureSampleRect } from './dmx.js';
+
+// Advanced Output and DMX settings are saved with the composition.
+registerProjectExtension('advancedOutput', (value, owner) => normalizeOutputConfig(value, { compositionWidth: owner.width, compositionHeight: owner.height }));
+registerProjectExtension('dmx', value => normalizeDmxConfig(value));
 import { LiveEngine } from './engine.js';
 import { applyOSC } from './controls.js';
 import * as composition from './composition.js';
@@ -23,9 +43,7 @@ const clipThumbnail = clip => {
 const id = () => crypto.randomUUID();
 const now = () => performance.now() / 1000;
 const desktop = window.desktop;
-const effects = ['invert','grayscale','brightness','contrast','saturation','hue','pixelate','mirror','kaleidoscope','strobe'];
-const sourceTypes = ['plasma','grid','rings','noise','solid'];
-const sourceDescriptions = ['Flowing color fields','Perspective line pattern','Concentric waves','Animated texture','Solid color generator'];
+
 let preferences=readPreferences();
 let project = createProject();
 let transport = new Transport(project);
@@ -48,6 +66,11 @@ const mediaPreparations = new Map();
 const heldPointers = new Map();
 const oscHolds = new Map();
 let pendingDashboardDrag=null;
+const animator=new Animator();
+let animatedCount=0,lastAnimationRefresh=0,lastFeedback=0,lastFrameTime=0,effectSearch='',sourceSearch='',selectedGroupId=null,refreshQueued=false;
+const shortcutHolds=new Map();
+let shortcuts,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
+const oscSent=new Map();
 let lastPaint=0,paintFrames=0,paintStart=0,lastActive='';
 const layerPlayheads=new Map(),clipPlayheads=new Map(),queuedSlots=new Map();
 let inspectorPlayhead=null,inspectorTime=null;
@@ -76,7 +99,7 @@ function initialize() {
     <div class="layout-splitter horizontal" data-layout-splitter="workspace" role="separator" aria-label="Resize top and bottom sections" aria-orientation="horizontal" tabindex="0"></div>
     <main class="bottom"><section class="monitor-panel"><div class="panel-title"><span id="monitor-label">Composition Monitor</span><span id="frame-count" class="muted">60 FPS</span></div><div class="monitor-wrap"><canvas id="output-canvas" width="1280" height="720"></canvas></div><div class="monitor-caption"><span id="live-label">Composition</span><span id="resolution">1280 × 720</span></div><div class="layout-splitter horizontal" data-layout-splitter="monitors" role="separator" aria-label="Resize composition and preview monitors" aria-orientation="horizontal" tabindex="0"></div><div class="panel-title preview-title"><span>Preview Monitor</span><button id="preview-toggle" title="Preview selected clip">Preview selected</button></div><div id="preview-wrap" class="monitor-wrap preview-wrap"><span class="preview-empty">Click a clip name to preview</span></div><div class="monitor-caption"><span id="preview-label">Preview · No clip selected</span></div><div class="monitor-footer"><label>Video</label><input id="master-opacity" type="range" min="0" max="1" step=".01" value="1" aria-label="Master video"><label>Audio</label><input id="master-volume" type="range" min="0" max="1" step=".01" value="1" aria-label="Master audio"><span id="audio-meter">—</span></div></section>
     <div class="layout-splitter vertical" data-layout-splitter="panel-0" role="separator" aria-label="Resize monitor and composition panels" aria-orientation="vertical" tabindex="0"></div>
-    <section class="inspector-panel context-panel"><div class="transport-tabs"><button data-inspector="composition">Composition</button><button data-inspector="layer">Layer</button></div><div data-inspector-panel="context" class="inspector-content"></div></section>
+    <section class="inspector-panel context-panel"><div class="transport-tabs"><button data-inspector="composition">Composition</button><button data-inspector="layer">Layer</button><button data-inspector="group">Group</button></div><div data-inspector-panel="context" class="inspector-content"></div></section>
     <div class="layout-splitter vertical" data-layout-splitter="panel-1" role="separator" aria-label="Resize composition and clip panels" aria-orientation="vertical" tabindex="0"></div>
     <section class="inspector-panel clip-panel"><div class="transport-tabs"><button data-inspector="clip" class="active">Clip</button></div><div data-inspector-panel="clip" class="inspector-content"></div></section>
     <div class="layout-splitter vertical" data-layout-splitter="panel-2" role="separator" aria-label="Resize clip and browser panels" aria-orientation="vertical" tabindex="0"></div>
@@ -86,6 +109,16 @@ function initialize() {
   installResizableLayout($('#app'));
   const snapshotButton=document.createElement('button');snapshotButton.id='snapshot-output';snapshotButton.textContent='Snapshot';snapshotButton.title='Save the current output as PNG';$('#record').before(snapshotButton);
   engine = new LiveEngine($('#output-canvas'), {onError: message => toast(message, true)});
+  outputs=new OutputWindows({source:$('#output-canvas'),desktop,onError:message=>toast(message,true),onClosed:()=>{outputOpen=outputs.active;$('#output').classList.toggle('active',outputOpen);}});
+  desktop?.onDMXInput?.(({universe,data})=>shortcuts.handleDmx(universe,data));
+  engine.captureProvider={screen:async params=>{if(desktop?.selectCaptureSource)await desktop.selectCaptureSource(params.device||'');return navigator.mediaDevices.getDisplayMedia({video:true,audio:false});}};
+  shortcuts=new ShortcutManager({getProject:()=>project,toast,runAction,targetFor,actionState,
+    changed:(structural)=>{changed(structural);if(structural&&browserTab==='controls')renderBrowser();else if(!structural)scheduleRefresh();},
+    onEditChange:()=>{if(browserTab==='controls')renderBrowser();},onDevicesChange:()=>{if(browserTab==='controls')renderBrowser();},
+    onRawMidi:data=>midiMessage({data}),onClockBPM:bpm=>{project.bpm=bpm;if(document.activeElement!==$('#bpm'))$('#bpm').value=bpm;},onClockStart:()=>transport.resync(now())});
+  shortcuts.clock.enabled=preferences.midiClockSync;
+  if(preferences.midiClockSync)shortcuts.enableMidi().catch(()=>{});
+  if(preferences.audioInputDevice)engine.setExternalAudioInput(preferences.audioInputDevice).catch(error=>toast(`External audio input unavailable: ${error.message}`,true));
   fileBrowser=new FilesBrowser({desktop,onImport:item=>item?placeMedia(item,currentLayer()):importFiles(),onPreview:item=>startPreview(createClip(item.kind,item)),onRelink:relinkAll,onError:message=>toast(message,true)});
   bindStatic();
   applyPreferences();
@@ -144,7 +177,12 @@ function showMediaPreparation(item){
   if(percent===null)progress.removeAttribute('value');else progress.value=percent/100;
   $('#status-text').textContent=message;
 }
-function changed(history=true){dirty=true;$('#save-state').textContent='UNSAVED';clearTimeout(saveTimer);saveTimer=setTimeout(autosave,800);if(history){const value=snapshot();if(value!==lastHistory){undoStack.push(lastHistory);if(undoStack.length>60)undoStack.shift();redoStack=[];lastHistory=value;}}}
+// Undo snapshots serialize the whole composition. Continuous edits (slider
+// drags, history='coalesce') become one step after a short pause; any other
+// edit commits immediately so it stays its own undo step.
+let historyTimer=null;
+function changed(history=true){dirty=true;$('#save-state').textContent='UNSAVED';clearTimeout(saveTimer);saveTimer=setTimeout(autosave,800);if(history==='coalesce'){clearTimeout(historyTimer);historyTimer=setTimeout(commitHistory,250);}else if(history)commitHistory();}
+function commitHistory(){clearTimeout(historyTimer);historyTimer=null;const value=snapshot();if(value!==lastHistory){undoStack.push(lastHistory);if(undoStack.length>60)undoStack.shift();redoStack=[];lastHistory=value;}}
 async function autosave(){try{const data=serializeProject(project);if(desktop)await desktop.autosave(data);else localStorage.setItem('prism-recovery',JSON.stringify(data));$('#save-state').textContent=dirty?'RECOVERY SAVED':'SAVED';}catch(e){toast(`Recovery could not be saved: ${e.message}`,true);}}
 function renderAll(){renderLayers();renderDecks();renderInspector();renderBrowser();syncGlobals();}
 function applyPreferences(){
@@ -153,9 +191,28 @@ function applyPreferences(){
   document.documentElement.dataset.transitions=String(preferences.showTransitions);
 }
 function preferencesDialog(){
-  const labels={clipPanelFollowsTrigger:'Clip panel follows triggered clips',showAudioControls:'Show audio controls',showLayerTransport:'Show transport in each layer',showTransitions:'Show transition controls in each layer'};
-  const dialog=showDialog('Preferences',Object.entries(labels).map(([key,label])=>`<label class="preference-option"><input data-preference="${key}" type="checkbox" ${preferences[key]?'checked':''}>${label}</label>`).join('')+'<p class="browser-note">These settings apply to this computer and survive reopening Prism Live.</p>',[['Cancel','cancel'],['Save settings','save']]);
-  dialog.addEventListener('close',()=>{if(dialog.returnValue!=='save')return;try{preferences=writePreferences(Object.fromEntries($$('[data-preference]',dialog).map(input=>[input.dataset.preference,input.checked])));applyPreferences();renderAll();}catch(error){toast('Settings could not be saved: '+error.message,true);}});
+  const labels={clipPanelFollowsTrigger:'Clip panel follows triggered clips',showAudioControls:'Show audio controls',showLayerTransport:'Show transport in each layer',showTransitions:'Show transition controls in each layer',midiClockSync:'Sync BPM to incoming MIDI clock'};
+  const deviceSelect=(key,label)=>`<label class="select-field"><span>${label}</span><select data-device-preference="${key}"><option value="">${key==='audioInputDevice'?'None':'System default'}</option>${preferences[key]?`<option value="${esc(preferences[key])}" selected>Saved device</option>`:''}</select></label>`;
+  const dialog=showDialog('Preferences',Object.entries(labels).map(([key,label])=>`<label class="preference-option"><input data-preference="${key}" type="checkbox" ${preferences[key]?'checked':''}>${label}</label>`).join('')
+    +`<h3 style="margin-top:12px">Audio</h3>${deviceSelect('audioOutputDevice','Audio output')}${deviceSelect('audioInputDevice','External FFT input')}<p class="browser-note">The external input drives parameters set to Audio Analysis › external (a DJ feed, band or microphone).</p>`
+    +'<p class="browser-note">These settings apply to this computer and survive reopening Prism Live.</p>',[['Cancel','cancel'],['Save settings','save']]);
+  navigator.mediaDevices?.enumerateDevices?.().then(devices=>{
+    for(const select of $$('[data-device-preference]',dialog)){
+      const kind=select.dataset.devicePreference==='audioInputDevice'?'audioinput':'audiooutput',saved=preferences[select.dataset.devicePreference];
+      select.innerHTML=`<option value="">${kind==='audioinput'?'None':'System default'}</option>`+devices.filter(device=>device.kind===kind&&device.deviceId!=='default').map((device,index)=>`<option value="${esc(device.deviceId)}" ${device.deviceId===saved?'selected':''}>${esc(device.label||`${kind==='audioinput'?'Input':'Output'} ${index+1}`)}</option>`).join('');
+    }
+  }).catch(()=>{});
+  dialog.addEventListener('close',async()=>{
+    if(dialog.returnValue!=='save')return;
+    try{
+      const previous=preferences;
+      preferences=writePreferences({...preferences,...Object.fromEntries($$('[data-preference]',dialog).map(input=>[input.dataset.preference,input.checked])),...Object.fromEntries($$('[data-device-preference]',dialog).map(select=>[select.dataset.devicePreference,select.value]))});
+      applyPreferences();renderAll();
+      shortcuts.clock.enabled=preferences.midiClockSync;if(preferences.midiClockSync)shortcuts.enableMidi().catch(error=>toast(`MIDI unavailable: ${error.message}`,true));
+      if(previous.audioInputDevice!==preferences.audioInputDevice)await engine.setExternalAudioInput(preferences.audioInputDevice||null);
+      if(previous.audioOutputDevice!==preferences.audioOutputDevice&&engine.audioContext?.setSinkId)await engine.audioContext.setSinkId(preferences.audioOutputDevice||'');
+    }catch(error){toast('Settings could not be fully applied: '+error.message,true);}
+  });
 }
 function layerPerformanceControls(layer){
   const clip=findClip(layer.activeClipId)?.clip;
@@ -174,16 +231,83 @@ function bindLayerPerformance(row,layer){
   $('[data-layer-timeline]',row).oninput=event=>transport.seek(layer.id,Number(event.target.value));
 }
 function syncGlobals(){for(const [selector,key] of [['#project-name','name'],['#bpm','bpm'],['#quantize','quantize'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])$(selector).value=project[key];$('#pause').classList.toggle('active',project.paused);$('#blackout').classList.toggle('active',project.blackout);$('#bypass-all').classList.toggle('active',project.bypass);for(const button of $$('[data-global-direction]')){button.classList.toggle('pinned',project.directionPin===button.dataset.globalDirection);button.setAttribute('aria-pressed',String(project.directionPin===button.dataset.globalDirection));}$('#pause').classList.toggle('pinned',project.directionPin==='pause');$('#resolution').textContent=`${project.width} × ${project.height}`;}
+function currentGroup(){return (project.groups||[]).find(group=>group.id===selectedGroupId)||(project.groups||[]).find(group=>group.id===currentLayer()?.groupId)||null;}
+function inspectorTarget(scope){return scope==='composition'?project:scope==='layer'?currentLayer():scope==='group'?currentGroup():currentClip();}
+function ownerPath(scope,target){return scope==='composition'?'composition':`${scope}/${target.id}`;}
+// Bring visible controls in line with values changed by animation, shortcuts
+// or OSC without rebuilding the panels. Focused controls are left alone.
+function refreshControls(animatedOnly=false){
+  const focused=document.activeElement;
+  for(const host of $$('[data-inspector-panel]')){
+    if(animatedOnly){refreshAnimatedControls(host,project);continue;}
+    const target=inspectorTarget(host.dataset.scope);if(!target)continue;
+    for(const input of $$('[data-param-path]',host)){
+      if(input===focused)continue;const resolved=resolvePath(project,input.dataset.paramPath);if(!resolved)continue;
+      const value=readOwner(resolved.scope,resolved.owner,resolved.key);
+      if(input.type==='checkbox')input.checked=!!value;else if(input.dataset.axis!==undefined&&Array.isArray(value))input.value=value[Number(input.dataset.axis)];else if(input.dataset.number!==undefined)input.value=Number(value).toFixed(2);else if(input.type!=='color'||typeof value==='string')input.value=input.type==='color'?String(value).slice(0,7):value;
+    }
+    for(const input of $$('[data-prop],[data-number]',host)){
+      if(input===focused)continue;const key=input.dataset.prop||input.dataset.number,value=target[key];
+      if(typeof value!=='number')continue;
+      const shown=input.dataset.unit==='pixels'?value*(key==='x'?project.width:project.height):value;
+      input.value=input.dataset.number!==undefined?Number(shown).toFixed(2):shown;
+    }
+  }
+  for(const row of $$('.layer-row')){const layer=project.layers.find(item=>item.id===row.dataset.layer);if(!layer)continue;for(const input of $$('[data-layer-prop]',row))if(input!==focused&&input.type==='range')input.value=layer[input.dataset.layerProp];}
+  for(const row of $$('[data-group-row]')){const group=(project.groups||[]).find(item=>item.id===row.dataset.groupRow);if(!group)continue;for(const input of $$('[data-group-prop]',row))if(input!==focused&&input.type==='range')input.value=group[input.dataset.groupProp];}
+  for(const [selector,key] of [['#bpm','bpm'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])if($(selector)!==focused)$(selector).value=project[key];
+  $('#pause').classList.toggle('active',project.paused);$('#blackout').classList.toggle('active',project.blackout);$('#bypass-all').classList.toggle('active',project.bypass);
+}
+function promptText(title,value=''){return new Promise(resolve=>{const dialog=showDialog(title,`<input id="prompt-text" type="text" value="${esc(value)}" maxlength="120" style="width:100%">`,[['Cancel','cancel'],['OK','ok']]);const input=$('#prompt-text',dialog);input.select();input.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();dialog.close('ok');}};dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'?input.value.trim()||null:null));});}
+function addEffect(target,data,alt=false){
+  if(!target)return toast('Select a clip, layer or group first.');
+  const audio=data.kind==='audio',definition=(audio?audioEffectDefinition:effectDefinition)(data.type);
+  if(!definition)return toast('That effect is not available.',true);
+  if(audio&&target.kind==='effect')return toast('Effect clips carry video effects only.');
+  const list=audio?(target.audioEffects||=[]):target.effects;
+  if(list.length>=LIMITS.effects)return toast('Effect stack limit reached.');
+  const effect={id:id(),type:data.type,enabled:true,params:defaultParams(definition),animations:{}};
+  // Alt-drop adds the effect faded out so it can be brought in (manual p. 81).
+  if(!audio){effect.opacity=alt?0:1;effect.blend='normal';}
+  const preset=data.preset!==undefined?readPresets()[`${audio?'audio:':''}${data.type}`]?.[data.preset]:null;
+  if(preset)applyPreset(effect,preset);
+  list.push(effect);changed();renderInspector();if(browserTab==='effects')renderBrowser();
+  return effect;
+}
+function stepLayerClip(layer,step){
+  const clips=clipList(layer),count=clips.length,current=clips.findIndex(clip=>clip?.id===layer.activeClipId),start=current<0?(step>0?-1:count):current;
+  for(let offset=1;offset<=count;offset++){const clip=clips[(((start+offset*step)%count)+count)%count];if(clip){trigger(layer,clip);return clip;}}
+  return null;
+}
+function addPropertyCogs(host,scope,target){
+  const keys=new Set((PROPERTY_PARAMS[scope]||[]).filter(param=>param.type!=='bool').map(param=>param.key)),base=ownerPath(scope,target);
+  for(const range of $$('.field input[type="range"][data-prop]',host)){
+    const key=range.dataset.prop;if(!keys.has(key))continue;
+    const field=range.closest('.field'),path=`${base}/${key}`;
+    if(field.querySelector('.param-cog'))continue;
+    field.insertAdjacentHTML('beforeend',cogButton(path,target,key));
+    for(const input of $$('[data-prop],[data-number]',field))input.dataset.animateOwner=path;
+    field.classList.toggle('animated',!!target.animations?.[key]);
+  }
+}
+function spectrumFor(source){return engine.spectrum(source,source==='clip'?selectedClipId:source==='layer'?selectedLayerId:source==='group'?currentGroup()?.id:null);}
+function scheduleRefresh(){if(refreshQueued)return;refreshQueued=true;requestAnimationFrame(()=>{refreshQueued=false;refreshControls();});}
 
 function renderLayers(){
   document.documentElement.style.setProperty('--columns',project.columns||8);
   renderColumns();
   lastActive=project.layers.map(l=>l.activeClipId).join(',');
-  $('#layer-bank').innerHTML=[...project.layers].reverse().map(layer=>`<div class="layer-row" data-layer="${layer.id}">${layerHeader(layer)}<div class="clips">${clipList(layer).map((clip,index)=>clip?`<button class="clip-slot ${selectedClips.has(clip.id)?'selected':''} ${project.layers.some(item=>item.activeClipId===clip.id)?'playing':''}" data-slot="${index}" data-clip="${clip.id}" draggable="true" title="${esc(clip.name)} — click to trigger, right-click to edit"><div class="clip-art ${esc(clip.kind==='source'?clip.source:clip.kind)}" style="${clip.source==='solid'?`background:${esc(clip.color)}`:''}">${clipThumbnail(clip)}<span class="clip-kind">${clip.kind==='source'?'GEN':esc(clip.kind.toUpperCase())}</span></div><span class="clip-name">${esc(clip.name)}</span><div class="clip-progress"></div></button>`:`<button class="clip-slot empty-slot ${layer.id===selectedLayerId&&index===selectedColumn&&!selectedClipId?'selected':''}" data-slot="${index}" title="Drop media or double-click to import">+</button>`).join('')}</div></div>`).join('');
+  $('#layer-bank').innerHTML=[...project.layers].reverse().map((layer,index,list)=>`${groupHeaderFor(layer,list[index-1])}<div class="layer-row ${layer.groupId?'in-group':''} ${groupOfLayer(layer)?.collapsed?'group-collapsed':''} ${layer.locked?'locked':''}" data-layer="${layer.id}">${layerHeader(layer)}<div class="clips">${clipList(layer).map((clip,index)=>clip?`<button class="clip-slot ${selectedClips.has(clip.id)?'selected':''} ${project.layers.some(item=>item.activeClipId===clip.id)?'playing':''}" data-slot="${index}" data-clip="${clip.id}" draggable="true" title="${esc(clip.name)} — click to trigger, right-click to edit"><div class="clip-art ${esc(clip.kind==='source'?clip.source:clip.kind)}" style="${clip.source==='solid'?`background:${esc(clip.color)}`:''}">${clipThumbnail(clip)}<span class="clip-kind">${clip.kind==='source'?'GEN':esc(clip.kind.toUpperCase())}</span></div><span class="clip-name">${esc(clip.name)}</span><div class="clip-progress"></div></button>`:`<button class="clip-slot empty-slot ${layer.id===selectedLayerId&&index===selectedColumn&&!selectedClipId?'selected':''}" data-slot="${index}" title="Drop media or double-click to import">+</button>`).join('')}</div></div>`).join('');
+  bindGroupRows();
   for(const row of $$('.layer-row')){
     const layer=project.layers.find(l=>l.id===row.dataset.layer);
-    $('[data-layer-select]',row).onclick=()=>{selectedLayerId=layer.id;inspectorTab='layer';renderLayers();renderInspector();};
-    for(const input of $$('[data-layer-prop]',row)) input.oninput=()=>{layer[input.dataset.layerProp]=input.type==='range'?+input.value:input.value;changed();};
+    $('[data-layer-select]',row).onclick=()=>{selectedLayerId=layer.id;selectedGroupId=layer.groupId;inspectorTab='layer';renderLayers();renderInspector();};
+    $('[data-layer-select]',row).oncontextmenu=event=>{event.preventDefault();layerMenu(layer,event);};
+    const head=$('.layer-head',row);
+    head.ondragover=event=>{if(event.dataTransfer.types.includes('application/prism-effect')){event.preventDefault();head.classList.add('drag-over');}};
+    head.ondragleave=()=>head.classList.remove('drag-over');
+    head.ondrop=event=>{head.classList.remove('drag-over');const data=event.dataTransfer.getData('application/prism-effect');if(!data)return;event.preventDefault();selectedLayerId=layer.id;inspectorTab='layer';addEffect(layer,JSON.parse(data),event.altKey);renderLayers();};
+    for(const input of $$('[data-layer-prop]',row)) input.oninput=()=>{layer[input.dataset.layerProp]=input.type==='range'?+input.value:input.value;changed(input.type==='range'?'coalesce':true);};
     for(const button of $$('[data-action]',row))button.onclick=()=>{const action=button.dataset.action;if(action==='stop'){triggerRequests.delete(layer.id);transport.stop(layer.id);}else layer[action]=!layer[action];changed();renderLayers();};
     bindLayerPerformance(row,layer);
     for(const button of $$('[data-group]',row))button.onclick=()=>{layer.group=layer.group===button.dataset.group?'none':button.dataset.group;changed();renderLayers();};
@@ -218,7 +342,16 @@ function renderLayers(){
         e.preventDefault();slot.classList.remove('drag-over');
         try{
           const source=e.dataTransfer.getData('application/prism-source'),move=e.dataTransfer.getData('application/prism-clip'),path=e.dataTransfer.getData('application/prism-path');
-          if(source)addSource(source,layer,index);
+          const effectData=e.dataTransfer.getData('application/prism-effect');
+          if(effectData){
+            // An effect dropped on a clip applies to it; on an empty slot it
+            // creates an Effect Clip (manual p. 85).
+            const data=JSON.parse(effectData);
+            if(clip){addEffect(clip,data,e.altKey);selectClip(layer,clip,index);}
+            else if(data.kind!=='audio'){addSource('effect-clip',layer,index);const created=clipList(layer)[index];if(created)addEffect(created,data,e.altKey);}
+            return;
+          }
+          if(source)addSource(source,layer,index,JSON.parse(e.dataTransfer.getData('application/prism-source-extra')||'{}'));
           else if(move){const data=JSON.parse(move),from=slotForClip(data.clipId),to={layerId:layer.id,deckId:project.selectedDeckId,column:index};if(!from)return;
             const incoming=findClip(data.clipId)?.clip;
             if(e.shiftKey&&clip&&incoming?.kind==='audio')await pairAudio(clip,{name:incoming.name,kind:'audio',path:incoming.path,url:incoming.url});
@@ -237,6 +370,55 @@ function renderLayers(){
     queuedSlots.set(row.dataset.layer,slots);
     for(const slot of slots)clipPlayheads.set(slot.dataset.clip,$('.clip-progress',slot));
   }
+}
+function groupOfLayer(layer){return layer.groupId?(project.groups||[]).find(group=>group.id===layer.groupId)||null:null;}
+function groupHeaderFor(layer,above){
+  const group=groupOfLayer(layer);
+  if(!group||above?.groupId===group.id)return '';
+  const count=project.layers.filter(item=>item.groupId===group.id).length;
+  return `<div class="group-row ${group.id===currentGroup()?.id&&inspectorTab==='group'?'selected':''}" data-group-row="${group.id}"><button data-group-collapse title="${group.collapsed?'Expand':'Collapse'} group">${group.collapsed?'▸':'▾'}</button>
+    <span class="name" data-group-select title="Group of ${count} layer${count===1?'':'s'}; right-click for options">${esc(group.name)}</span>
+    <button data-group-action="clear" title="Eject group">×</button><button data-group-action="bypass" class="${group.bypass?'active':''}" title="Bypass group">B</button><button data-group-action="solo" class="${group.solo?'active':''}" title="Solo group">S</button>
+    <select data-group-prop="blend" aria-label="${esc(group.name)} blend">${blendOptions(group.blend)}</select>
+    ${[['opacity','V',1],['volume','A',1],['speed','Speed',4]].map(([key,label,max])=>`<label title="${key}"><span>${label}</span><input type="range" data-group-prop="${key}" min="0" max="${max}" step=".01" value="${group[key]}" aria-label="${esc(group.name)} ${key}"></label>`).join('')}
+    <div class="group-columns" title="Group column triggers">${Array.from({length:project.columns||8},(_,column)=>`<button data-group-column="${column}">${column+1}</button>`).join('')}</div></div>`;
+}
+function bindGroupRows(){
+  for(const row of $$('[data-group-row]')){
+    const group=(project.groups||[]).find(item=>item.id===row.dataset.groupRow);if(!group)continue;
+    $('[data-group-select]',row).onclick=()=>{selectedGroupId=group.id;inspectorTab='group';renderLayers();renderInspector();};
+    $('[data-group-select]',row).oncontextmenu=event=>{event.preventDefault();showMenu(event,[['Rename',()=>editName(group,'Group name',()=>{changed();renderAll();})],['Ungroup',()=>editComposition(()=>composition.ungroup(project,group.id))]]);};
+    $('[data-group-collapse]',row).onclick=()=>{group.collapsed=!group.collapsed;changed();renderLayers();};
+    for(const button of $$('[data-group-action]',row))button.onclick=()=>{const action=button.dataset.groupAction;if(action==='clear'){for(const layer of project.layers)if(layer.groupId===group.id){triggerRequests.delete(layer.id);transport.stop(layer.id);}}else group[action]=!group[action];changed();renderLayers();};
+    for(const input of $$('[data-group-prop]',row))input.oninput=()=>{group[input.dataset.groupProp]=input.type==='range'?Number(input.value):input.value;changed(input.type==='range'?'coalesce':true);if(inspectorTab==='group')scheduleRefresh();};
+    for(const button of $$('[data-group-column]',row))button.onclick=()=>triggerColumn(Number(button.dataset.groupColumn),{groupId:group.id});
+  }
+}
+function showMenu(event,items){
+  $('.context-menu')?.remove();
+  const menu=document.createElement('div');menu.className='context-menu';menu.setAttribute('role','menu');
+  menu.innerHTML=items.map(([label,,disabled],index)=>label==='-'?'<hr>':`<button role="menuitem" data-menu="${index}" ${disabled?'disabled':''}>${esc(label)}</button>`).join('');
+  document.body.append(menu);
+  menu.style.left=`${Math.min(event.clientX,innerWidth-menu.offsetWidth-8)}px`;menu.style.top=`${Math.min(event.clientY,innerHeight-menu.offsetHeight-8)}px`;
+  for(const button of $$('[data-menu]',menu))button.onclick=()=>{menu.remove();items[Number(button.dataset.menu)][1]();};
+  const close=e=>{if(!menu.contains(e.target)){menu.remove();document.removeEventListener('pointerdown',close,true);}};
+  setTimeout(()=>document.addEventListener('pointerdown',close,true),0);
+  menu.querySelector('button')?.focus();
+}
+// Layer menu (manual pp. 40–42): groups, duplicate, rename, clear and remove.
+function layerMenu(layer,event){
+  const groups=(project.groups||[]).filter(group=>group.id!==layer.groupId);
+  showMenu(event,[
+    ['Group › New',()=>editComposition(()=>{selectedGroupId=composition.createGroupForLayer(project,layer.id).id;})],
+    ...groups.map(group=>[`Group › ${group.name}`,()=>editComposition(()=>composition.setLayerGroup(project,layer.id,group.id))]),
+    ['Group › None',()=>editComposition(()=>composition.setLayerGroup(project,layer.id,null)),!layer.groupId],
+    ['-'],
+    ['Rename…',()=>editName(layer,'Layer name',()=>{changed();renderAll();})],
+    ['Duplicate',()=>editComposition(()=>{selectedLayerId=composition.duplicateLayer(project,layer.id).id;})],
+    [layer.locked?'Unlock content':'Lock content',()=>{layer.locked=!layer.locked;changed();renderLayers();renderInspector();}],
+    ['Clear clips',()=>editComposition(()=>{transport.stop(layer.id);composition.clearLayerClips(project,layer.id);})],
+    ['Remove layer',()=>{if(project.layers.length===1)return toast('Keep at least one layer.');editComposition(()=>{transport.stop(layer.id);composition.removeLayer(project,layer.id);composition.pruneGroups(project);});}],
+  ]);
 }
 function options(values,selected){return values.map(v=>`<option value="${esc(v)}" ${String(v)===String(selected)?'selected':''}>${esc(v)}</option>`).join('');}
 function slotForClip(clipId){return composition.findClipSlot(project,clipId);}
@@ -344,11 +526,12 @@ function bindDashboard(host,target,scope){
     const index=Number(input.dataset.dashboardValue),key=target.dashboard[index]?.key;
     if(!moveDashboard(target,scope,index,Number(input.value)))return;
     input.style.setProperty('--dial-progress',`${Number(input.value)*280}deg`);
+    changed('coalesce');
     const slider=host.querySelector(`[data-prop="${key}"]`),number=host.querySelector(`[data-number="${key}"]`);
     const value=target[key]*(slider?.dataset.unit==='pixels'?(key==='x'?project.width:project.height):1);
     if(slider)slider.value=value;
     if(number)number.value=Number(value).toFixed(2);
-    changed();if(scope==='composition')syncGlobals();
+    if(scope==='composition')syncGlobals();
   };
   for(const input of $$('[data-dashboard-value]',host))input.style.setProperty('--dial-progress',`${Number(input.value)*280}deg`);
 }
@@ -358,7 +541,7 @@ function renderExtras(target,inspectorTab){
   let html='<div class="section">';
   if(inspectorTab==='clip')html+=`<h3>Media components</h3><div class="row"><label><input id="use-video" type="checkbox" ${target.useVideo?'checked':''}> Video</label><label><input id="use-audio" type="checkbox" ${target.useAudio?'checked':''}> Audio</label><button id="attach-audio" class="icon-btn">Pair audio…</button></div>${componentFields(target)}${select('Video fit','fit',target.fit,['width','height','stretch','original','contain','cover'])}${target.audio?`<div class="component-path" title="${esc(target.audio.path||target.audio.url)}">Audio: ${esc((target.audio.path||'Paired audio').split(/[\\/]/).pop())} · ${target.audio.duration.toFixed(2)} s</div><div class="row"><button id="relink-audio" class="icon-btn">Reconnect audio</button><button id="detach-audio" class="icon-btn">Unpair audio</button></div>`:''}${target.kind==='video'?'<div class="row" style="margin-top:8px"><button id="remove-video" class="icon-btn">Remove video, keep audio</button></div>':''}${desktop&&target.path?'<button id="reveal-media" class="icon-btn" style="margin-top:8px">Show in Explorer</button>':''}`;
   if(inspectorTab!=='composition')html+=`<label class="select-field"><span>Ignore column trigger</span><input id="ignore-column" type="checkbox" ${target.ignoreColumn?'checked':''}></label>`;
-  if(inspectorTab!=='clip')html+=range('Linked AV','av',target.av,0,1);
+  if(inspectorTab==='layer'||inspectorTab==='composition')html+=range('Linked AV','av',target.av,0,1);
   html+=`</div><div class="section"><div class="row"><h3 class="grow">Image mask</h3><button id="choose-mask" class="icon-btn">${mask?'Replace':'Add'} mask…</button></div>${mask?`<div class="component-path" title="${esc(mask.path||'Imported image')}">${esc((mask.path||'Imported mask').split(/[\\/]/).pop())}</div><div class="row"><label><input id="mask-enabled" type="checkbox" ${mask.enabled?'checked':''}> Enabled</label><label><input id="mask-invert" type="checkbox" ${mask.invert?'checked':''}> Invert</label><button id="remove-mask" class="icon-btn">Remove</button></div>`:'<small>Transparent images use their alpha; opaque images use red brightness.</small>'}<label class="select-field"><span>Processing order</span><select id="render-order">${orders.map(order=>`<option value="${order.join(',')}" ${(target.renderOrder||orders[0]).join(',')===order.join(',')?'selected':''}>${order.join(' → ')}</option>`).join('')}</select></label></div>`;
   return html;
 }
@@ -385,7 +568,6 @@ function bindExtras(target,inspectorTab,host,prefix){
   $('#remove-mask')?.addEventListener('click',()=>{engine.removeMask(target.mask.id);target.mask=null;changed();renderInspector();});
   $('#render-order').onchange=event=>{target.renderOrder=event.target.value.split(',');changed();};
 }
-function effectStack(target){return `<div class="section"><div class="row"><h3 class="grow">Effects</h3><button id="browse-effects" class="icon-btn">+ Add effect</button></div>${target.effects.map((fx,index)=>`<div class="effect-card" data-effect="${fx.id}"><div class="row"><input type="checkbox" data-fx="enabled" ${fx.enabled?'checked':''} aria-label="Enable ${fx.type}"><span class="grow">${esc(fx.type)}</span><button data-fx-up="${index}" title="Move effect up">↑</button><button data-fx-remove="${index}" title="Remove effect">×</button></div><div class="field"><label>Amount</label><input data-fx="amount" type="range" min="0" max="1" step=".01" value="${fx.amount}" aria-label="${fx.type} amount"><output>${fx.amount.toFixed(2)}</output></div></div>`).join('')||'<small>Add effects from the Effects browser.</small>'}</div>`;}
 function inspectorQueries(host,prefix){
   const selectorFor=selector=>selector.replace(/#([a-zA-Z][\w-]*)/g,(_,value)=>'#'+prefix+value);
   return {$:(selector,parent=host)=>selector==='#inspector'?host:parent.querySelector(selectorFor(selector)),$$:(selector,parent=host)=>[...parent.querySelectorAll(selectorFor(selector))]};
@@ -454,17 +636,21 @@ function decorateInspector(host,scope){
 }
 function renderInspectorPanel(inspectorTab,host,prefix){
   const {$,$$}=inspectorQueries(host,prefix);
-  const layer=currentLayer(),clip=currentClip(),target=inspectorTab==='composition'?project:inspectorTab==='layer'?layer:clip;
-  if(!target){$('#inspector').innerHTML='<div class="empty">Select a clip to see its transport,<br>transform, and effect controls.<br><br>Right-click selects without triggering.</div>';return;}
-  let html=`<div class="section"><div class="row"><h2 class="grow">${esc(target.name)}</h2><button id="rename" class="icon-btn">Rename</button>${inspectorTab==='clip'?'<button id="remove-clip" class="icon-btn danger">Remove</button>':''}</div></div>`;
+  const layer=currentLayer(),clip=currentClip(),group=currentGroup(),target=inspectorTarget(inspectorTab);
+  if(!target){$('#inspector').innerHTML=inspectorTab==='group'?'<div class="empty">The selected layer is not in a group.<br><br>Right-click a layer name and choose<br>Group → New to create one.</div>':'<div class="empty">Select a clip to see its transport,<br>transform, and effect controls.<br><br>Right-click selects without triggering.</div>';return;}
+  let html=`<div class="section"><div class="row"><h2 class="grow">${esc(target.name)}</h2><button id="rename" class="icon-btn">Rename</button>${inspectorTab==='clip'?'<button id="remove-clip" class="icon-btn danger">Remove</button>':''}${inspectorTab==='group'?'<button id="ungroup" class="icon-btn">Ungroup</button>':''}</div></div>`;
   html+=dashboardSection(target,inspectorTab);
   if(inspectorTab==='clip')html+=`<div class="section clip-persistence"><h3>Deck behavior</h3><label><input id="clip-persistent" type="checkbox" ${clip.persistent?'checked':''}> Persistent across decks</label><small>Shows this clip in the same layer and column on every deck. Covered clips stay in their original deck.</small></div>`;
   if(inspectorTab==='clip')html+=`<div class="section clip-label-color"><h3>Clip label</h3><div class="row"><label>Highlight <input id="clip-label-color" type="color" value="${esc(clip.labelColor||'#8affd7')}"></label><button id="clear-clip-label" class="icon-btn">Clear color</button></div></div>`;
   if(inspectorTab==='clip')html+=`<div class="section"><h3>Snapshot</h3><button id="snapshot-clip" class="icon-btn">Save clip frame as PNG</button></div>`;
   if(inspectorTab==='clip')html+=`<div class="section"><h3>Transport <span class="muted">· ${esc(clip.kind)}</span></h3><div class="transport-buttons"><button data-direction="-1" class="${clip.direction===-1&&!clip.paused?'active':''}">◀ Reverse</button><button id="clip-pause" class="${clip.paused?'active':''}">Ⅱ Pause</button><button data-direction="1" class="${clip.direction===1&&!clip.paused?'active':''}">▶ Forward</button><button id="retrigger">↻</button></div><input id="timeline" class="timeline" type="range" min="0" max="1" step=".001" value="0" aria-label="Clip playhead"><div class="time-labels"><span id="clip-time">00:00.00</span><span>${clip.duration.toFixed(2)} s</span></div>${select('Playback','loop',clip.loop,['loop','once','once-clear','pingpong','random'])}${select('Restart behavior','trigger',clip.trigger,['restart','continue','piano'])}${select('Trigger style','triggerStyle',clip.triggerStyle,['inherit','normal','piano'])}${select('Clip target','clipTarget',clip.clipTarget,['inherit','own','selected','free'])}<div class="select-field"><label>Beat snap</label><select id="clip-quantize">${[[null,'Composition'],[0,'Immediate'],[.25,'1/4 beat'],[1,'1 beat'],[4,'1 bar'],[8,'2 bars']].map(([v,label])=>`<option value="${v===null?'inherit':v}" ${clip.quantize===v?'selected':''}>${label}</option>`).join('')}</select></div>${select('Autopilot','autoPilot',clip.autoPilot,['inherit','off','next','previous','random'])}<div class="select-field"><label for="beat-sync">BPM sync</label><input id="beat-sync" type="checkbox" ${clip.beatSync?'checked':''}><label>Beats</label><input id="clip-beats" aria-label="Clip beats" type="number" min=".25" max="1024" step=".25" value="${clip.beats}" style="width:65px"></div>${range('Speed','speed',clip.speed,.1,4)}${range('In point','inPoint',clip.inPoint,0,.99)}${range('Out point','outPoint',clip.outPoint,.01,1)}<h3 style="margin-top:14px">BeatLoopr</h3><div class="cue-buttons">${[0,4,2,1,.5,.25].map(v=>`<button data-beat-loop="${v}" class="${clip.beatLoop===v?'active':''}">${v||'Off'}</button>`).join('')}</div><h3 style="margin-top:14px">Cue points <small>Shift-click to set</small></h3><div class="cue-buttons">${clip.cues.map((c,i)=>`<button data-cue="${i}" title="${(c*100).toFixed(1)}%">${i+1} · ${(c*100).toFixed(0)}%</button>`).join('')}</div></div><div class="section"><h3>Video & audio</h3>${range('Opacity','opacity',clip.opacity,0,1)}${range('Volume','volume',clip.volume,0,4)}${range('Pan','pan',clip.pan,-1,1)}${clip.kind==='source'?`<div class="select-field"><label>Duration (s)</label><input id="source-duration" type="number" value="${clip.duration}" min=".1" max="3600" step=".1" style="width:90px"></div><div class="select-field"><label>Color</label><input type="color" id="source-color" value="${esc(clip.color)}"></div>`:''}${clip.kind!=='source'?'<div class="row"><button id="relink-clip">Reconnect media</button></div>':''}${clip.path?`<small title="${esc(clip.path)}">${esc(clip.path.split(/[\\/]/).pop())}</small>`:''}</div>`;
+  if(inspectorTab==='clip'&&clip.kind==='source')html+=sourceParamsHTML(clip);
+  if(inspectorTab==='clip'&&clip.kind==='effect')html+='<div class="section"><h3>Effect clip</h3><small>Effects on this clip process every layer beneath it while it plays, like an adjustment layer. Use the layer opacity or a transition to fade it in.</small></div>';
+  if(inspectorTab==='group')html+=`<div class="section"><h3>Group mixing</h3>${range('Video','opacity',group.opacity,0,1)}${range('Audio','volume',group.volume,0,1)}${range('Pan','pan',group.pan,-1,1)}${range('Speed','speed',group.speed,0,4)}<div class="select-field"><label for="prop-blend">Blend mode</label><select id="prop-blend" data-prop="blend">${blendOptions(group.blend)}</select></div>${select('Crossfader','crossfader',group.crossfader,['none','A','B'])}<div class="row"><label><input id="group-bypass" type="checkbox" ${group.bypass?'checked':''}> Bypass</label><label><input id="group-solo" type="checkbox" ${group.solo?'checked':''}> Solo</label><button id="group-clear" class="icon-btn">Eject all</button></div><small>${project.layers.filter(item=>item.groupId===group.id).length} layers. What happens in the group stays in the group.</small></div>`;
+  if(inspectorTab==='layer')html+=`<div class="section"><h3>Layer options</h3>${select('Mask mode','maskMode',layer.maskMode||'none',['none','luma','alpha','luma-invert','alpha-invert'])}<div class="select-field"><label for="layer-group">Group</label><select id="layer-group"><option value="">None</option>${(project.groups||[]).map(item=>`<option value="${item.id}" ${layer.groupId===item.id?'selected':''}>${esc(item.name)}</option>`).join('')}<option value="new">New group…</option></select></div><div class="row wrap"><label><input id="layer-locked" type="checkbox" ${layer.locked?'checked':''}> Lock content</label><button id="layer-previous" class="icon-btn" title="Previous clip">⏮ Prev</button><button id="layer-next" class="icon-btn" title="Next clip">Next ⏭</button><button id="duplicate-layer" class="icon-btn">Duplicate</button><button id="clear-layer-clips" class="icon-btn">Clear clips</button></div></div>`;
   if(inspectorTab==='layer')html+=`<div class="section"><h3>Layer mixing</h3>${range('Video','opacity',layer.opacity,0,1)}${range('Audio','volume',layer.volume,0,1)}${range('Pan','pan',layer.pan,-1,1)}<div class="select-field"><label for="prop-blend">Blend mode</label><select id="prop-blend" data-prop="blend">${blendOptions(layer.blend)}</select></div>${select('Crossfader','group',layer.group,['none','A','B'])}${range('Transition (s)','transition',layer.transition,0,10,'.1')}<div class="select-field"><label for="prop-transitionMode">Transition mode</label><select id="prop-transitionMode" data-prop="transitionMode">${blendOptions(layer.transitionMode,true)}</select></div>${select('Autopilot','autoPilot',layer.autoPilot,['off','next','previous','random'])}<div class="row"><button id="move-layer-up">Move up</button><button id="move-layer-down">Move down</button><button id="remove-layer" class="danger">Remove layer</button></div></div>`;
   if(inspectorTab==='composition')html+=compositionSettings(project,range);
-  html+=transformFields(target,project,inspectorTab)+renderExtras(target,inspectorTab)+effectStack(target);host.innerHTML=html.replace(/\b(id|for)="([^"]+)"/g,(_,attribute,value)=>attribute+'="'+prefix+value+'"');bindExtras(target,inspectorTab,host,prefix);
+  html+=transformFields(target,project,inspectorTab)+renderExtras(target,inspectorTab)+effectStackHTML(target)+(target.kind==='effect'?'':effectStackHTML(target,{audio:true}));host.innerHTML=html.replace(/\b(id|for)="([^"]+)"/g,(_,attribute,value)=>attribute+'="'+prefix+value+'"');bindExtras(target,inspectorTab,host,prefix);
   const targets=inspectorTargets(target,inspectorTab);
   const setProperty=(key,value,input)=>{
     if(input.type==='range'||input.type==='number'){
@@ -476,7 +662,7 @@ function renderInspectorPanel(inspectorTab,host,prefix){
     const slider=$('[data-prop="'+key+'"]',$('#inspector')),number=$('[data-number="'+key+'"]',$('#inspector'));
     const display=typeof target[key]==='number'?target[key]*(input.dataset.unit==='pixels'?(key==='x'?project.width:project.height):1):target[key];if(slider)slider.value=display;if(number&&number!==document.activeElement)number.value=Number(display).toFixed(2);
     for(const dial of $$('[data-dashboard-value]',host))if(target.dashboard[Number(dial.dataset.dashboardValue)]?.key===key){dial.value=target.dashboard[Number(dial.dataset.dashboardValue)].value;dial.style.setProperty('--dial-progress',`${Number(dial.value)*280}deg`);}
-    changed();if(inspectorTab!=='clip')syncGlobals();
+    changed('coalesce');if(inspectorTab!=='clip')syncGlobals();
   };
   for(const input of $$('[data-prop]',$('#inspector'))){
     input.oninput=()=>setProperty(input.dataset.prop,input.value,input);
@@ -484,8 +670,21 @@ function renderInspectorPanel(inspectorTab,host,prefix){
   }
   for(const input of $$('[data-number]',$('#inspector')))input.onchange=()=>{setProperty(input.dataset.number,input.value,input);input.value=Number(target[input.dataset.number]*(input.dataset.unit==='pixels'?(input.dataset.number==='x'?project.width:project.height):1)).toFixed(2);};
   $('#rename').onclick=()=>editName(target,'Name',()=>{changed();renderAll();});
-  $('#browse-effects').onclick=()=>{activateInspector(inspectorTab);browserTab='effects';renderBrowser();};
-  for(const card of $$('[data-effect]')){const fx=target.effects.find(e=>e.id===card.dataset.effect);for(const input of $$('[data-fx]',card))input.oninput=()=>{fx[input.dataset.fx]=input.type==='checkbox'?input.checked:+input.value;if(input.type==='range')input.nextElementSibling.textContent=fx.amount.toFixed(2);changed();};$('[data-fx-remove]',card).onclick=()=>{target.effects=target.effects.filter(e=>e!==fx);changed();renderInspector();};$('[data-fx-up]',card).onclick=()=>{const i=target.effects.indexOf(fx);if(i>0)[target.effects[i-1],target.effects[i]]=[target.effects[i],target.effects[i-1]];changed();renderInspector();};}
+  bindEffectStacks(host,target,{getProject:()=>project,toast,prompt:promptText,changed:structural=>{changed(structural?true:'coalesce');if(structural)renderInspector();if(structural&&browserTab==='effects')renderBrowser();},onBrowse:kind=>{activateInspector(inspectorTab);browserTab='effects';effectKind=kind;renderBrowser();}});
+  for(const zone of $$('[data-effect-drop]',host)){zone.ondragover=event=>{if(event.dataTransfer.types.includes('application/prism-effect')){event.preventDefault();zone.classList.add('drag-over');}};zone.ondragleave=()=>zone.classList.remove('drag-over');zone.ondrop=event=>{zone.classList.remove('drag-over');const data=event.dataTransfer.getData('application/prism-effect');if(!data)return;event.preventDefault();addEffect(target,JSON.parse(data),event.altKey);};}
+  if(inspectorTab==='group'){
+    $('#ungroup').onclick=()=>editComposition(()=>{composition.ungroup(project,group.id);selectedGroupId=null;inspectorTab='layer';});
+    $('#group-bypass').onchange=event=>{group.bypass=event.target.checked;changed();renderLayers();};
+    $('#group-solo').onchange=event=>{group.solo=event.target.checked;changed();renderLayers();};
+    $('#group-clear').onclick=()=>{for(const item of project.layers)if(item.groupId===group.id){triggerRequests.delete(item.id);transport.stop(item.id);}renderLayers();};
+  }
+  if(inspectorTab==='layer'){
+    $('#layer-group').onchange=event=>{const value=event.target.value;editComposition(()=>{if(value==='new')selectedGroupId=composition.createGroupForLayer(project,layer.id).id;else composition.setLayerGroup(project,layer.id,value||null);});};
+    $('#layer-locked').onchange=event=>{layer.locked=event.target.checked;changed();renderLayers();};
+    $('#layer-previous').onclick=()=>stepLayerClip(layer,-1);$('#layer-next').onclick=()=>stepLayerClip(layer,1);
+    $('#duplicate-layer').onclick=()=>editComposition(()=>{selectedLayerId=composition.duplicateLayer(project,layer.id).id;});
+    $('#clear-layer-clips').onclick=async()=>{if(await confirmDialog('Clear all clips in this layer?',`Every deck's clips in ${layer.name} are removed. Undo restores them.`,'Clear clips'))editComposition(()=>{transport.stop(layer.id);composition.clearLayerClips(project,layer.id);});};
+  }
   if(clip&&inspectorTab==='clip'){
     for(const b of $$('[data-direction]'))b.onclick=()=>{clip.direction=+b.dataset.direction;clip.paused=false;changed();renderInspector();};
     $('#clip-pause').onclick=()=>{clip.paused=!clip.paused;changed();renderInspector();};
@@ -511,6 +710,7 @@ function renderInspectorPanel(inspectorTab,host,prefix){
     for(const [button,offset] of [['#move-layer-up',1],['#move-layer-down',-1]])$(button).onclick=()=>{const i=project.layers.indexOf(layer),j=i+offset;if(j<0||j>=project.layers.length)return;[project.layers[i],project.layers[j]]=[project.layers[j],project.layers[i]];changed();renderLayers();};
   }
   decorateInspector(host,inspectorTab);
+  addPropertyCogs(host,inspectorTab,target);
   bindDashboard(host,target,inspectorTab);
   if(inspectorTab==='composition'){
     $('#composition-description').onchange=event=>{project.description=event.target.value;changed();};
@@ -521,14 +721,79 @@ function renderInspectorPanel(inspectorTab,host,prefix){
   }
 }
 
+function grouped(definitions,query){
+  const groups=new Map();
+  for(const definition of definitions){
+    if(definition.legacy&&definition.kind!=='canvas'&&!['plasma','grid','rings','noise','solid'].includes(definition.id))continue;
+    if(query&&!`${definition.name} ${definition.category} ${definition.id}`.toLowerCase().includes(query))continue;
+    if(!groups.has(definition.category))groups.set(definition.category,[]);
+    groups.get(definition.category).push(definition);
+  }
+  return [...groups].map(([category,items])=>[category,items.sort((a,b)=>a.name.localeCompare(b.name))]).sort((a,b)=>a[0].localeCompare(b[0]));
+}
+function effectsBrowserHTML(){
+  const query=effectSearch.trim().toLowerCase(),audio=effectKind==='audio',presets=readPresets();
+  const definitions=audio?listAudioEffects():listEffects();
+  const scopeName=effectScope==='composition'?'composition':effectScope==='group'?'group':effectScope==='layer'?'layer':'clip';
+  const items=grouped(definitions,query).map(([category,list])=>`<details class="browser-group" open><summary>${esc(category)} <span class="muted">${list.length}</span></summary>${list.map(definition=>{
+    const own=presets[`${audio?'audio:':''}${definition.id}`]||[];
+    return `<div class="browser-item fx-item" data-add-effect="${esc(definition.id)}" data-effect-kind="${audio?'audio':'video'}" draggable="true" title="Click to add to the selected ${scopeName}. Drag onto a clip, layer or panel; Alt-drop adds it at 0% opacity."><span class="pill">${audio?'AFX':'FX'}</span><strong>${esc(definition.name)}</strong><span class="spacer"></span><span class="muted">＋</span></div>${own.map((preset,index)=>`<div class="browser-item fx-item preset" data-add-effect="${esc(definition.id)}" data-effect-kind="${audio?'audio':'video'}" data-preset="${index}" draggable="true"><span class="muted">↳</span>${esc(preset.name)}</div>`).join('')}`;
+  }).join('')}</details>`).join('');
+  return `<div class="browser-tools"><input id="effect-search" type="search" placeholder="Search effects (Ctrl+/)" value="${esc(effectSearch)}" aria-label="Search effects"><div class="segmented"><button data-effect-kind-tab="video" class="${audio?'':'active'}">Video</button><button data-effect-kind-tab="audio" class="${audio?'active':''}">Audio</button></div></div>
+    <div class="browser-note">Adds to the selected <strong>${scopeName}</strong>. Effects process top to bottom. ${audio?'Audio effects mix with Dry/Wet.':'Each effect has its own opacity and blend mode.'}</div>${items||'<p class="browser-note">No effects match.</p>'}
+    ${audio?'':`<div class="section"><h3>ISF shaders</h3><p class="browser-note">Import Interactive Shader Format (.fs) effects and generators, e.g. from the ISF community library.</p><div class="row"><button id="load-isf-files">Import .fs files…</button>${desktop?.scanISFFolder?'<button id="load-isf-folder">Import folder…</button>':''}</div></div>`}`;
+}
+function sourcesBrowserHTML(){
+  const query=sourceSearch.trim().toLowerCase();
+  const special=['capture','screen','router'];
+  const items=grouped(listSources().filter(definition=>!special.includes(definition.id)),query).map(([category,list])=>`<details class="browser-group" open><summary>${esc(category)} <span class="muted">${list.length}</span></summary>${list.map(definition=>`<div class="browser-item" data-source="${esc(definition.id)}" draggable="true" title="Drag to a clip slot or click to add to the selected layer"><div class="source-icon clip-art ${esc(definition.id)}"></div><div><strong>${esc(definition.name)}</strong><small>${esc(definition.description||definition.category)}</small></div><span class="spacer"></span><span class="muted">＋</span></div>`).join('')}</details>`).join('');
+  const live=`<details class="browser-group" open><summary>Live inputs &amp; routing</summary>
+    ${captureDevices.map(device=>`<div class="browser-item" data-source="capture" data-source-params="${esc(JSON.stringify({device:device.deviceId}))}" data-source-name="${esc(device.label||'Camera')}" draggable="true"><span class="pill">CAM</span><strong>${esc(device.label||'Capture device')}</strong></div>`).join('')}
+    <div class="browser-item" data-source="capture" data-source-name="Capture device" draggable="true"><span class="pill">CAM</span><strong>Default capture device</strong></div>
+    <div class="browser-item" data-source="screen" data-source-name="Screen capture" draggable="true"><span class="pill">SCR</span><strong>Screen capture</strong></div>
+    <div class="browser-item" data-source="router" data-source-name="Video Router" draggable="true"><span class="pill">RT</span><strong>Video Router</strong><small>Layers below, or a chosen layer/group</small></div>
+    <div class="browser-item" data-source="effect-clip" data-source-name="Effect clip" draggable="true"><span class="pill">FX</span><strong>Effect clip</strong><small>Adjustment layer for effects</small></div>
+    <button id="refresh-devices" class="icon-btn">Find capture devices</button></details>`;
+  return `<div class="browser-tools"><input id="source-search" type="search" placeholder="Search sources" value="${esc(sourceSearch)}" aria-label="Search sources"></div><div class="browser-note">Drag a source into a clip slot, or click to add it to the selected layer.</div>${live}${items}`;
+}
+async function importISFTexts(files){
+  let added=0;const problems=[];
+  for(const file of files){
+    try{const {definition,kind,warnings}=parseISF(file.text,{fileName:file.name});(kind==='source'?registerSource:registerEffect)(definition);added++;if(warnings.length)problems.push(`${file.name}: ${warnings[0]}`);}
+    catch(error){problems.push(`${file.name}: ${error.message}`);}
+  }
+  renderBrowser();
+  toast(`Imported ${added} ISF shader${added===1?'':'s'}.${problems.length?` ${problems.length} note${problems.length===1?'':'s'}: ${problems.slice(0,2).join(' · ')}`:''}`,added===0&&problems.length>0);
+  return added;
+}
+async function refreshCaptureDevices(){
+  try{
+    if(!navigator.mediaDevices?.enumerateDevices)throw new Error('Capture devices are unavailable here.');
+    let devices=(await navigator.mediaDevices.enumerateDevices()).filter(device=>device.kind==='videoinput');
+    if(devices.length&&!devices.some(device=>device.label)){const stream=await navigator.mediaDevices.getUserMedia({video:true});stream.getTracks().forEach(track=>track.stop());devices=(await navigator.mediaDevices.enumerateDevices()).filter(device=>device.kind==='videoinput');}
+    captureDevices=devices;renderBrowser();toast(`${devices.length} capture device${devices.length===1?'':'s'} found.`);
+  }catch(error){toast(`Capture devices unavailable: ${error.message}`,true);}
+}
 function renderBrowser(){
   for(const b of $$('[data-browser]'))b.classList.toggle('active',b.dataset.browser===browserTab);
-  if(browserTab==='sources')$('#browser').innerHTML='<div class="browser-note">Drag a source into a clip slot, or click to add to the selected layer.</div>'+sourceTypes.map((s,i)=>`<div class="browser-item" data-source="${s}" draggable="true"><div class="source-icon clip-art ${s}"></div><div><strong>${s[0].toUpperCase()+s.slice(1)}</strong><small>${sourceDescriptions[i]}</small></div><span class="spacer"></span><span class="muted">＋</span></div>`).join('');
-  if(browserTab==='effects')$('#browser').innerHTML=`<div class="browser-note">Click an effect to add it to the selected <strong>${effectScope}</strong>. Effects process from top to bottom.</div>`+effects.map(s=>`<div class="browser-item" data-add-effect="${s}"><span class="pill">FX</span><strong>${s[0].toUpperCase()+s.slice(1)}</strong><span class="spacer"></span><span class="muted">＋</span></div>`).join('');
+  if(browserTab==='sources')$('#browser').innerHTML=sourcesBrowserHTML();
+  if(browserTab==='effects')$('#browser').innerHTML=effectsBrowserHTML();
   if(browserTab==='files'){fileBrowser.render($('#browser'));return;}else fileBrowser.detach();
-  if(browserTab==='controls')$('#browser').innerHTML=`<div class="section"><h3>Performance controls</h3><p class="browser-note">Number keys 1–0 trigger the selected layer; Shift triggers a column. Q–I trigger the top layer; A–K the middle; Z–comma the bottom. Space pauses. Escape clears blackout.</p><button id="enable-midi">${midiAccess?'MIDI connected':'Enable MIDI input'}</button><p id="midi-status" class="browser-note">${midiAccess?[...midiAccess.inputs.values()].map(x=>esc(x.name)).join(', ')||'No MIDI inputs detected':'Connect a controller, then enable MIDI.'}</p></div><div class="section"><h3>MIDI learn</h3><select id="learn-target"><option value="crossfader">Crossfader</option><option value="masterOpacity">Master video</option><option value="masterVolume">Master audio</option>${project.layers.map((l,i)=>`<option value="layer:${l.id}:opacity">${esc(l.name)} video</option>`).join('')}${Array.from({length:project.columns||8},(_,i)=>`<option value="column:${i}">Column ${i+1}</option>`).join('')}</select><button id="midi-learn" class="icon-btn">Learn</button><div id="mappings">${project.mappings.map((m,i)=>`<div class="mapping"><small class="grow">${esc(m.target)} ← ${m.type} ${m.number}</small><button data-unmap="${i}" class="icon-btn">×</button></div>`).join('')}</div></div>${desktop?.startOSC?'<div class="section"><h3>OSC input</h3><div class="row"><input id="osc-port" aria-label="OSC port" type="number" min="1024" max="65535" value="7000" style="width:80px"><button id="osc-start">Start OSC</button><button id="osc-stop">Stop</button></div><p class="browser-note">Local UDP input. /composition/video/fadeout/values, /layer1/audio/pan/values, /layer1/clip1/connect, /layer1/video/opacity/values.</p></div>':''}`;
-  for(const item of $$('[data-source]')){item.onclick=()=>addSource(item.dataset.source);item.ondragstart=e=>e.dataTransfer.setData('application/prism-source',item.dataset.source);}
-  for(const item of $$('[data-add-effect]'))item.onclick=()=>{const target=effectScope==='composition'?project:effectScope==='layer'?currentLayer():currentClip();if(!target)return toast('Select a clip or layer first.');if(target.effects.length>=LIMITS.effects)return toast('Effect stack limit reached.');target.effects.push({id:id(),type:item.dataset.addEffect,enabled:true,amount:.5});changed();activateInspector(effectScope);};
+  if(browserTab==='controls')$('#browser').innerHTML=shortcuts.panelHTML()+controlExtrasHTML()+`<div class="section"><h3>Performance controls</h3><p class="browser-note">Number keys 1–0 trigger the selected layer; Shift triggers a column. Q–I trigger the top layer; A–K the middle; Z–comma the bottom. Space pauses. Escape clears blackout.</p><button id="enable-midi">${midiAccess?'MIDI connected':'Enable MIDI input'}</button><p id="midi-status" class="browser-note">${midiAccess?[...midiAccess.inputs.values()].map(x=>esc(x.name)).join(', ')||'No MIDI inputs detected':'Connect a controller, then enable MIDI.'}</p></div><div class="section"><h3>MIDI learn</h3><select id="learn-target"><option value="crossfader">Crossfader</option><option value="masterOpacity">Master video</option><option value="masterVolume">Master audio</option>${project.layers.map((l,i)=>`<option value="layer:${l.id}:opacity">${esc(l.name)} video</option>`).join('')}${Array.from({length:project.columns||8},(_,i)=>`<option value="column:${i}">Column ${i+1}</option>`).join('')}</select><button id="midi-learn" class="icon-btn">Learn</button><div id="mappings">${project.mappings.map((m,i)=>`<div class="mapping"><small class="grow">${esc(m.target)} ← ${m.type} ${m.number}</small><button data-unmap="${i}" class="icon-btn">×</button></div>`).join('')}</div></div>${desktop?.startOSC?'<div class="section"><h3>OSC input</h3><div class="row"><input id="osc-port" aria-label="OSC port" type="number" min="1024" max="65535" value="7000" style="width:80px"><button id="osc-start">Start OSC</button><button id="osc-stop">Stop</button></div><p class="browser-note">Local UDP input. /composition/video/fadeout/values, /layer1/audio/pan/values, /layer1/clip1/connect, /layer1/video/opacity/values.</p></div>':''}`;
+  const sourceExtra=item=>({params:item.dataset.sourceParams?JSON.parse(item.dataset.sourceParams):undefined,name:item.dataset.sourceName});
+  for(const item of $$('[data-source]')){item.onclick=()=>addSource(item.dataset.source,currentLayer(),undefined,sourceExtra(item));item.ondragstart=e=>{e.dataTransfer.setData('application/prism-source',item.dataset.source);e.dataTransfer.setData('application/prism-source-extra',JSON.stringify(sourceExtra(item)));};}
+  for(const item of $$('[data-add-effect]')){
+    const data={type:item.dataset.addEffect,kind:item.dataset.effectKind||'video',...(item.dataset.preset!==undefined?{preset:Number(item.dataset.preset)}:{})};
+    item.onclick=event=>{addEffect(inspectorTarget(effectScope),data,event.altKey);activateInspector(effectScope);};
+    item.ondragstart=event=>{event.dataTransfer.setData('application/prism-effect',JSON.stringify(data));event.dataTransfer.effectAllowed='copy';};
+  }
+  const search=$('#effect-search')||$('#source-search');
+  if(search){search.oninput=()=>{if(search.id==='effect-search')effectSearch=search.value;else sourceSearch=search.value;const position=search.selectionStart;renderBrowser();const next=$('#'+search.id);next.focus();next.setSelectionRange(position,position);};}
+  for(const button of $$('[data-effect-kind-tab]'))button.onclick=()=>{effectKind=button.dataset.effectKindTab;renderBrowser();};
+  $('#refresh-devices')?.addEventListener('click',refreshCaptureDevices);
+  $('#load-isf-files')?.addEventListener('click',()=>{const input=document.createElement('input');input.type='file';input.accept='.fs,.frag,.glsl';input.multiple=true;input.onchange=async()=>importISFTexts(await Promise.all([...input.files].map(async file=>({name:file.name,text:await file.text()}))));input.click();});
+  $('#load-isf-folder')?.addEventListener('click',async()=>{try{const result=await desktop.scanISFFolder();if(result)await importISFTexts(result.files);if(result?.folder&&!preferences.isfFolders.includes(result.folder))preferences=writePreferences({...preferences,isfFolders:[...preferences.isfFolders,result.folder]});}catch(error){toast(`ISF import failed: ${error.message}`,true);}});
+  if(browserTab==='controls')shortcuts.bindPanel($('#browser'),{prompt:promptText,render:renderBrowser});
   $('#import-media')?.addEventListener('click',()=>importFiles());
   for(const item of $$('[data-library]'))item.onclick=()=>placeMedia(mediaLibrary[+item.dataset.library],currentLayer());
   $('#enable-midi')?.addEventListener('click',enableMidi);
@@ -536,10 +801,11 @@ function renderBrowser(){
   for(const b of $$('[data-unmap]'))b.onclick=()=>{project.mappings.splice(+b.dataset.unmap,1);changed();renderBrowser();};
   $('#osc-start')?.addEventListener('click',async()=>{try{const result=await desktop.startOSC(+$('#osc-port').value);toast(`OSC listening on port ${result?.port||$('#osc-port').value}`);}catch(e){toast(e.message,true);}});
   $('#osc-stop')?.addEventListener('click',async()=>{await desktop.stopOSC();toast('OSC stopped.');});
+  if(browserTab==='controls')bindControlExtras();
 }
 
 function bindStatic(){
-  for(const [selector,key] of [['#project-name','name'],['#bpm','bpm'],['#quantize','quantize'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])$(selector).oninput=e=>{project[key]=key==='name'?e.target.value:+e.target.value;if(key==='bpm')project.bpm=Math.max(20,Math.min(300,project.bpm||120));$('#speed-value').textContent=project.speed.toFixed(2)+'×';changed();};
+  for(const [selector,key] of [['#project-name','name'],['#bpm','bpm'],['#quantize','quantize'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])$(selector).oninput=e=>{project[key]=key==='name'?e.target.value:+e.target.value;if(key==='bpm')project.bpm=Math.max(20,Math.min(300,project.bpm||120));$('#speed-value').textContent=project.speed.toFixed(2)+'×';changed('coalesce');};
   $('#pause').onclick=()=>{project.paused=!project.paused;changed();syncGlobals();};
   const direction=(mode,pin=false)=>{if(pin&&project.directionPin===mode)project.directionPin=null;else transport.setGlobalDirection(mode,{pin});changed();syncGlobals();renderInspector();};
   for(const button of $$('[data-global-direction]')){button.onclick=()=>direction(button.dataset.globalDirection);button.oncontextmenu=event=>{event.preventDefault();direction(button.dataset.globalDirection,true);};}
@@ -570,9 +836,53 @@ function bindStatic(){
   window.addEventListener('blur',()=>{pendingDashboardDrag=null;for(const [key,value] of heldKeys){releaseHeld(value);heldKeys.delete(key);}for(const value of heldPointers.values())releaseHeld(value);heldPointers.clear();});
   window.addEventListener('dragover',e=>e.preventDefault());window.addEventListener('drop',e=>e.preventDefault());
   document.addEventListener('pointerdown',()=>engine.audioContext?.resume().catch(()=>{}));
+  // Parameter cogwheels open the animation editor (manual p. 141).
+  document.addEventListener('click',event=>{
+    const cog=event.target.closest('[data-animate-path]');
+    if(!cog||document.documentElement.dataset.shortcutEdit)return;
+    event.preventDefault();event.stopPropagation();
+    openAnimationEditor(cog,cog.dataset.animatePath,{getProject:()=>project,changed:()=>changed(),spectrum:source=>spectrumFor(source),onClose:()=>renderInspector()});
+  });
   window.addEventListener('beforeunload',()=>{if(dirty)autosave();for(const url of objectURLs)URL.revokeObjectURL(url);});
 }
 
+// Shortcut targets: map an interface control to its parameter or action path.
+function targetFor(element){
+  const el=element.closest('[data-param-path],[data-animate-path],[data-prop],[data-number],[data-layer-prop],[data-action],[data-group-prop],[data-group-action],[data-fx-bypass],[data-clip],[data-column],[data-deck],[data-group-column],button[id],input[id]');
+  if(!el)return null;
+  if(el.dataset.paramPath)return el.dataset.paramPath;
+  if(el.dataset.animatePath)return el.dataset.animatePath;
+  const host=el.closest('[data-inspector-panel]');
+  if(host&&(el.dataset.prop||el.dataset.number)){const scope=host.dataset.scope,target=inspectorTarget(scope),key=el.dataset.prop||el.dataset.number;return target&&(PROPERTY_PARAMS[scope]||[]).some(param=>param.key===key)?`${ownerPath(scope,target)}/${key}`:null;}
+  const row=el.closest('[data-layer]');
+  if(row&&el.dataset.layerProp&&el.dataset.layerProp!=='blend')return `layer/${row.dataset.layer}/${el.dataset.layerProp}`;
+  if(row&&el.dataset.action)return el.dataset.action==='stop'?`action/layer/${row.dataset.layer}/clear`:`layer/${row.dataset.layer}/${el.dataset.action}`;
+  const groupRow=el.closest('[data-group-row]');
+  if(groupRow&&el.dataset.groupProp&&el.dataset.groupProp!=='blend')return `group/${groupRow.dataset.groupRow}/${el.dataset.groupProp}`;
+  if(groupRow&&el.dataset.groupAction)return el.dataset.groupAction==='clear'?`action/group/${groupRow.dataset.groupRow}/clear`:`group/${groupRow.dataset.groupRow}/${el.dataset.groupAction}`;
+  if(el.dataset.fxBypass!==undefined){const card=el.closest('[data-effect]');return card?`${el.closest('[data-effect-stack="audio"]')?'audiofx':'effect'}/${card.dataset.effect}/enabled`:null;}
+  if(el.dataset.clip)return `action/clip/${el.dataset.clip}/trigger`;
+  if(el.dataset.column!==undefined)return `action/column/${el.dataset.column}`;
+  if(el.dataset.deck)return `action/deck/${el.dataset.deck}`;
+  return {'master-opacity':'composition/masterOpacity','master-volume':'composition/masterVolume',crossfader:'composition/crossfader','global-speed':'composition/speed',bpm:'composition/bpm',pause:'composition/paused',blackout:'composition/blackout','bypass-all':'composition/bypass',tap:'action/composition/tap','clear-all':'action/composition/clear','cross-a':'action/composition/fade-a','cross-b':'action/composition/fade-b',resync:'action/composition/resync'}[el.id]||null;
+}
+function runAction(path,pressed,inputId=id()){
+  const [,kind,a,b]=path.split('/');
+  const release=()=>{const held=shortcutHolds.get(inputId);shortcutHolds.delete(inputId);if(held)releaseHeld(held);};
+  if(kind==='clip'){
+    const found=findClip(a);if(!found)return;const {clip,layer}=found;
+    if(!pressed)return release();
+    const held={layerId:layer.id,clipId:clip.id,inputId};shortcutHolds.set(inputId,held);
+    trigger(layer,clip,()=>!transport.isPiano(clip)||shortcutHolds.get(inputId)===held,{inputId,selectedLayerId});return;
+  }
+  if(kind==='column'){if(pressed)beginColumnHold(Number(a),shortcutHolds,inputId);else release();return;}
+  if(!pressed)return;
+  if(kind==='layer'){const layer=project.layers.find(item=>item.id===a);if(!layer)return;if(b==='clear'){triggerRequests.delete(layer.id);transport.stop(layer.id);}else if(b==='next')stepLayerClip(layer,1);else if(b==='previous')stepLayerClip(layer,-1);renderLayers();}
+  else if(kind==='group'&&b==='clear'){for(const layer of project.layers)if(layer.groupId===a){triggerRequests.delete(layer.id);transport.stop(layer.id);}renderLayers();}
+  else if(kind==='deck'&&project.decks.some(deck=>deck.id===a)){project.selectedDeckId=a;changed();renderDecks();renderLayers();}
+  else if(kind==='composition'){if(a==='tap')$('#tap').click();else if(a==='clear')$('#clear-all').click();else if(a==='fade-a')fadeCrossfader(0);else if(a==='fade-b')fadeCrossfader(1);else if(a==='resync')transport.resync(now());}
+}
+function actionState(path){const [,kind,a]=path.split('/');if(kind==='clip')return project.layers.some(layer=>layer.activeClipId===a);if(kind==='deck')return project.selectedDeckId===a;return false;}
 function releaseHeld(held){for(const voice of held.clips||[held])transport.release(voice.layerId,voice.clipId,{inputId:voice.inputId});}
 function beginColumnHold(index,holds,key){
   const held={inputId:id(),clips:[]};holds.set(key,held);
@@ -592,14 +902,16 @@ async function trigger(layer,clip,stillHeld=()=>true,options={}){
   finally{if(triggerRequests.get(key)===request)triggerRequests.delete(key);}
 }
 
-async function triggerColumn(index,{inputId,stillHeld=()=>true,held}={}){const items=project.layers.map(layer=>({layer,clip:clipList(layer)[index],request:id()})).filter(item=>item.clip&&!item.layer.ignoreColumn&&!item.clip.ignoreColumn&&!findClip(item.layer.activeClipId)?.clip.ignoreColumn);if(held)held.clips=items.map(item=>({layerId:item.layer.id,clipId:item.clip.id,inputId}));for(const item of items)triggerRequests.set(item.layer.id,item.request);const results=await Promise.allSettled(items.map(item=>engine.prepare(item.clip)));const time=now();for(let i=0;i<items.length;i++){const item=items[i];if(results[i].status==='rejected'){toast(`Cannot play ${item.clip.name}: ${results[i].reason.message}`,true);continue;}if(triggerRequests.get(item.layer.id)===item.request&&findClip(item.clip.id)&&(!transport.isPiano(item.clip)||stillHeld()))transport.trigger(item.layer.id,item.clip.id,time,{target:'own',inputId});}engine.audioContext?.resume().catch(()=>{});renderLayers();return items.map(item=>({layerId:item.layer.id,clipId:item.clip.id,inputId}));}
-function addSource(source,layer=currentLayer(),index){
+async function triggerColumn(index,{inputId,stillHeld=()=>true,held,groupId}={}){const items=project.layers.filter(layer=>groupId?layer.groupId===groupId:!groupOfLayer(layer)?.ignoreColumn).map(layer=>({layer,clip:clipList(layer)[index],request:id()})).filter(item=>item.clip&&!item.layer.ignoreColumn&&!item.clip.ignoreColumn&&!findClip(item.layer.activeClipId)?.clip.ignoreColumn);if(held)held.clips=items.map(item=>({layerId:item.layer.id,clipId:item.clip.id,inputId}));for(const item of items)triggerRequests.set(item.layer.id,item.request);const results=await Promise.allSettled(items.map(item=>engine.prepare(item.clip)));const time=now();for(let i=0;i<items.length;i++){const item=items[i];if(results[i].status==='rejected'){toast(`Cannot play ${item.clip.name}: ${results[i].reason.message}`,true);continue;}if(triggerRequests.get(item.layer.id)===item.request&&findClip(item.clip.id)&&(!transport.isPiano(item.clip)||stillHeld()))transport.trigger(item.layer.id,item.clip.id,time,{target:'own',inputId});}engine.audioContext?.resume().catch(()=>{});renderLayers();return items.map(item=>({layerId:item.layer.id,clipId:item.clip.id,inputId}));}
+function addSource(source,layer=currentLayer(),index,extra={}){
+  if(layer.locked)return toast(`${layer.name} is locked. Unlock it in the layer panel to change its content.`);
   const deckId=project.selectedDeckId;
   if(index===undefined)index=clipList(layer).findIndex(c=>!c);
   if(index<0)return toast('This layer is full. Add a deck or choose an empty slot.');
   const visible=visibleSlot(project,layer,deckId,index);
   if(visible.persistentFrom&&visible.persistentFrom!==deckId)return toast('This slot is covered by a persistent clip. Choose another slot or turn off persistence.');
-  const clip=createClip('source',{name:source[0].toUpperCase()+source.slice(1),source});
+  const definition=sourceDefinition(source);
+  const clip=source==='effect-clip'?createClip('effect',{name:extra.name||'Effect clip'}):createClip('source',{name:extra.name||definition?.name||source,source,params:extra.params});
   const slots=storedClipList(layer,deckId),previous=slots[index];
   if(previous){if(previous.id===layer.activeClipId)transport.stop(layer.id);engine.remove(previous.id);}
   slots[index]=clip;selectClip(layer,clip,index);changed();renderAll();
@@ -612,6 +924,7 @@ async function importFileList(files,layer,index){for(const file of files){let it
 function kindFor(name){return /\.(png|jpe?g|gif|bmp|webp|avif|svg)$/i.test(name)?'image':/\.(wav|mp3|ogg|flac|m4a|aac|aiff?)$/i.test(name)?'audio':'video';}
 async function placeMedia(item,layer,index){
   if(item.error)return toast(`Cannot import ${item.name}: ${item.error}`,true);
+  if(layer.locked)return toast(`${layer.name} is locked. Unlock it to change its content.`);
   const destinationProject=project,deckId=project.selectedDeckId;
   if(index===undefined)index=clipList(layer).findIndex(c=>!c);
   if(index<0||index>=(project.columns||8))return toast('This layer is full. Add another deck for more media.');
@@ -797,7 +1110,121 @@ async function toggleRecording(){
   finally{recordingPending=false;}
 }
 
-async function openOutput(){if(!desktop){try{await $('#output-canvas').requestFullscreen();}catch(e){toast(e.message,true);}return;}if(outputOpen){await desktop.closeOutput();outputOpen=false;$('#output').classList.remove('active');return;}const displays=await desktop.getDisplays();const body=`<p>Choose a display for fullscreen output. Escape closes the output.</p><div class="select-field"><label>Display</label><select id="display-choice">${displays.map(d=>`<option value="${d.id}">${esc(d.label)} · ${d.width} × ${d.height}</option>`).join('')}</select></div>`;const dialog=showDialog('Output display',body,[['Cancel','cancel'],['Open output','open']]);dialog.addEventListener('close',async()=>{if(dialog.returnValue==='open'){await desktop.openOutput(Number($('#display-choice',dialog).value));outputOpen=true;$('#output').classList.add('active');}});}
+async function openOutput(){
+  if(outputs.active||outputOpen){outputs.closeAll();if(desktop?.closeOutput)await desktop.closeOutput().catch(()=>{});outputOpen=false;$('#output').classList.remove('active');toast('Outputs closed.');return;}
+  displaysCache=desktop?await desktop.getDisplays():[];
+  const configured=project.advancedOutput?.screens?.some(screen=>screen.enabled!==false&&screen.device?.type==='display');
+  const body=`<p>Send the composition to a display. Escape in an output window leaves fullscreen.</p>${displaysCache.length?`<div class="select-field"><label>Display</label><select id="display-choice">${displaysCache.map(d=>`<option value="${d.id}">${esc(d.label)} · ${d.width} × ${d.height}</option>`).join('')}</select></div>`:'<p class="browser-note">In the browser, the output opens in a new window you can drag to another display.</p>'}${configured?'<p class="browser-note">This composition has an Advanced Output setup. “Open Advanced Output screens” uses its screens and slices.</p>':''}`;
+  const dialog=showDialog('Output',body,[['Cancel','cancel'],['Advanced Output…','advanced'],...(configured?[['Open Advanced Output screens','configured']]:[]),['Open output','open']]);
+  dialog.addEventListener('close',async()=>{
+    const action=dialog.returnValue;
+    if(action==='advanced')return openOutputEditor();
+    if(action!=='open'&&action!=='configured')return;
+    let config=project.advancedOutput;
+    if(action==='open'){
+      // A quick output is a single full-composition screen on the chosen display.
+      const screen=screenFromComposition(project.width,project.height);
+      const display=displaysCache.find(item=>String(item.id)===String($('#display-choice',dialog)?.value));
+      config={version:1,screens:[{...screen,name:display?.label||'Output',device:display?{type:'display',displayId:String(display.id),width:project.width,height:project.height}:{...screen.device}}]};
+    }
+    const opened=outputs.sync(config,{displays:displaysCache});
+    if(!opened&&desktop?.openOutput){await desktop.openOutput(Number($('#display-choice',dialog)?.value));toast('Using the compatibility output window.');}
+    outputOpen=opened>0||!!desktop?.openOutput;$('#output').classList.toggle('active',outputOpen);
+  });
+}
+function openOutputEditor(){
+  if(outputEditor)return;
+  const host=document.createElement('div');host.className='output-overlay';document.body.append(host);
+  const config=project.advancedOutput||normalizeOutputConfig(null,{compositionWidth:project.width,compositionHeight:project.height});
+  const done=()=>{outputEditor?.close?.();outputEditor=null;host.remove();};
+  outputEditor=openAdvancedOutput({host,config,compositionCanvas:$('#output-canvas'),compositionSize:{width:project.width,height:project.height},
+    displays:displaysCache.map(item=>({id:String(item.id),label:item.label,width:item.width,height:item.height})),
+    layers:project.layers.map(layer=>({id:layer.id,name:layer.name})),groups:(project.groups||[]).map(group=>({id:group.id,name:group.name})),
+    outputOptions:outputs.options,onOutputOptions:options=>outputs.setOptions(options),
+    onChange:next=>{project.advancedOutput=next;changed();if(outputs.active)outputs.sync(next,{displays:displaysCache});},
+    onClose:done});
+  const escape=event=>{if(event.key==='Escape'&&!event.defaultPrevented&&outputEditor&&!$('dialog[open]')){document.removeEventListener('keydown',escape);done();}};
+  document.addEventListener('keydown',escape);
+}
+// DMX output (manual pp. 125–131): sample fixture areas of the visible output.
+function controlExtrasHTML(){
+  const dmx=project.dmx||normalizeDmxConfig(null),lumiverse=id=>dmx.lumiverses.find(item=>item.id===id);
+  const fixture=item=>`<div class="dmx-fixture" data-fixture="${esc(item.id)}"><div class="row"><input data-fixture-field="name" value="${esc(item.name)}" aria-label="Fixture name" class="grow"><button data-fixture-remove title="Remove fixture">×</button></div>
+    <div class="dmx-grid">${[['universe','Universe',lumiverse(item.lumiverseId)?.universe??0],['startChannel','Start ch',item.startChannel],['x','X',item.rect.x],['y','Y',item.rect.y],['width','W',item.rect.width],['height','H',item.rect.height],['columns','Cols',item.columns],['rows','Rows',item.rows]].map(([key,label,value])=>`<label>${label}<input type="number" data-fixture-field="${key}" value="${value}"></label>`).join('')}
+    <label>Channels<select data-fixture-field="channels">${['rgb','grb','bgr','rgbw','rgba','w','dimmer-rgb'].map(value=>`<option ${item.channels===value?'selected':''}>${value}</option>`).join('')}</select></label><label>Order<select data-fixture-field="order">${['row-major','snake','column-major','column-snake'].map(value=>`<option ${item.order===value?'selected':''}>${value}</option>`).join('')}</select></label></div></div>`;
+  return `${desktop?.sendOSC?`<div class="section"><h3>OSC output</h3><div class="row"><label><input id="osc-out-enabled" type="checkbox" ${preferences.oscOutEnabled?'checked':''}> Send feedback</label><input id="osc-out-host" value="${esc(preferences.oscOutHost)}" style="width:110px" aria-label="OSC output host"><input id="osc-out-port" type="number" min="1" max="65535" value="${preferences.oscOutPort}" style="width:70px" aria-label="OSC output port"></div><p class="browser-note">OSC shortcuts with feedback send their current value (0–1) to this address.</p></div>`:''}
+    <div class="section"><h3>DMX output (Art-Net / sACN)</h3><div class="row wrap"><label><input id="dmx-enabled" type="checkbox" ${dmx.enabled&&dmxActive?'checked':''}> Send DMX</label><select id="dmx-protocol" aria-label="DMX protocol">${['artnet','sacn'].map(value=>`<option value="${value}" ${dmx.protocol===value?'selected':''}>${value==='artnet'?'Art-Net':'sACN'}</option>`).join('')}</select><input id="dmx-host" value="${esc(dmx.host)}" placeholder="${dmx.protocol==='sacn'?'multicast':'255.255.255.255'}" style="width:120px" aria-label="DMX destination"></div>
+    <p class="browser-note">Fixtures sample a rectangle of the output (composition pixels) as a grid of RGB pixels.</p>${dmx.fixtures.map(fixture).join('')}<button id="dmx-add-fixture" class="icon-btn">+ Fixture</button>
+    <h3 style="margin-top:10px">DMX input (shortcuts)</h3><div class="row"><label><input id="dmx-input-enabled" type="checkbox" ${dmx.input.enabled?'checked':''}> Receive</label><input id="dmx-input-universe" type="number" min="0" max="32767" value="${dmx.input.universe}" style="width:70px" aria-label="DMX input universe"></div></div>`;
+}
+function bindControlExtras(){
+  const host=$('#browser'),save=next=>{project.dmx=normalizeDmxConfig(next);changed();};
+  const savePreferences=()=>{preferences=writePreferences({...preferences,oscOutEnabled:$('#osc-out-enabled')?.checked??preferences.oscOutEnabled,oscOutHost:$('#osc-out-host')?.value??preferences.oscOutHost,oscOutPort:Number($('#osc-out-port')?.value)||preferences.oscOutPort});oscSent.clear();};
+  for(const selector of ['#osc-out-enabled','#osc-out-host','#osc-out-port'])$(selector)?.addEventListener('change',savePreferences);
+  $('#dmx-enabled')?.addEventListener('change',event=>setDmxOutput(event.target.checked));
+  $('#dmx-protocol')?.addEventListener('change',event=>{save({...(project.dmx||{}),protocol:event.target.value,port:undefined,host:undefined});if(dmxActive)setDmxOutput(true);else renderBrowser();});
+  $('#dmx-host')?.addEventListener('change',event=>{save({...(project.dmx||{}),host:event.target.value.trim()});if(dmxActive)setDmxOutput(true);});
+  $('#dmx-add-fixture')?.addEventListener('click',()=>{
+    const dmx=project.dmx||normalizeDmxConfig(null),lumiverses=dmx.lumiverses.length?dmx.lumiverses:[{id:'lumiverse-1',name:'Lumiverse 1',universe:dmx.protocol==='sacn'?1:0}];
+    save({...dmx,lumiverses,fixtures:[...dmx.fixtures,{id:`fixture-${crypto.randomUUID()}`,name:`Fixture ${dmx.fixtures.length+1}`,lumiverseId:lumiverses[0].id,startChannel:1,rect:{x:0,y:0,width:project.width,height:project.height},columns:8,rows:1,channels:'rgb',order:'row-major'}]});
+    renderBrowser();
+  });
+  for(const card of $$('[data-fixture]',host)){
+    const update=(key,value)=>{
+      const dmx=project.dmx,fixtures=dmx.fixtures.map(item=>{
+        if(item.id!==card.dataset.fixture)return item;
+        if(['x','y','width','height'].includes(key))return {...item,rect:{...item.rect,[key]:Number(value)}};
+        if(key==='universe'){return {...item,lumiverseId:ensureLumiverse(Number(value))};}
+        return {...item,[key]:['startChannel','columns','rows'].includes(key)?Number(value):value};
+      });
+      save({...project.dmx,fixtures});
+    };
+    for(const input of $$('[data-fixture-field]',card))input.onchange=()=>update(input.dataset.fixtureField,input.value);
+    $('[data-fixture-remove]',card).onclick=()=>{save({...project.dmx,fixtures:project.dmx.fixtures.filter(item=>item.id!==card.dataset.fixture)});renderBrowser();};
+  }
+  const inputChange=async()=>{
+    const enabled=$('#dmx-input-enabled').checked,universe=Number($('#dmx-input-universe').value)||0;
+    save({...(project.dmx||{}),input:{...(project.dmx?.input||{}),enabled,universe}});
+    try{if(enabled)await desktop?.startDMXInput?.({protocol:project.dmx.protocol,universes:[universe]});else await desktop?.stopDMXInput?.();}catch(error){toast(`DMX input: ${error.message}`,true);}
+  };
+  $('#dmx-input-enabled')?.addEventListener('change',inputChange);$('#dmx-input-universe')?.addEventListener('change',inputChange);
+}
+function ensureLumiverse(universe){
+  const dmx=project.dmx,existing=dmx.lumiverses.find(item=>item.universe===universe);
+  if(existing)return existing.id;
+  const lumiverse={id:`lumiverse-${crypto.randomUUID()}`,name:`Universe ${universe}`,universe};
+  project.dmx={...dmx,lumiverses:[...dmx.lumiverses,lumiverse]};
+  return lumiverse.id;
+}
+function sendDmxFrame(){
+  const config=project.dmx,region=fixtureSampleRect(config,{width:project.width,height:project.height});
+  if(!region)return;
+  const pixels=engine.readRegion(region.x,region.y,region.width,region.height);
+  if(!pixels)return;
+  const universes=sampleFixtures(pixels,region.width,region.height,config,{flipY:true,region});
+  desktop.sendDMX([...universes].map(([universe,data])=>[universe,Uint8Array.from(data)]));
+}
+async function setDmxOutput(enabled){
+  if(!desktop?.startDMX)return toast('DMX output needs the Windows app.',true);
+  try{
+    project.dmx=normalizeDmxConfig({...(project.dmx||{}),enabled});
+    if(enabled){await desktop.startDMX({protocol:project.dmx.protocol,host:project.dmx.host||undefined,port:project.dmx.port,rate:project.dmx.rate});dmxActive=true;}
+    else{dmxActive=false;await desktop.stopDMX();}
+    changed();renderBrowser();
+  }catch(error){dmxActive=false;toast(`DMX output: ${error.message}`,true);}
+}
+// OSC output: mirror OSC shortcut values back to the sender's controller.
+function sendOSCFeedback(){
+  const messages=[];
+  for(const shortcut of project.shortcuts||[]){
+    if(shortcut.source!=='osc'||!shortcut.feedback||!shortcut.input.address)continue;
+    const target=shortcut.target.startsWith('action/')?null:resolvePath(project,shortcut.target);
+    const value=target?(()=>{const raw=readOwner(target.scope,target.owner,target.key);return typeof raw==='boolean'?(raw?1:0):typeof raw==='number'?Math.round(((raw-(target.param.min??0))/(((target.param.max??1)-(target.param.min??0))||1))*1000)/1000:null;})():actionState(shortcut.target)?1:0;
+    if(value===null||oscSent.get(shortcut.id)===value)continue;
+    oscSent.set(shortcut.id,value);messages.push({address:shortcut.input.address,args:[value]});
+  }
+  if(messages.length)desktop.sendOSC(preferences.oscOutHost,preferences.oscOutPort,messages.slice(0,256)).catch(error=>toast(`OSC output: ${error.message}`,true));
+}
 
 function stopPreview(){
   if(!preview)return;
@@ -818,7 +1245,15 @@ function togglePreview(){
 
 function frame(timestamp){
   const t=timestamp/1000;
-  try{const frames=transport.tick(t);engine.render(project,frames,t);if(preview){preview.project.bpm=project.bpm;preview.project.width=project.width;preview.project.height=project.height;preview.engine.render(preview.project,preview.transport.tick(t).map(f=>({...f,clip:{...f.clip,opacity:1,volume:0}})),t);}
+  try{const frames=transport.tick(t);const dt=lastFrameTime?Math.min(1,Math.max(0,t-lastFrameTime)):0;lastFrameTime=t;
+    animatedCount=applyAnimations(project,frames,animator,{dt:project.paused?0:dt,beat:transport.beat,spectrum:(source,owner)=>engine.spectrum(source,owner)});
+    engine.render(project,frames,t,{beat:transport.beat});
+    if(animatedCount&&t-lastAnimationRefresh>1/30){lastAnimationRefresh=t;refreshControls();}
+    if(shortcuts&&t-lastFeedback>.05){lastFeedback=t;shortcuts.syncFeedback();}
+    outputs?.present(t);
+    if(outputEditor&&t-(outputEditor.lastUpdate||0)>1/30){outputEditor.lastUpdate=t;outputEditor.update?.($('#output-canvas'));}
+    if(dmxActive&&project.dmx?.enabled&&t-lastDmx>1/Math.max(1,project.dmx.rate||44)){lastDmx=t;sendDmxFrame();}
+    if(preferences.oscOutEnabled&&desktop?.sendOSC&&t-lastOscOut>.05){lastOscOut=t;sendOSCFeedback();}if(preview){preview.project.bpm=project.bpm;preview.project.width=project.width;preview.project.height=project.height;preview.engine.render(preview.project,preview.transport.tick(t).map(f=>({...f,clip:{...f.clip,opacity:1,volume:0}})),t);}
     const active=project.layers.map(l=>l.activeClipId).join(',');if(active!==lastActive)renderLayers();
     for(const f of frames){
       const layerTimeline=layerPlayheads.get(f.layer.id);
@@ -832,7 +1267,7 @@ function frame(timestamp){
     }
     paintFrames++;if(t-lastPaint>.1){lastPaint=t;for(const layer of project.layers){const queued=transport.getState(layer.id)?.pendingClipId;for(const slot of queuedSlots.get(layer.id)||[])slot.classList.toggle('queued',slot.dataset.clip===queued);}const beat=transport.beat??t*project.bpm/60;$('#beat-status').textContent=`BEAT ${Math.floor(beat/4)%999+1}.${Math.floor(beat%4)+1}`;if(recorder?.state==='recording')$('#record').textContent='■ '+formatTime(t-recordingStarted);}
     if(t-paintStart>1){$('#frame-count').textContent=`${Math.round(paintFrames/(t-paintStart))} FPS`;paintFrames=0;paintStart=t;const stats=engine.getStats?.();if(stats?.audioRms!==undefined)$('#audio-meter').textContent=stats.audioRms>0?Math.round(20*Math.log10(stats.audioRms))+' dB':'silent';$('#memory-status').textContent=stats?.mediaCount!==undefined?`${stats.mediaCount} media loaded`:'';}
-    if(outputOpen&&!sendingFrame&&t-lastOutputFrame>1/30){sendingFrame=true;lastOutputFrame=t;$('#output-canvas').toBlob(async blob=>{try{if(blob)await desktop.sendOutputFrame(await blob.arrayBuffer());}finally{sendingFrame=false;}},'image/jpeg',.9);}
+    if(outputOpen&&!outputs?.active&&!sendingFrame&&t-lastOutputFrame>1/30){sendingFrame=true;lastOutputFrame=t;$('#output-canvas').toBlob(async blob=>{try{if(blob)await desktop.sendOutputFrame(await blob.arrayBuffer());}finally{sendingFrame=false;}},'image/jpeg',.9);}
   }catch(e){if(!frame.lastError||t-frame.lastError>5){frame.lastError=t;toast(`Render error: ${e.message}`,true);}}
   requestAnimationFrame(frame);
 }
@@ -840,7 +1275,15 @@ function formatTime(seconds){return `${String(Math.floor(seconds/60)).padStart(2
 let fadeToken=0;function fadeCrossfader(to){const token=++fadeToken,start=now(),from=project.crossfader;function step(){if(token!==fadeToken)return;const a=Math.min(1,(now()-start)/2);project.crossfader=from+(to-from)*a;$('#crossfader').value=project.crossfader;if(a<1)requestAnimationFrame(step);else changed();}step();}
 
 function keyDown(e){
+  if(e.ctrlKey&&e.shiftKey&&(e.code==='KeyK'||e.code==='KeyM')&&!$('dialog[open]')){
+    e.preventDefault();const source=e.code==='KeyK'?'key':'midi';
+    if(shortcuts.editing===source)shortcuts.exit();else{if(source==='midi')shortcuts.enableMidi().catch(error=>toast(`MIDI unavailable: ${error.message}`,true));shortcuts.exit();shortcuts.enter(source);}
+    browserTab='controls';renderBrowser();return;
+  }
+  if(shortcuts.editing==='key'&&!$('dialog[open]')&&shortcuts.handleKey(e,true))return;
   if(/INPUT|SELECT|TEXTAREA/.test(e.target.tagName)||$('dialog[open]'))return;
+  if((e.ctrlKey||e.metaKey)&&e.code==='Slash'){e.preventDefault();browserTab='effects';renderBrowser();$('#effect-search')?.focus();return;}
+  if(shortcuts.handleKey(e,true)){e.preventDefault();return;}
   if(e.ctrlKey||e.metaKey){if(['c','x','v'].includes(e.key.toLowerCase())){e.preventDefault();if(e.key.toLowerCase()==='v')pasteSelection();else copySelection(e.key.toLowerCase()==='x');return;}if(['s','o','z','y'].includes(e.key.toLowerCase())){e.preventDefault();if(e.key.toLowerCase()==='s')saveProject(e.shiftKey);else if(e.key.toLowerCase()==='o')openProject();else undo(e.key.toLowerCase()==='y'||e.shiftKey);}return;}
   if(e.repeat)return;
   if(e.code==='Space'){e.preventDefault();$('#pause').click();return;}
@@ -865,13 +1308,15 @@ function keyDown(e){
   changed();renderInspector();
 }
 
-function keyUp(e){const held=heldKeys.get(e.code);if(held){releaseHeld(held);heldKeys.delete(e.code);}}
-function undo(redo=false){const source=redo?redoStack:undoStack,destination=redo?undoStack:redoStack;if(!source.length)return;destination.push(snapshot());const data=source.pop();const oldUndo=undoStack,oldRedo=redoStack;loadProject(JSON.parse(data));undoStack=oldUndo;redoStack=oldRedo;lastHistory=data;changed(false);toast(redo?'Redo':'Undo');}
-async function enableMidi(){try{midiAccess=await navigator.requestMIDIAccess();const bind=()=>{for(const input of midiAccess.inputs.values())input.onmidimessage=midiMessage;};bind();midiAccess.onstatechange=()=>{bind();if(browserTab==='controls')renderBrowser();};renderBrowser();toast('MIDI input enabled.');}catch(e){toast(`MIDI unavailable: ${e.message}`,true);}}
+function keyUp(e){if(shortcuts.handleKey(e,false))return;const held=heldKeys.get(e.code);if(held){releaseHeld(held);heldKeys.delete(e.code);}}
+function undo(redo=false){if(historyTimer)commitHistory();const source=redo?redoStack:undoStack,destination=redo?undoStack:redoStack;if(!source.length)return;destination.push(snapshot());const data=source.pop();const oldUndo=undoStack,oldRedo=redoStack;loadProject(JSON.parse(data));undoStack=oldUndo;redoStack=oldRedo;lastHistory=data;changed(false);toast(redo?'Redo':'Undo');}
+async function enableMidi(){try{midiAccess=await shortcuts.enableMidi();renderBrowser();toast('MIDI input enabled.');}catch(e){toast(`MIDI unavailable: ${e.message}`,true);}}
 function midiMessage(event){const [status,number,value]=event.data,type=(status&0xf0)===0xb0?'cc':(status&0xf0)===0x90&&value>0?'note':null;if(!type)return;const channel=status&15;if(learning){if(project.mappings.length>=LIMITS.mappings)return toast('Mapping limit reached.');project.mappings.push({type,channel,number,target:learning});learning=null;changed();renderBrowser();toast('MIDI control assigned.');return;}for(const map of project.mappings)if(map.type===type&&map.channel===channel&&map.number===number)controlTarget(map.target,value/127);}
 function controlTarget(target,value){if(target.startsWith('column:')){if(value>0)triggerColumn(+target.split(':')[1]);}else if(target.startsWith('layer:')){const [,layerId,property]=target.split(':');const layer=project.layers.find(l=>l.id===layerId);if(layer&&['opacity','volume'].includes(property))layer[property]=value;}else if(['crossfader','masterOpacity','masterVolume'].includes(target))project[target]=value;syncGlobals();}
 let controlRefresh;
 function applyControl(message){
+  const address=message?.address??message?.path,args=(Array.isArray(message?.args)?message.args:message?.value===undefined?[]:[message.value]).map(arg=>arg&&typeof arg==='object'&&'value' in arg?arg.value:arg);
+  if(typeof address==='string'&&shortcuts?.handleOSC(address,args))return;
   const handled=applyOSC({project,transport,triggerClip:(layer,clip)=>{const held={layerId:layer.id,clipId:clip.id,inputId:id()};oscHolds.set(clip.id,held);trigger(layer,clip,()=>!transport.isPiano(clip)||oscHolds.get(clip.id)===held,{inputId:held.inputId,selectedLayerId});},triggerColumn,
     stopLayer:layerId=>{triggerRequests.delete(layerId);transport.stop(layerId);},
     releaseClip:(layer,clip)=>{const held=oscHolds.get(clip.id);oscHolds.delete(clip.id);if(held)releaseHeld(held);else transport.release(layer.id,clip.id);},
@@ -894,5 +1339,13 @@ window.prismDiagnostics=()=>{
   return {project:serializeProject(project),preferences:{...preferences},
     frames:frames.map(frame=>({clipId:frame.clip.id,layerId:frame.layer.id,sourceLayerId:frame.sourceLayerId,voiceId:frame.voiceId,inputId:transport.getState(frame.layer.id)?.inputId,direction:frame.direction,position:frame.position,time:frame.time,weight:frame.weight})),
     voices:frames.map(frame=>{const voiceId=frame.sourceLayerId!==frame.layer.id?frame.voiceId:undefined;const media=engine.getMedia(frame.clip.id,voiceId),audio=engine.getAudio(frame.clip.id,voiceId);return {clipId:frame.clip.id,layerId:frame.layer.id,voiceId:frame.voiceId,mediaTime:media?.currentTime??null,audioTime:audio?.currentTime??null,mediaPaused:media?.paused??null,audioPaused:audio?.paused??null};}),
-    stats:engine?.getStats?.(),recording:recorder?.state||'inactive'};
+    stats:engine?.getStats?.(),recording:recorder?.state||'inactive',outputs:outputs?[...outputs.windows.values()].map(entry=>({name:entry.name,width:entry.canvas.width,height:entry.canvas.height})):[]};
+};
+// Renders the composition and every output window once, then samples each
+// at its centre (for automated output checks).
+window.prismOutputProbe=()=>{
+  const t=now();engine.render(project,transport.tick(t),t,{beat:transport.beat});
+  const center=[...(engine.readRegion(Math.floor(project.width/2),Math.floor(project.height/2),1,1)||[])];
+  outputs.present(t);
+  return {composition:center,outputs:[...outputs.windows.values()].map(entry=>entry.mapper.readPixel(Math.floor(entry.canvas.width/2),Math.floor(entry.canvas.height/2)))};
 };

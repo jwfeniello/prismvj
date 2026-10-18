@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { chromium } from '@playwright/test';
 import { GifPlayback } from '../src/gif-playback.js';
+import { sourceFile } from './src-server.mjs';
 
 let browser;
 let server;
@@ -24,6 +25,8 @@ before(async () => {
     ['/alpha-fixture.webm', await readFile(new URL('./engine-alpha-fixture.webm', import.meta.url))],
   ]);
   server = createServer((request, response) => {
+    const source = sourceFile(request.url);
+    if (source) { response.setHeader('Content-Type', source.type); response.end(source.body); return; }
     const videoFixture = videoFixtures.get(request.url);
     response.setHeader('Content-Type', request.url.endsWith('.js') ? 'text/javascript' : videoFixture ? 'video/webm' : 'text/html');
     if (videoFixture) {

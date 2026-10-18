@@ -1,10 +1,15 @@
 // Composition data and a clock-driven transport. No DOM or media decoders live here.
 import { BLEND_IDS, TRANSITION_IDS, normalizeBlend } from './blends.js';
 import { normalizeDashboard } from './dashboard.js';
-export const LIMITS = Object.freeze({ layers: 32, decks: 32, columns: 64, clips: 4096, effects: 32, mappings: 256, cues: 6 });
-const KINDS = ['video', 'audio', 'image', 'source'];
-const SOURCES = ['plasma', 'grid', 'rings', 'noise', 'solid'];
-const EFFECTS = ['invert', 'grayscale', 'brightness', 'contrast', 'saturation', 'hue', 'pixelate', 'mirror', 'kaleidoscope', 'strobe'];
+import { normalizeAnimations } from './animation.js';
+import './fx/builtins.js';
+import { effectDefinition, audioEffectDefinition, sourceDefinition, normalizeDefinitionParams, isDefinitionId, EFFECT_MIX_PARAMS } from './fx/registry.js';
+import { ownerParam } from './params.js';
+export const LIMITS = Object.freeze({ layers: 32, decks: 32, columns: 64, clips: 4096, effects: 32, mappings: 256, cues: 6, groups: 16, shortcuts: 1024 });
+// 'effect' clips carry only effects and act as adjustment layers (manual p. 85).
+const KINDS = ['video', 'audio', 'image', 'source', 'effect'];
+const SHORTCUT_SOURCES = ['key', 'midi', 'osc', 'dmx'];
+const SHORTCUT_MODES = ['toggle', 'momentary', 'trigger', 'value', 'relative', 'set'];
 const DIRECTIONS = ['forward', 'backward', 'pause', 'random'];
 const TARGETS = ['own', 'selected', 'free'];
 const AUTO = ['off', 'next', 'previous', 'random'];
@@ -32,10 +37,27 @@ function array(value, label, max, fallback = []) {
   return value;
 }
 
-function effects(value) {
-  return array(value, 'Effects', LIMITS.effects).filter(item => record(item) && EFFECTS.includes(item.type)).map(item => ({
-    id: safeId(item.id, 'effect'), type: item.type, enabled: bool(item.enabled, true), amount: number(item.amount, 0.5, 0, 1),
-  }));
+// Video effects carry Resolume's per-effect Opacity and Blend Mode. Unknown
+// (not yet loaded, e.g. ISF) types keep their values instead of disappearing.
+function effects(value, audio = false) {
+  const definitionFor = audio ? audioEffectDefinition : effectDefinition;
+  // Imported (isf:) effects may not be loaded yet; keep them. Drop unknown built-ins.
+  return array(value, audio ? 'Audio effects' : 'Effects', LIMITS.effects).filter(item => record(item) && isDefinitionId(item.type) && (definitionFor(item.type) || item.type.startsWith('isf:'))).map(item => {
+    const definition = definitionFor(item.type);
+    const values = record(item.params) ? item.params : own(item, 'amount') ? { amount: item.amount } : {};
+    const effect = { id: safeId(item.id, 'effect'), type: item.type, enabled: bool(item.enabled, true) };
+    if (!audio) { effect.opacity = number(item.opacity, 1, 0, 1); effect.blend = normalizeBlend(item.blend, 'normal'); }
+    effect.params = normalizeDefinitionParams(definition, values);
+    effect.animations = normalizeAnimations(item.animations, key => ownerParam(audio ? 'audiofx' : 'effect', effect, key));
+    return effect;
+  });
+}
+
+function sourceParams(source, values, color) {
+  const definition = sourceDefinition(source);
+  const input = record(values) ? { ...values } : {};
+  if (definition?.params.some(param => param.key === 'color' && param.type === 'color') && typeof input.color !== 'string') input.color = color;
+  return normalizeDefinitionParams(definition, input);
 }
 
 function mediaReference(value, prefix) {
@@ -81,10 +103,12 @@ export function createClip(kind = 'source', options = {}) {
   const cues = array(input.cues, 'Cue points', LIMITS.cues, [0, 0.25, 0.5, 0.75, null, null])
     .map(value => value === null ? null : number(value, 0, 0, 1));
   while (cues.length < LIMITS.cues) cues.push(null);
-  return {
-    id: safeId(input.id, 'clip'), name: string(input.name, kind === 'source' ? 'New source' : 'New clip'), kind,
-    path: string(input.path, '', 32768), url: string(input.url, '', 32768), source: choice(input.source, SOURCES, 'plasma'),
-    color: typeof input.color === 'string' && /^#[0-9a-f]{6}$/i.test(input.color) ? input.color : '#ff6a38',
+  const source = isDefinitionId(input.source) ? input.source : 'plasma';
+  const color = typeof input.color === 'string' && /^#[0-9a-f]{6}$/i.test(input.color) ? input.color : '#ff6a38';
+  const clip = {
+    id: safeId(input.id, 'clip'), name: string(input.name, kind === 'source' ? 'New source' : kind === 'effect' ? 'Effect clip' : 'New clip'), kind,
+    path: string(input.path, '', 32768), url: string(input.url, '', 32768), source, params: kind === 'source' ? sourceParams(source, input.params, color) : {},
+    color,
     labelColor: typeof input.labelColor === 'string' && /^#[0-9a-f]{6}$/i.test(input.labelColor) ? input.labelColor : null,
     persistent: bool(input.persistent),
     dashboard: normalizeDashboard(input.dashboard, 'clip'),
@@ -103,16 +127,52 @@ export function createClip(kind = 'source', options = {}) {
     quantize: input.quantize === null || input.quantize === undefined ? null : number(input.quantize, 0, 0, 128),
     autoPilot: choice(input.autoPilot, ['inherit', ...AUTO], 'inherit'), ignoreColumn: bool(input.ignoreColumn),
     cues,
-    effects: effects(input.effects),
+    effects: effects(input.effects), audioEffects: effects(input.audioEffects, true),
   };
+  clip.animations = normalizeAnimations(input.animations, key => ownerParam('clip', clip, key));
+  return clip;
+}
+
+const groupDefaults = () => ({ opacity: 1, volume: 1, pan: 0, speed: 1, blend: 'normal', bypass: false, solo: false, crossfader: 'none',
+  ignoreColumn: false, locked: false, collapsed: false, scale: 1, x: 0, y: 0, rotation: 0, ...transform3D(), mask: null, renderOrder: renderOrder(),
+  effects: [], audioEffects: [], dashboard: normalizeDashboard(null, 'group'), animations: {} });
+
+// Groups are sub-compositions of contiguous layers (manual pp. 41–44).
+export function createGroup(name = 'Group') {
+  return { id: uid('group'), name: string(name, 'Group'), ...groupDefaults() };
+}
+
+function group(item, index, unique) {
+  if (!record(item)) throw new TypeError(`Group ${index + 1} is invalid.`);
+  const result = { id: unique(item.id, 'group'), name: string(item.name, `Group ${index + 1}`), opacity: number(item.opacity, 1, 0, 1), volume: number(item.volume, 1, 0, 1),
+    pan: number(item.pan, 0, -1, 1), speed: number(item.speed, 1, 0, 16), blend: normalizeBlend(item.blend), bypass: bool(item.bypass), solo: bool(item.solo),
+    crossfader: choice(item.crossfader, ['A', 'B', 'none'], 'none'), ignoreColumn: bool(item.ignoreColumn), locked: bool(item.locked), collapsed: bool(item.collapsed),
+    scale: number(item.scale, 1, 0, 20), x: number(item.x, 0, -64, 64), y: number(item.y, 0, -64, 64), rotation: number(item.rotation, 0, -36000, 36000), ...transform3D(item),
+    mask: mask(item.mask), renderOrder: renderOrder(item.renderOrder), effects: effects(item.effects), audioEffects: effects(item.audioEffects, true),
+    dashboard: normalizeDashboard(item.dashboard, 'group') };
+  if (result.mask) result.mask.id = unique(result.mask.id, 'mask');
+  result.animations = normalizeAnimations(item.animations, key => ownerParam('group', result, key));
+  return result;
+}
+
+function shortcuts(value) {
+  return array(value, 'Shortcuts', LIMITS.shortcuts, []).filter(item => record(item) && SHORTCUT_SOURCES.includes(item.source) && typeof item.target === 'string').map(item => {
+    const input = record(item.input) ? item.input : {};
+    return { id: safeId(item.id, 'shortcut'), source: item.source, target: string(item.target, '', 300), mode: choice(item.mode, SHORTCUT_MODES, 'value'),
+      input: { code: string(input.code, '', 64), shift: bool(input.shift), ctrl: bool(input.ctrl), alt: bool(input.alt),
+        type: choice(input.type, ['note', 'cc', 'pitch'], 'cc'), channel: Math.round(number(input.channel, 0, 0, 15)), number: Math.round(number(input.number, 0, 0, 127)),
+        device: string(input.device, '', 128), address: string(input.address, '', 256), universe: Math.round(number(input.universe, 0, 0, 32767)), dmxChannel: Math.round(number(input.dmxChannel, 1, 1, 512)) },
+      min: number(item.min, 0, 0, 1), max: number(item.max, 1, 0, 1), invert: bool(item.invert), feedback: bool(item.feedback, true),
+      value: number(item.value, 1, 0, 1), group: string(item.group, '', 64), enabled: bool(item.enabled, true) };
+  });
 }
 
 export function createLayer(name = 'Layer') {
   return { id: uid('layer'), name: string(name, 'Layer'), opacity: 1, volume: 1, av: 1, pan: 0, scale: 1, x: 0, y: 0, rotation: 0, blend: 'normal', group: 'none', bypass: false, solo: false,
     dashboard: normalizeDashboard(null, 'layer'),
     ...transform3D(), width: null, height: null, widthEnabled: false, heightEnabled: false, blendFavorites: favorites(), transitionMode: 'normal',
-    ignoreColumn: false, mask: null, renderOrder: renderOrder(),
-    transition: 0, autoPilot: 'off', clips: Object.create(null), activeClipId: null, effects: [] };
+    ignoreColumn: false, mask: null, renderOrder: renderOrder(), groupId: null, maskMode: 'none', locked: false,
+    transition: 0, autoPilot: 'off', clips: Object.create(null), activeClipId: null, effects: [], audioEffects: [], animations: {} };
 }
 
 export function createProject() {
@@ -135,7 +195,7 @@ export function createProject() {
     dashboard: normalizeDashboard(null, 'composition'),
     ...transform3D(), triggerStyle: 'normal', clipTarget: 'own', directionPin: null,
     masterOpacity: 1, masterVolume: 1, pan: 0, scale: 1, x: 0, y: 0, rotation: 0, crossfader: 0.5, speed: 1, paused: false, blackout: false, bypass: false, quantize: 0,
-    selectedDeckId: decks[0].id, decks, layers, effects: [], mappings: [], output: {} };
+    selectedDeckId: decks[0].id, decks, layers, groups: [], effects: [], audioEffects: [], animations: {}, mappings: [], shortcuts: [], output: {} };
 }
 
 // Reject incompatible structure; normalize safe numeric and optional settings. Build
@@ -147,6 +207,7 @@ export function validateProject(input) {
   const rawLayers = array(input.layers, 'Layers', LIMITS.layers);
   if (!rawDecks.length) throw new TypeError('A project needs at least one deck.');
   if (!rawLayers.length) throw new TypeError('A project needs at least one layer.');
+  const rawGroups = array(input.groups, 'Groups', LIMITS.groups, []);
   let inferredColumns = 0;
   for (const layer of rawLayers) for (const deck of rawDecks) {
     const slots = record(layer?.clips) && own(layer.clips, deck?.id) ? layer.clips[deck.id] : undefined;
@@ -165,6 +226,8 @@ export function validateProject(input) {
     if (!record(item)) throw new TypeError(`Deck ${index + 1} is invalid.`);
     return { id: unique(item.id, 'deck'), name: string(item.name, `Deck ${index + 1}`) };
   });
+  const groups = rawGroups.map((item, index) => group(item, index, unique));
+  const groupIds = new Set(groups.map(item => item.id));
   let clipCount = 0;
   const layers = rawLayers.map((item, index) => {
     if (!record(item) || (item.clips !== undefined && !record(item.clips))) throw new TypeError(`Layer ${index + 1} is invalid.`);
@@ -177,7 +240,9 @@ export function validateProject(input) {
       blendFavorites: favorites(item.blendFavorites), transitionMode: item.transitionMode === 'random' ? 'random' : choice(normalizeBlend(item.transitionMode), TRANSITION_IDS, 'normal'),
       group: choice(item.group, ['A', 'B', 'none'], 'none'), bypass: bool(item.bypass), solo: bool(item.solo),
       transition: number(item.transition, 0, 0, 60), autoPilot: choice(item.autoPilot, AUTO, 'off'),
-      clips: Object.create(null), activeClipId: null, effects: effects(item.effects) };
+      groupId: groupIds.has(item.groupId) ? item.groupId : null, maskMode: choice(item.maskMode, ['none', 'luma', 'alpha', 'luma-invert', 'alpha-invert'], 'none'), locked: bool(item.locked),
+      clips: Object.create(null), activeClipId: null, effects: effects(item.effects), audioEffects: effects(item.audioEffects, true) };
+    layer.animations = normalizeAnimations(item.animations, key => ownerParam('layer', layer, key));
     if (layer.mask) layer.mask.id = unique(layer.mask.id, 'mask');
     for (let d = 0; d < decks.length; d++) {
       const rawKey = rawDecks[d].id;
@@ -206,6 +271,8 @@ export function validateProject(input) {
     }
     return layer;
   });
+  // A group must hold at least one layer; empty groups are dropped.
+  const usedGroups = groups.filter(item => layers.some(layer => layer.groupId === item.id));
   // Routed clips remain stored in their original slots. Active destinations may
   // therefore refer to any clip in the composition, including another layer.
   const allClipIds = new Set(layers.flatMap(layer => Object.values(layer.clips).flat()).filter(Boolean).map(clip => clip.id));
@@ -225,7 +292,7 @@ export function validateProject(input) {
     if (typeof item.enabled === 'boolean') mapping.enabled = item.enabled;
     return mapping;
   });
-  return {
+  const result = {
     version: 1, id: safeId(input.id, 'project'), name: string(input.name, 'Untitled performance'), description: string(input.description, '', 8192), columns,
     ...transform3D(input), triggerStyle: choice(input.triggerStyle, ['normal', 'piano'], 'normal'), clipTarget: choice(input.clipTarget, TARGETS, 'own'), directionPin: choice(input.directionPin, DIRECTIONS, null),
     av: number(input.av, 1, 0, 1), mask: projectMask, renderOrder: renderOrder(input.renderOrder), dashboard: normalizeDashboard(input.dashboard, 'composition'),
@@ -235,11 +302,22 @@ export function validateProject(input) {
     rotation: number(input.rotation, 0, -36000, 36000),
     crossfader: number(input.crossfader, 0.5, 0, 1), speed: number(input.speed, 1, 0, 16), paused: bool(input.paused), blackout: bool(input.blackout), bypass: bool(input.bypass),
     quantize: number(input.quantize, 0, 0, 128), selectedDeckId: decks.some(deck => deck.id === input.selectedDeckId) ? input.selectedDeckId : decks[0].id,
-    decks, layers, effects: effects(input.effects), mappings,
+    decks, layers, groups: usedGroups, effects: effects(input.effects), audioEffects: effects(input.audioEffects, true), mappings, shortcuts: shortcuts(input.shortcuts),
     output: Object.fromEntries(['displayId', 'fullscreen', 'width', 'height'].filter(key =>
       own(output, key) && (typeof output[key] === 'boolean' || typeof output[key] === 'string' || (typeof output[key] === 'number' && Number.isFinite(output[key]))))
       .map(key => [key, typeof output[key] === 'string' ? output[key].slice(0, 256) : output[key]])),
   };
+  result.animations = normalizeAnimations(input.animations, key => ownerParam('composition', result, key));
+  for (const [key, normalize] of extensions) if (own(input, key)) result[key] = normalize(input[key], result);
+  return result;
+}
+
+// Optional project sections owned by other modules (advanced output, DMX).
+// Each normalizer must return an allow-listed copy and never throw for bad data.
+const extensions = new Map();
+export function registerProjectExtension(key, normalize) {
+  if (!/^[a-zA-Z][a-zA-Z0-9]{0,40}$/.test(key) || typeof normalize !== 'function') throw new TypeError('Invalid project extension.');
+  extensions.set(key, (value, project) => { try { return normalize(value, project); } catch { return undefined; } });
 }
 
 export function serializeProject(project) {
@@ -295,6 +373,9 @@ export class Transport {
       for (const clip of layer.clips[deck.id] || []) if (clip) clips.set(clip.id, { clip, layer });
     }
     this._clips = clips;
+    // Group master speed scales every layer in the group (manual p. 43).
+    const groupSpeed = new Map((this.project.groups || []).map(item => [item.id, number(item.speed, 1, 0, 16)]));
+    this._speeds = new Map(this.project.layers.map(layer => [layer.id, groupSpeed.get(layer.groupId) ?? 1]));
     // Snapshot before reconciling either layer so moving/swapping playing clips
     // preserves their playheads regardless of the order of the layer stack.
     const activeStates = [];
@@ -339,7 +420,7 @@ export class Transport {
       // decoder-facing data while retaining the running transport position.
       for (const state of [entry.current, entry.outgoing]) if (state) {
         const source = clips.get(state.clip.id);
-        state.clip = source.clip; state.sourceLayerId = source.layer.id; state.voiceId = `${layer.id}:${state.clip.id}`;
+        state.clip = source.clip; state.sourceLayerId = source.layer.id; state.voiceId = `${layer.id}:${state.clip.id}`; state.layerId = layer.id;
       }
     }
     for (const moved of pendingMoves) {
@@ -369,7 +450,7 @@ export class Transport {
       randomPhase: saved?.randomPhase || 0, travel: saved?.travel || 0, completed: false, seed: seedFor(clip.id), beatLoopWindow: null,
       sourceLayerId: request.sourceLayerId || this._clips.get(clip.id)?.layer.id || entry.layer.id,
       originLayerId: request.originLayerId || request.sourceLayerId || this._clips.get(clip.id)?.layer.id || entry.layer.id,
-      voiceId: `${entry.layer.id}:${clip.id}`, inputId: request.inputId ?? null, target: request.target || 'own',
+      voiceId: `${entry.layer.id}:${clip.id}`, layerId: entry.layer.id, inputId: request.inputId ?? null, target: request.target || 'own',
       triggerStyle: request.triggerStyle || effectiveTriggerStyle(this.project, clip) };
     entry.pending = null; entry.layer.activeClipId = clip.id;
   }
@@ -486,7 +567,7 @@ export class Transport {
     const clip = state.clip;
     if (clip.paused || clip.direction === 0) return 0;
     return clip.beatSync ? number(this.project.bpm, 120, 20, 999) / 60 / number(clip.beats, 16, 0.03125, 4096)
-      : number(clip.speed, 1, 0, 16) * number(this.project.speed, 1, 0, 16) / number(clip.duration, 8, 0.01, 86400);
+      : number(clip.speed, 1, 0, 16) * number(this.project.speed, 1, 0, 16) * (this._speeds?.get(state.layerId) ?? 1) / number(clip.duration, 8, 0.01, 86400);
   }
 
   _direction(state) {

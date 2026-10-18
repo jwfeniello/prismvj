@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { chromium } from '@playwright/test';
 import { BLEND_MODES, BLEND_IDS, TRANSITION_IDS, normalizeBlend } from '../src/blends.js';
+import { sourceFile } from './src-server.mjs';
 
 const chrome = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const gpuOptions = { skip: !existsSync(chrome), timeout: 60000 };
@@ -13,6 +14,8 @@ before(async () => {
   if (!existsSync(chrome)) return;
   const files = new Map(await Promise.all(['engine.js', 'blends.js', 'gif-playback.js'].map(async name => [`/${name}`, await readFile(new URL(`../src/${name}`, import.meta.url))])));
   server = createServer((request, response) => {
+    const source = sourceFile(request.url);
+    if (source) { response.setHeader('Content-Type', source.type); response.end(source.body); return; }
     response.setHeader('Content-Type', files.has(request.url) ? 'text/javascript' : 'text/html');
     response.end(files.get(request.url) || '<!doctype html><canvas width="96" height="64"></canvas>');
   });

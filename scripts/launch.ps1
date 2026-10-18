@@ -1,6 +1,9 @@
 $ErrorActionPreference = 'Stop'
 $projectDirectory = Split-Path -Parent $PSScriptRoot
-$packagedDirectory = Join-Path $projectDirectory 'release\reverse-smooth-dxv\PrismLive-win32-x64'
+$packagedDirectory = Join-Path $projectDirectory 'release\manual-parity\PrismLive-win32-x64'
+if (-not ((Test-Path -LiteralPath (Join-Path $packagedDirectory 'PrismLive.exe')) -and ((Test-Path -LiteralPath (Join-Path $packagedDirectory 'resources\app.asar')) -or (Test-Path -LiteralPath (Join-Path $packagedDirectory 'resources\app\dist\index.html'))))) {
+    $packagedDirectory = Join-Path $projectDirectory 'release\reverse-smooth-dxv\PrismLive-win32-x64'
+}
 if (-not ((Test-Path -LiteralPath (Join-Path $packagedDirectory 'PrismLive.exe')) -and ((Test-Path -LiteralPath (Join-Path $packagedDirectory 'resources\app.asar')) -or (Test-Path -LiteralPath (Join-Path $packagedDirectory 'resources\app\dist\index.html'))))) {
     $packagedDirectory = Join-Path $projectDirectory 'release\smooth-transport\PrismLive-win32-x64'
 }

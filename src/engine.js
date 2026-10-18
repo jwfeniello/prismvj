@@ -1,5 +1,8 @@
-import { COMPOSITE_FRAGMENT, blendIndex } from './blends.js';
+import { COMPOSITE_FRAGMENT, blendIndex, normalizeBlend } from './blends.js';
 import { GifPlayback, isGifAsset } from './gif-playback.js';
+import { buildEffectShader, buildSourceShader, bindParams, uniformNames, effectPasses } from './fx/shader-template.js';
+import { effectDefinition, sourceDefinition } from './fx/registry.js';
+import { AudioEffectChain } from './audio-fx.js';
 
 const reverseMediaURL = clip => clip?.kind === 'video' && /\.mov$/i.test(clip.path || '')
   && /^prism-media:/i.test(clip.url || '') ? `${clip.url}${clip.url.includes('?') ? '&' : '?'}reverse=1` : null;
@@ -140,9 +143,10 @@ uniform sampler2D uImage;
 uniform sampler2D uMask;
 uniform bool uAlpha;
 uniform bool uInvert;
+uniform bool uLuma;
 void main() {
   vec4 mask = texture(uMask,uv);
-  float amount = uAlpha ? mask.a : mask.r;
+  float amount = uAlpha ? mask.a : uLuma ? dot(mask.rgb,vec3(0.2126,0.7152,0.0722)) : mask.r;
   if (uInvert) amount = 1.0-amount;
   frag = texture(uImage,uv)*amount;
 }`;
@@ -152,6 +156,14 @@ const SOURCES = { plasma: 1, grid: 2, rings: 3, noise: 4, solid: 5 };
 const clamp = (v, low = 0, high = 1) => Math.min(high, Math.max(low, Number.isFinite(Number(v)) ? Number(v) : low));
 const number = (v, fallback = 0) => Number.isFinite(Number(v)) ? Number(v) : fallback;
 const groupGain = (group, fader) => group === 'A' || group === 'a' ? Math.min(1, (1-fader)*2) : group === 'B' || group === 'b' ? Math.min(1, fader*2) : 1;
+// Older projects and direct callers store a single `amount` instead of params.
+const effectParams = effect => effect.params || (effect.amount !== undefined ? { amount: effect.amount } : {});
+// Capture devices and screen capture behave like video media without a file.
+const liveSource = clip => clip?.kind === 'source' && ['capture', 'screen'].includes(sourceDefinition(clip.source)?.kind);
+const hasMedia = clip => (clip.kind !== 'source' && clip.kind !== 'effect') || liveSource(clip);
+const mediaURL = clip => liveSource(clip)
+  ? `capture:${clip.source}:${clip.params?.device || ''}:${clip.params?.width || 1280}x${clip.params?.height || 720}:${clip.params?.cursor !== false}` : clip.url || clip.path;
+const LOG_BINS = 64;
 const auxiliaryId = (role, ownerId) => JSON.stringify([role, ownerId]);
 const voiceMediaId = (clipId, voiceId) => voiceId && voiceId !== clipId ? auxiliaryId('voice', voiceId) : clipId;
 
@@ -181,6 +193,19 @@ export class LiveEngine {
     this.onError = onError;
     this.media = new Map();
     this.audioLayers = new Map();
+    this.audioGroups = new Map();
+    // Lazily compiled catalog programs, per-instance feedback buffers, canvas
+    // sources (Text Animator) and cached layer outputs for routers/outputs.
+    this.fxPrograms = new Map();
+    this.feedback = new Map();
+    this.canvasSources = new Map();
+    this.layerCache = new Map();
+    this.cacheRequests = new Set();
+    this.analysers = new Map();
+    this.spectra = new Map();
+    this.audioBands = [0, 0, 0, 0];
+    this.frameIndex = 0;
+    this.beat = 0;
     this.maxMedia = Math.round(clamp(maxMedia, 1, 256));
     this.mediaClock = 0;
     this.protectedMedia = new Set();
@@ -206,6 +231,10 @@ export class LiveEngine {
       this.targets = [];
       this.lastFinished = null;
       this.programs = [];
+      this.fxPrograms.clear();
+      this.feedback.clear();
+      this.layerCache.clear();
+      for (const source of this.canvasSources.values()) source.texture = null;
       try {
         this._initGL();
         for (const entry of this.media.values()) {
@@ -295,14 +324,50 @@ export class LiveEngine {
     for (const analyser of meter?.analysers || []) analyser.disconnect();
   }
 
-  _layerAudio(layer) {
+  // Splice an audio effect chain between two connected nodes on first use.
+  _audioInsert(holder, from, to, effects, bpm) {
+    if (!holder.fxChain) {
+      if (!effects?.length || !this._audioContext) return;
+      holder.fxChain = new AudioEffectChain(this._audioContext);
+      from.disconnect(to); from.connect(holder.fxChain.input); holder.fxChain.output.connect(to);
+    }
+    holder.fxChain.sync(effects || [], { bpm });
+  }
+
+  // Group audio bus (manual p. 43): layers in a group mix into it, then into
+  // the composition, so group volume/pan/crossfader apply to all its layers.
+  _groupAudio(group, project) {
+    let bus = this.audioGroups.get(group.id);
+    if (!bus) {
+      const gain = this._audioContext.createGain(), panner = this._audioContext.createStereoPanner();
+      gain.connect(panner); panner.connect(this.masterGain);
+      bus = { gain, panner, input: gain, level: 1, pan: 0 };
+      this.audioGroups.set(group.id, bus);
+    }
+    const level = group.bypass ? 0 : clamp(group.volume ?? 1)*groupGain(group.crossfader, clamp(project?.crossfader ?? 0.5));
+    if (bus.level !== level) { bus.gain.gain.setTargetAtTime(level, this._audioContext.currentTime, 0.012); bus.level = level; }
+    const pan = clamp(group.pan ?? 0, -1, 1);
+    if (bus.pan !== pan) { bus.panner.pan.setTargetAtTime(pan, this._audioContext.currentTime, 0.012); bus.pan = pan; }
+    if (bus.frame !== this.frameIndex) { bus.frame = this.frameIndex; this._audioInsert(bus, bus.gain, bus.panner, group.audioEffects, project?.bpm); }
+    return bus;
+  }
+
+  _layerAudio(layer, project) {
     if (!this._audioContext) return null;
     let bus = this.audioLayers.get(layer.id);
     if (!bus) {
-      const panner = this._audioContext.createStereoPanner();
+      const input = this._audioContext.createGain(), panner = this._audioContext.createStereoPanner();
+      input.connect(panner);
       panner.connect(this.masterGain);
-      bus = { panner, pan: 0, meter: this._createMeter(panner) };
+      bus = { input, panner, pan: 0, meter: this._createMeter(panner), destination: this.masterGain };
       this.audioLayers.set(layer.id, bus);
+    }
+    if (bus.frame !== this.frameIndex) { bus.frame = this.frameIndex; this._audioInsert(bus, bus.input, bus.panner, layer.audioEffects, project?.bpm); }
+    const group = layer.groupId ? project?.groups?.find(item => item.id === layer.groupId) : null;
+    const destination = group ? this._groupAudio(group, project).input : this.masterGain;
+    if (bus.destination !== destination) {
+      bus.panner.disconnect(); bus.panner.connect(destination); bus.panner.connect(bus.meter.splitter);
+      bus.destination = destination;
     }
     const pan = clamp(layer.pan ?? 0, -1, 1);
     if (bus.pan !== pan) {
@@ -343,7 +408,7 @@ export class LiveEngine {
     this.transformProgram = this._program(TRANSFORM, ['uImage', 'uInverse', 'uResolution', 'uValid']);
     this.compositeProgram = this._program(COMPOSITE_FRAGMENT, ['uBase', 'uTop', 'uBlend', 'uOpacity', 'uTime', 'uResolution', 'uTransition']);
     this.copyProgram = this._program(COPY, ['uImage', 'uOpacity', 'uOpaque']);
-    this.maskProgram = this._program(MASK, ['uImage', 'uMask', 'uAlpha', 'uInvert']);
+    this.maskProgram = this._program(MASK, ['uImage', 'uMask', 'uAlpha', 'uInvert', 'uLuma']);
     this.vao = gl.createVertexArray();
     gl.bindVertexArray(this.vao);
     gl.disable(gl.DEPTH_TEST);
@@ -376,7 +441,8 @@ export class LiveEngine {
     if (!force && this.canvas.width === width && this.canvas.height === height) return;
     const allocated = [];
     try {
-      for (let i = 0; i < 5; i++) {
+      // 0, 1, 5: scratch; 2: layer; 3/4: composition; 6/7: group accumulation.
+      for (let i = 0; i < 8; i++) {
         const texture = this._texture();
         const framebuffer = gl.createFramebuffer();
         allocated.push({ texture, framebuffer });
@@ -393,6 +459,8 @@ export class LiveEngine {
     } finally { gl.bindFramebuffer(gl.FRAMEBUFFER, null); }
     for (const target of this.targets) { gl.deleteTexture(target.texture); gl.deleteFramebuffer(target.framebuffer); }
     this.targets = allocated;
+    this.scratchTargets = [allocated[0], allocated[1], allocated[5]];
+    this._clearCaches();
     this.lastFinished = null;
     this.canvas.width = width;
     this.canvas.height = height;
@@ -411,7 +479,7 @@ export class LiveEngine {
     // Decode both tracks independently. The audio defines the shared timeline;
     // the video's native duration is retained for stretching it onto that clock.
     const mainAsset = audioAsset ? { ...clip } : clip;
-    const main = clip.kind === 'source' ? Promise.resolve(null) : this._prepareMedia(mainAsset, mediaId, 'main', clip.id, mediaId);
+    const main = liveSource(clip) ? this._prepareCapture(clip, mediaId) : !hasMedia(clip) ? Promise.resolve(null) : this._prepareMedia(mainAsset, mediaId, 'main', clip.id, mediaId);
     const paired = audioAsset ? this._prepareMedia({ ...audioAsset, kind: 'audio', name: audioAsset.name || `${clip.name || 'Clip'} audio` }, pairId, 'audio', clip.id, mediaId) : Promise.resolve(null);
     const reversed = reversedURL ? this._prepareMedia({ ...mainAsset, url: reversedURL }, reverseId, 'reverse', clip.id, mediaId) : Promise.resolve(null);
     const [element, audio, reverseElement] = await Promise.all([main, paired, reversed]);
@@ -432,6 +500,42 @@ export class LiveEngine {
     } else if (animation) clip.duration = animation.duration;
     else if (element && clip.kind !== 'image' && Number.isFinite(element.duration) && element.duration > 0) clip.duration = element.duration;
     return element;
+  }
+
+  // Capture devices / screens (manual pp. 72–75) as live video entries.
+  _prepareCapture(clip, key) {
+    const url = mediaURL(clip), previous = this.media.get(key);
+    if (previous && previous.url === url) { previous.lastUsed = ++this.mediaClock; return previous.promise; }
+    if (previous) this._removeMedia(key);
+    const element = document.createElement('video');
+    element.muted = true; element.playsInline = true;
+    const entry = { id: key, ownerId: clip.id, cacheGroup: key, role: 'main', name: clip.name || 'Capture', kind: 'video', live: true, url, element, texture: null,
+      ready: false, failed: false, dirty: true, hasAlpha: false, alphaKnown: true, lastUpload: -1, lastTarget: null, lastNow: null, gain: 0, active: false, cancel: null, lastUsed: ++this.mediaClock };
+    this.media.set(key, entry);
+    const params = clip.params || {};
+    entry.promise = (async () => {
+      try {
+        const stream = clip.source === 'screen'
+          ? await (this.captureProvider?.screen?.(params) || navigator.mediaDevices.getDisplayMedia({ video: { cursor: params.cursor === false ? 'never' : 'always' }, audio: false }))
+          : await navigator.mediaDevices.getUserMedia({ audio: false, video: { ...(params.device ? { deviceId: { exact: params.device } } : {}),
+            width: { ideal: params.width || 1280 }, height: { ideal: params.height || 720 } } });
+        if (this.disposed || this.media.get(key) !== entry) { stream.getTracks().forEach(track => track.stop()); throw new Error('Capture was closed.'); }
+        entry.stream = stream;
+        element.srcObject = stream;
+        await element.play();
+        entry.ready = true;
+        if (element.requestVideoFrameCallback) {
+          const decoded = () => { entry.dirty = true; entry.videoFrameReady = true; if (!this.disposed && this.media.get(key) === entry) entry.videoCallback = element.requestVideoFrameCallback(decoded); };
+          entry.videoCallback = element.requestVideoFrameCallback(decoded);
+        }
+        return element;
+      } catch (error) {
+        entry.failed = true;
+        this._error(`media-${key}`, `Cannot open ${entry.name}: ${error.message}`);
+        throw error;
+      }
+    })();
+    return entry.promise;
   }
 
   async prepareMask(owner) {
@@ -637,9 +741,78 @@ export class LiveEngine {
     return entry.texture;
   }
 
+  _sourceParams(clip, definition) {
+    const params = { ...(clip.params || {}) };
+    // The clip colour (also shown on its slot) is the source's colour parameter.
+    if (definition.params?.some(param => param.key === 'color' && param.type === 'color') && /^#[0-9a-f]{6}$/i.test(clip.color || '')) params.color = clip.color;
+    return params;
+  }
+
+  _fullFrame(target) {
+    target.contentWidth = target.fitWidth = this.canvas.width;
+    target.contentHeight = target.fitHeight = this.canvas.height;
+    return target;
+  }
+
+  _shaderSource(clip, definition, time) {
+    const shader = this._catalogProgram(`src:${definition.id}`, () => buildSourceShader(definition), definition);
+    if (!shader) return null;
+    const gl = this.gl;
+    this._bind(this.targets[0], true);
+    const u = this._use(shader);
+    this._builtins(u, number(time));
+    bindParams(gl, u, definition, this._sourceParams(clip, definition));
+    this._draw();
+    return this._fullFrame(this.targets[0]);
+  }
+
+  _canvasSource(clip, definition, time) {
+    let source = this.canvasSources.get(clip.id);
+    if (!source || source.definition !== definition) {
+      source?.instance?.dispose?.();
+      if (source?.texture && !this.lost) this.gl.deleteTexture(source.texture);
+      source = { definition, instance: definition.create(), texture: null, used: 0 };
+      this.canvasSources.set(clip.id, source);
+    }
+    source.used = this.frameIndex;
+    const gl = this.gl, image = source.instance.render(this._sourceParams(clip, definition), number(time), this.canvas.width, this.canvas.height);
+    if (!image) return null;
+    if (!source.texture) source.texture = this._texture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, source.texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    this._bind(this.targets[0], true);
+    const u = this._use(this.sourceProgram);
+    this._sample(source.texture, u.uImage);
+    gl.uniform1i(u.uSource, 0);
+    gl.uniform2f(u.uFit, 1, 1);
+    gl.uniform3f(u.uChannels, clip.red === false ? 0 : 1, clip.green === false ? 0 : 1, clip.blue === false ? 0 : 1);
+    gl.uniform1i(u.uIgnoreAlpha, 0);
+    this._draw();
+    return this._fullFrame(this.targets[0]);
+  }
+
+  // Video Router (manual p. 79): the composition below this layer, or a
+  // cached layer/group output requested earlier in the frame.
+  _routerSource(clip) {
+    const input = typeof clip.params?.input === 'string' ? clip.params.input : 'below';
+    const routed = input === 'below' ? this.routerBase : this.layerCache.get(input.replace(/^(layer|group):/, ''));
+    if (!routed) return null;
+    this._copy(routed, this.targets[0]);
+    return this._fullFrame(this.targets[0]);
+  }
+
   _source(clip, entry, time) {
     const gl = this.gl;
-    const generated = clip.kind === 'source';
+    if (clip.kind === 'source') {
+      const definition = sourceDefinition(clip.source);
+      if (definition?.kind === 'canvas' && typeof definition.create === 'function') return this._canvasSource(clip, definition, time);
+      if (definition?.kind === 'router') return this._routerSource(clip);
+      if (definition?.glsl) return this._shaderSource(clip, definition, time);
+    }
+    const generated = clip.kind === 'source' && !liveSource(clip);
     const imageTime = entry?.animation && clip.audio ? number(time) * entry.animation.duration / Math.max(0.001, number(clip.duration, 1)) : time;
     const texture = generated ? this.blankTexture : this._upload(entry, imageTime);
     if (!texture) return null;
@@ -678,21 +851,124 @@ export class LiveEngine {
   _effects(input, effects, now) {
     let current = input;
     for (const effect of effects || []) {
-      if (effect.enabled === false || !EFFECTS[effect.type]) continue;
-      const target = current === this.targets[0] ? this.targets[1] : this.targets[0];
-      this._bind(target);
-      const gl = this.gl;
-      const u = this._use(this.effectProgram);
-      this._sample(current.texture, u.uImage);
-      gl.uniform1i(u.uEffect, EFFECTS[effect.type]);
-      gl.uniform1f(u.uAmount, number(effect.amount, 0.5));
-      gl.uniform1f(u.uTime, now);
-      gl.uniform2f(u.uResolution, this.canvas.width, this.canvas.height);
-      this._draw();
-      this._copySize(current, target);
-      current = target;
+      if (effect.enabled === false) continue;
+      const opacity = clamp(effect.opacity ?? 1);
+      if (opacity <= 0) continue;
+      const definition = effectDefinition(effect.type);
+      const output = definition ? this._runEffect(current, effect, definition, now) : EFFECTS[effect.type] ? this._legacyEffect(current, effect, now) : null;
+      if (!output) continue;
+      const blend = normalizeBlend(effect.blend);
+      if (opacity >= 1 && blend === 'normal') { current = output; continue; }
+      // Resolume mixes each effect with its input by its own opacity/blend.
+      // Alpha blend crossfades so a full-opacity key still shows only the key.
+      const mixed = this._scratch(current, output);
+      this._composite(current, output, mixed, blend, opacity, now, blend === 'normal');
+      this._copySize(current, mixed);
+      current = mixed;
     }
     return current;
+  }
+
+  _legacyEffect(current, effect, now) {
+    const target = this._scratch(current);
+    this._bind(target);
+    const gl = this.gl;
+    const u = this._use(this.effectProgram);
+    this._sample(current.texture, u.uImage);
+    gl.uniform1i(u.uEffect, EFFECTS[effect.type]);
+    gl.uniform1f(u.uAmount, number(effectParams(effect).amount, 0.5));
+    gl.uniform1f(u.uTime, now);
+    gl.uniform2f(u.uResolution, this.canvas.width, this.canvas.height);
+    this._draw();
+    this._copySize(current, target);
+    return target;
+  }
+
+  _scratch(...exclude) { return this.scratchTargets.find(target => !exclude.includes(target)); }
+
+  _catalogProgram(key, build, definition) {
+    let entry = this.fxPrograms.get(key);
+    if (entry?.definition !== definition) {
+      if (entry?.shader) { this.gl.deleteProgram(entry.shader.program); this.programs = this.programs.filter(program => program !== entry.shader.program); }
+      try { entry = { definition, shader: this._program(build(), uniformNames(definition)) }; }
+      catch (error) { entry = { definition, shader: null }; this._error(`program-${key}`, `${definition.name || definition.id} could not compile: ${error.message}`); }
+      this.fxPrograms.set(key, entry);
+    }
+    return entry.shader;
+  }
+
+  _builtins(u, now) {
+    const gl = this.gl, width = this.canvas.width, height = this.canvas.height;
+    gl.uniform2f(u.uResolution, width, height);
+    gl.uniform1f(u.uAspect, width/height);
+    gl.uniform1f(u.uTime, now);
+    gl.uniform1f(u.uBeat, this.beat);
+    gl.uniform4f(u.uAudio, ...this.audioBands);
+  }
+
+  _runEffect(input, effect, definition, now) {
+    const passes = effectPasses(definition), params = effectParams(effect), gl = this.gl;
+    const history = definition.feedback ? this._feedbackTarget(effect.id) : null;
+    let source = input;
+    for (let pass = 0; pass < passes.length; pass++) {
+      const shader = this._catalogProgram(`fx:${definition.id}:${pass}`, () => buildEffectShader(definition, pass), definition);
+      if (!shader) return null;
+      const target = this._scratch(input, source);
+      this._bind(target);
+      const u = this._use(shader);
+      this._sample(source.texture, u.uImage, 0);
+      this._sample(input.texture, u.uOriginal, 1);
+      this._sample(history?.texture, u.uPrevious, 2);
+      this._builtins(u, now);
+      gl.uniform1i(u.uPass, pass);
+      bindParams(gl, u, definition, params);
+      this._draw();
+      this._copySize(input, target);
+      source = target;
+    }
+    if (history) { this._copy(source, history); history.used = this.frameIndex; }
+    return source;
+  }
+
+  _allocTarget(width = this.canvas.width, height = this.canvas.height) {
+    const gl = this.gl, texture = this._texture(), framebuffer = gl.createFramebuffer();
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { texture, framebuffer, width, height, used: this.frameIndex };
+  }
+
+  _freeTarget(target) { if (target && !this.lost) { this.gl.deleteTexture(target.texture); this.gl.deleteFramebuffer(target.framebuffer); } }
+
+  _feedbackTarget(id) {
+    let target = this.feedback.get(id);
+    if (!target) { target = this._allocTarget(); this.feedback.set(id, target); }
+    return target;
+  }
+
+  // Cached copy of a processed layer/group for routers and output slices.
+  _cacheOutput(id, input) {
+    let target = this.layerCache.get(id);
+    if (!target) { target = this._allocTarget(); this.layerCache.set(id, target); }
+    this._copy(input, target);
+    target.used = this.frameIndex;
+  }
+
+  layerTexture(id) { return this.layerCache.get(id) || null; }
+
+  _clearCaches() {
+    for (const target of [...this.feedback.values(), ...this.layerCache.values()]) this._freeTarget(target);
+    this.feedback.clear();
+    this.layerCache.clear();
+  }
+
+  _pruneTargets() {
+    // Free buffers of removed effects or unrouted layers after ~2 s unused.
+    for (const map of [this.feedback, this.layerCache]) for (const [id, target] of map) {
+      if (this.frameIndex - target.used > 120) { this._freeTarget(target); map.delete(id); }
+    }
   }
 
   _copy(input, target, opacity = 1, opaque = false) {
@@ -744,6 +1020,7 @@ export class LiveEngine {
     this._sample(texture, u.uMask, 1);
     gl.uniform1i(u.uAlpha, entry.alphaMask ? 1 : 0);
     gl.uniform1i(u.uInvert, mask.invert ? 1 : 0);
+    gl.uniform1i(u.uLuma, 0);
     this._draw();
     this._copySize(input, target);
     return target;
@@ -790,13 +1067,15 @@ export class LiveEngine {
   _syncMedia(entry, clip, frame, project, now, gain, timeScale = 1, reverse = false) {
     if (!entry.ready || entry.failed || entry.kind === 'image') return;
     const media = entry.element;
-    const bus = this._layerAudio(frame.layer);
+    if (entry.live) { if (media.paused && !entry.playPending) { entry.playPending = true; media.play().catch(() => {}).finally(() => { entry.playPending = false; }); } return; }
+    const bus = this._layerAudio(frame.layer, project);
     if (bus && entry.panNode && entry.layerBus !== bus) {
       entry.panNode.disconnect();
-      entry.panNode.connect(bus.panner);
+      entry.panNode.connect(bus.input);
       entry.layerId = frame.layer.id;
       entry.layerBus = bus;
     }
+    if (entry.gainNode && (entry.fxChain || clip.audioEffects?.length)) this._audioInsert(entry, entry.gainNode, entry.panNode, clip.audioEffects, project.bpm);
     const pan = clamp(clip.pan ?? 0, -1, 1);
     if (entry.panNode && entry.pan !== pan) {
       entry.panNode.pan.setTargetAtTime(pan, this._audioContext.currentTime, 0.012);
@@ -843,19 +1122,28 @@ export class LiveEngine {
     entry.lastNow = now;
   }
 
-  render(project, frames = [], now = performance.now()/1000) {
+  render(project, frames = [], now = performance.now()/1000, { beat } = {}) {
     if (this.disposed) return;
     const started = performance.now();
+    this.frameIndex++;
+    this.beat = Number.isFinite(beat) ? beat : now*number(project.bpm, 120)/60;
+    this._analyseAudio();
     const delta = this.lastRender ? now-this.lastRender : 0;
     if (delta > 0 && delta < 1) this.stats.fps = this.stats.fps ? this.stats.fps*0.92+(1/delta)*0.08 : 1/delta;
     this.lastRender = now;
     this.stats.frames++;
     this.stats.activeClips = frames.length;
     this.stats.mediaCount = this.media.size;
-    const hasSolo = project.layers.some(layer => layer.solo);
+    const groups = new Map((project.groups || []).map(group => [group.id, group]));
+    const groupOf = layer => layer.groupId ? groups.get(layer.groupId) || null : null;
+    const hasSolo = project.layers.some(layer => layer.solo) || [...groups.values()].some(group => group.solo);
+    const visible = layer => {
+      const group = groupOf(layer);
+      return !project.bypass && !layer.bypass && !group?.bypass && (!hasSolo || layer.solo || !!group?.solo);
+    };
     const active = new Set();
     this.protectedMedia = new Set();
-    for (const owner of [project, ...project.layers, ...frames.map(frame => frame.clip).filter(Boolean)]) {
+    for (const owner of [project, ...groups.values(), ...project.layers, ...frames.map(frame => frame.clip).filter(Boolean)]) {
       if (owner.mask?.enabled !== false && owner.mask) this.protectedMedia.add(auxiliaryId('mask', owner.mask.id));
     }
     for (const frame of frames) if (frame.clip) {
@@ -868,7 +1156,7 @@ export class LiveEngine {
     for (const frame of frames) {
       if (!frame.clip || !frame.layer) continue;
       const { clip, layer } = frame;
-      const audible = !project.bypass && !layer.bypass && (!hasSolo || layer.solo);
+      const audible = visible(layer);
       const fader = groupGain(layer.group, clamp(project.crossfader ?? 0.5));
       const gain = audible && clip.useAudio !== false ? number(clip.volume, 1)*number(layer.volume, 1)*clamp(layer.av ?? 1)*number(frame.weight, 1)*fader : 0;
       const voiceId = frame.sourceLayerId && frame.sourceLayerId !== layer.id ? frame.voiceId : clip.id;
@@ -879,7 +1167,8 @@ export class LiveEngine {
       const reversedURL = reverseMediaURL(clip);
       const pairId = auxiliaryId('audio', mediaId);
       let pair = this.media.get(pairId);
-      const mainChanged = clip.kind !== 'source' && (!entry || entry.url !== (clip.url || clip.path) || entry.kind !== clip.kind);
+      const live = liveSource(clip), media = hasMedia(clip);
+      const mainChanged = media && (!entry || entry.url !== mediaURL(clip) || entry.kind !== (live ? 'video' : clip.kind));
       const reverseChanged = reversedURL && (!reverseEntry || reverseEntry.url !== reversedURL);
       const pairChanged = clip.audio && (!pair || pair.url !== (clip.audio.url || clip.audio.path));
       if (mainChanged || reverseChanged || pairChanged) {
@@ -890,7 +1179,7 @@ export class LiveEngine {
       }
       if (!reversedURL && reverseEntry) { this.remove(reverseId); reverseEntry = null; }
       if (!clip.audio && pair) { this.remove(pairId); pair = null; }
-      if (clip.kind !== 'source') {
+      if (media) {
         const reverse = frame.direction < 0 && !!reverseEntry?.ready;
         const selectedEntry = reverse ? reverseEntry : entry;
         if (selectedEntry) {
@@ -937,21 +1226,114 @@ export class LiveEngine {
     }
     for (const [id, bus] of this.audioLayers) {
       if (!project.layers.some(layer => layer.id === id)) {
-        bus.panner.disconnect();
+        bus.panner.disconnect(); bus.input.disconnect(); bus.fxChain?.dispose();
         this._disposeMeter(bus.meter);
         this.audioLayers.delete(id);
       }
+    }
+    for (const [id, bus] of this.audioGroups) {
+      const group = groups.get(id);
+      if (group) this._groupAudio(group, project);
+      else { bus.gain.disconnect(); bus.panner.disconnect(); bus.fxChain?.dispose(); this.audioGroups.delete(id); }
+    }
+    if (this.masterGain) {
+      this.masterFx ||= {};
+      this._audioInsert(this.masterFx, this.masterGain, this.masterPanner, project.audioEffects, project.bpm);
     }
     if (this.lost) return;
     const gl = this.gl;
     if (project.width !== this.requestedWidth || project.height !== this.requestedHeight) this.resize(project.width, project.height);
     gl.bindVertexArray(this.vao);
     gl.disable(gl.BLEND);
+    // Routers reading a specific layer/group and outputs reading one need a
+    // cached copy of that output; collect this frame's requests up front.
+    const cached = new Set(this.cacheRequests);
+    for (const { frame } of [...byLayer.values()].flat()) {
+      const input = frame.clip.kind === 'source' && sourceDefinition(frame.clip.source)?.kind === 'router' ? frame.clip.params?.input : null;
+      if (typeof input === 'string' && input !== 'below') cached.add(input.replace(/^(layer|group):/, ''));
+    }
+    const crossfader = clamp(project.crossfader ?? 0.5);
     let composition = this.targets[3];
     this._bind(composition, true);
-    for (const layer of project.layers) {
+    const layers = project.layers;
+    for (let index = 0; index < layers.length;) {
+      const group = groupOf(layers[index]);
+      if (!group) {
+        this.routerBase = composition;
+        const processed = this._renderLayer(layers[index], byLayer, now);
+        if (processed) {
+          const next = composition === this.targets[3] ? this.targets[4] : this.targets[3];
+          composition = this._mixLayer(composition, processed, next, layers[index], crossfader, now);
+          if (cached.has(layers[index].id)) this._cacheOutput(layers[index].id, processed);
+        }
+        index++;
+        continue;
+      }
+      // Groups render their layers on transparent black, then mix as one layer.
+      let end = index;
+      while (end < layers.length && layers[end].groupId === group.id) end++;
+      let accumulated = this.targets[6], drawn = false;
+      this._bind(accumulated, true);
+      for (let item = index; item < end; item++) {
+        this.routerBase = accumulated;
+        const processed = this._renderLayer(layers[item], byLayer, now);
+        if (!processed) continue;
+        const next = accumulated === this.targets[6] ? this.targets[7] : this.targets[6];
+        accumulated = this._mixLayer(accumulated, processed, next, layers[item], crossfader, now);
+        if (cached.has(layers[item].id)) this._cacheOutput(layers[item].id, processed);
+        drawn = true;
+      }
+      if (drawn) {
+        const processed = this._process(accumulated, group, now, 'layer');
+        if (cached.has(group.id)) this._cacheOutput(group.id, processed);
+        const next = composition === this.targets[3] ? this.targets[4] : this.targets[3];
+        this._composite(composition, processed, next, group.blend, clamp(group.opacity ?? 1)*groupGain(group.crossfader, crossfader), now);
+        composition = next;
+      }
+      index = end;
+    }
+    this.routerBase = null;
+    const finished = this._process(composition, project, now, 'composition');
+    this.lastFinished = finished;
+    this._copy(finished, null, project.blackout || project.bypass ? 0 : clamp(project.masterOpacity ?? 1)*clamp(project.av ?? 1), true);
+    this._pruneTargets();
+    this._pruneCanvasSources();
+    this.stats.frameMs = performance.now()-started;
+  }
+
+  // Mix a processed layer into `base`, honouring the layer's mask mode.
+  _mixLayer(base, processed, next, layer, crossfader, now) {
+    const opacity = clamp(layer.opacity ?? 1)*clamp(layer.av ?? 1)*groupGain(layer.group, crossfader);
+    if (layer.maskMode && layer.maskMode !== 'none') {
+      // Mask layer (manual p. 39): its luminance or alpha cuts the layers below.
+      const masked = opacity < 1 ? this._scratch(processed) : next;
+      this._bind(masked);
+      const gl = this.gl, u = this._use(this.maskProgram);
+      this._sample(base.texture, u.uImage);
+      this._sample(processed.texture, u.uMask, 1);
+      gl.uniform1i(u.uAlpha, layer.maskMode.startsWith('alpha') ? 1 : 0);
+      gl.uniform1i(u.uInvert, layer.maskMode.endsWith('invert') ? 1 : 0);
+      gl.uniform1i(u.uLuma, 1);
+      this._draw();
+      if (opacity < 1) this._composite(base, masked, next, 'normal', opacity, now, true);
+      return next;
+    }
+    this._composite(base, processed, next, layer.blend, opacity, now);
+    return next;
+  }
+
+  _pruneCanvasSources() {
+    for (const [id, source] of this.canvasSources) if (this.frameIndex - source.used > 300) {
+      source.instance?.dispose?.();
+      if (source.texture && !this.lost) this.gl.deleteTexture(source.texture);
+      this.canvasSources.delete(id);
+    }
+  }
+
+  _renderLayer(layer, byLayer, now) {
+      const gl = this.gl;
       const layerFrames = byLayer.get(layer.id);
-      if (!layerFrames?.length) continue;
+      if (!layerFrames?.length) return null;
       const layerTarget = this.targets[2];
       this._bind(layerTarget, true);
       // Layer width/height are content-size overrides: normalize every source
@@ -961,8 +1343,10 @@ export class LiveEngine {
       const normalizeDimensions = layer.widthEnabled || layer.heightEnabled;
       let drawn = false;
       for (const { frame, entry } of layerFrames) {
-        if (frame.clip.kind !== 'source' && (!entry?.ready || entry.failed)) continue;
-        const source = this._source(frame.clip, entry, frame.time);
+        if (hasMedia(frame.clip) && (!entry?.ready || entry.failed)) continue;
+        // Effect clips process everything beneath them (an adjustment layer).
+        const source = frame.clip.kind === 'effect' ? (this.routerBase ? (this._copy(this.routerBase, this.targets[0]), this._fullFrame(this.targets[0])) : null)
+          : this._source(frame.clip, entry, frame.time);
         if (!source) continue;
         let processed = this._process(source, frame.clip, now);
         if (normalizeDimensions) {
@@ -987,17 +1371,84 @@ export class LiveEngine {
         }
         drawn = true;
       }
-      if (!drawn) continue;
+      if (!drawn) return null;
       const layerTransform = normalizeDimensions ? { ...layer, widthEnabled: false, heightEnabled: false } : layer;
-      const processed = this._process(layerTarget, layerTransform, now, 'layer');
-      const next = composition === this.targets[3] ? this.targets[4] : this.targets[3];
-      this._composite(composition, processed, next, layer.blend, clamp(layer.opacity ?? 1)*clamp(layer.av ?? 1)*groupGain(layer.group, clamp(project.crossfader ?? 0.5)), now);
-      composition = next;
+      return this._process(layerTarget, layerTransform, now, 'layer');
+  }
+
+  // Audio analysis for FFT-driven parameters and the shaders' uAudio input
+  // (manual p. 143). Spectra are 64 log-spaced bands from 20 Hz to 20 kHz,
+  // read at most once per rendered frame and only for requested sources.
+  _analyser(key, sourceNode) {
+    let analyser = this.analysers.get(key);
+    if (analyser && analyser.sourceNode !== sourceNode) { analyser.node.disconnect(); try { analyser.sourceNode?.disconnect(analyser.node); } catch { /* already gone */ } this.analysers.delete(key); analyser = null; }
+    if (!analyser) {
+      if (!sourceNode || !this._audioContext) return null;
+      const node = this._audioContext.createAnalyser();
+      node.fftSize = 2048; node.smoothingTimeConstant = 0.5; node.minDecibels = -90; node.maxDecibels = -15;
+      const count = node.frequencyBinCount, nyquist = this._audioContext.sampleRate/2, ranges = new Uint16Array(LOG_BINS*2);
+      for (let i = 0; i < LOG_BINS; i++) {
+        const start = Math.min(count-1, Math.floor(20*Math.pow(1000, i/LOG_BINS)/nyquist*count));
+        ranges[i*2] = start; ranges[i*2+1] = Math.min(count, Math.max(start+1, Math.ceil(20*Math.pow(1000, (i+1)/LOG_BINS)/nyquist*count)));
+      }
+      sourceNode.connect(node);
+      analyser = { node, sourceNode, ranges, bins: new Uint8Array(count), log: new Float32Array(LOG_BINS), frame: -1, used: this.frameIndex };
+      this.analysers.set(key, analyser);
     }
-    const finished = this._process(composition, project, now, 'composition');
-    this.lastFinished = finished;
-    this._copy(finished, null, project.blackout || project.bypass ? 0 : clamp(project.masterOpacity ?? 1)*clamp(project.av ?? 1), true);
-    this.stats.frameMs = performance.now()-started;
+    analyser.used = this.frameIndex;
+    return analyser;
+  }
+
+  _readSpectrum(analyser) {
+    if (analyser.frame !== this.frameIndex) {
+      analyser.frame = this.frameIndex;
+      analyser.node.getByteFrequencyData(analyser.bins);
+      for (let i = 0; i < LOG_BINS; i++) {
+        let peak = 0;
+        for (let j = analyser.ranges[i*2]; j < analyser.ranges[i*2+1]; j++) if (analyser.bins[j] > peak) peak = analyser.bins[j];
+        analyser.log[i] = peak/255;
+      }
+    }
+    return analyser.log;
+  }
+
+  // source: 'composition' | 'group' | 'layer' | 'clip' | 'external'.
+  spectrum(source = 'composition', id = null) {
+    if (!this._audioContext) return null;
+    let node = null;
+    if (source === 'composition') node = this.limiter;
+    else if (source === 'layer') node = this.audioLayers.get(id)?.panner;
+    else if (source === 'group') node = this.audioGroups.get(id)?.panner;
+    else if (source === 'clip') node = this.media.get(id)?.panNode || this.media.get(auxiliaryId('audio', id))?.panNode;
+    else if (source === 'external') node = this.externalSource;
+    const analyser = this._analyser(`${source}:${id ?? ''}`, node);
+    return analyser ? this._readSpectrum(analyser) : null;
+  }
+
+  _analyseAudio() {
+    const spectrum = this._audioContext?.state === 'running' ? this.spectrum('composition') : null;
+    if (!spectrum) { this.audioBands.fill(0); return; }
+    const band = (from, to) => { let sum = 0; for (let i = from; i < to; i++) sum += spectrum[i]; return sum/(to-from); };
+    const third = Math.round(LOG_BINS*0.3), upper = Math.round(LOG_BINS*0.7);
+    this.audioBands[0] = band(0, third); this.audioBands[1] = band(third, upper); this.audioBands[2] = band(upper, LOG_BINS); this.audioBands[3] = band(0, LOG_BINS);
+    for (const [key, analyser] of this.analysers) if (key !== 'composition:' && this.frameIndex - analyser.used > 120) {
+      analyser.node.disconnect(); try { analyser.sourceNode?.disconnect(analyser.node); } catch { /* already gone */ }
+      this.analysers.delete(key);
+    }
+  }
+
+  // External FFT input (manual p. 151): an audio input device, analysed only.
+  async setExternalAudioInput(deviceId) {
+    this._ensureAudio();
+    this.externalStream?.getTracks().forEach(track => track.stop());
+    this.externalSource?.disconnect();
+    this.externalStream = this.externalSource = null;
+    if (deviceId === null || deviceId === undefined || !this._audioContext) return false;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { ...(deviceId ? { deviceId: { exact: deviceId } } : {}), echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    if (this.disposed) { stream.getTracks().forEach(track => track.stop()); return false; }
+    this.externalStream = stream;
+    this.externalSource = this._audioContext.createMediaStreamSource(stream);
+    return true;
   }
 
   getStats() {
@@ -1007,6 +1458,21 @@ export class LiveEngine {
     const layerAudio = Object.fromEntries([...this.audioLayers].map(([id, bus]) => [id, this._readMeter(bus.meter)]));
     return { ...this.stats, droppedFrames: dropped, mediaCount: this.media.size, contextLost: this.lost,
       audioState: this._audioContext?.state || 'idle', audio, audioPeak: Math.max(...audio.peak), audioRms: Math.max(...audio.rms), layerAudio, mediaCacheLimit: this.maxMedia };
+  }
+
+  // RGBA rows (bottom-up) of a region of the visible output, for DMX fixture
+  // sampling. The buffer is reused between calls; copy it to keep it.
+  readRegion(x, y, width, height) {
+    if (this.disposed || this.lost || !this.lastFinished) return null;
+    x = Math.max(0, Math.floor(x)); y = Math.max(0, Math.floor(y));
+    width = Math.min(this.canvas.width - x, Math.ceil(width)); height = Math.min(this.canvas.height - y, Math.ceil(height));
+    if (width <= 0 || height <= 0) return null;
+    const size = width*height*4;
+    if (!this.readBuffer || this.readBuffer.length !== size) this.readBuffer = new Uint8Array(size);
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.readPixels(x, this.canvas.height-y-height, width, height, gl.RGBA, gl.UNSIGNED_BYTE, this.readBuffer);
+    return this.readBuffer;
   }
 
   async capturePNG({ transparent = false } = {}) {
@@ -1058,6 +1524,9 @@ export class LiveEngine {
     if (!entry) return;
     this.media.delete(clipId);
     entry.cancel?.();
+    entry.stream?.getTracks().forEach(track => track.stop());
+    entry.fxChain?.dispose();
+    if (entry.live) entry.element.srcObject = null;
     entry.gifController?.abort();
     entry.animation?.close();
     entry.element.removeEventListener('error', entry.onError);
@@ -1094,7 +1563,12 @@ export class LiveEngine {
     this.limiter?.disconnect();
     this._disposeMeter(this.masterMeter);
     this.masterMeter = null;
-    for (const bus of this.audioLayers.values()) { bus.panner.disconnect(); this._disposeMeter(bus.meter); }
+    for (const bus of this.audioLayers.values()) { bus.panner.disconnect(); bus.fxChain?.dispose(); this._disposeMeter(bus.meter); }
+    for (const bus of this.audioGroups.values()) { bus.gain.disconnect(); bus.panner.disconnect(); bus.fxChain?.dispose(); }
+    this.audioGroups.clear();
+    this.masterFx?.fxChain?.dispose();
+    this.externalStream?.getTracks().forEach(track => track.stop());
+    for (const source of this.canvasSources.values()) source.instance?.dispose?.();
     this.audioLayers.clear();
     this._audioContext?.close().catch(() => {});
     this.targets = [];

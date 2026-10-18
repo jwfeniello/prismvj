@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, dialog, ipcMain, protocol, net, screen, session, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, protocol, net, screen, session, shell, desktopCapturer } = require('electron');
 const fs = require('node:fs/promises');
 const { createReadStream } = require('node:fs');
 const { Readable } = require('node:stream');
@@ -10,6 +10,8 @@ const { randomUUID } = require('node:crypto');
 const dgram = require('node:dgram');
 const { isAutomatedLaunch, validateBuiltPage } = require('./startup.cjs');
 const { createMediaConverter } = require('./media-converter.cjs');
+const { scanISFFolder } = require('./isf-library.cjs');
+const { DmxSender, DmxReceiver } = require('./dmx-network.cjs');
 
 // Test profiles and automation/debugging switches also imply hidden mode. A
 // forgotten environment flag must never put test windows or dialogs on stage.
@@ -58,6 +60,13 @@ let saveQueue = Promise.resolve();
 let frameBusy = false;
 let frameSentAt = 0;
 let oscSocket = null;
+let oscOutSocket = null;
+let dmxSender = null;
+let dmxReceiver = null;
+let captureSourceId = '';
+// Output windows opened by the editor with window.open share its process, so
+// the composition canvas is drawn directly on the GPU instead of being encoded.
+const outputWindows = new Map();
 let oscState = { active: false, port: null, host: '127.0.0.1', received: 0, rejected: 0 };
 let modelPromise;
 let shutdownStarted = false;
@@ -399,7 +408,19 @@ function windowOptions(extra = {}) {
 }
 
 function lockWindow(window) {
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.setWindowOpenHandler(({ url, frameName }) => {
+    if (window !== editor || url !== 'about:blank' || !/^prism-output-[a-z0-9-]{1,40}$/.test(frameName) || outputWindows.size >= 16) return { action: 'deny' };
+    return { action: 'allow', overrideBrowserWindowOptions: windowOptions({ show: false, title: 'Prism Live — Output', autoHideMenuBar: true, backgroundColor: '#000000', minWidth: 160, minHeight: 90 }) };
+  });
+  window.webContents.on('did-create-window', (child, { frameName }) => {
+    if (window !== editor) { child.close(); return; }
+    outputWindows.set(frameName, child);
+    child.setMenu(null);
+    child.webContents.on('will-navigate', event => event.preventDefault());
+    child.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    child.on('closed', () => { outputWindows.delete(frameName); notify('prism:output-window-closed', frameName); });
+    child.webContents.on('before-input-event', (_event, input) => { if (input.type === 'keyDown' && input.key === 'Escape') child.setFullScreen(false); });
+  });
   window.webContents.on('will-navigate', event => event.preventDefault());
   window.webContents.on('will-redirect', event => event.preventDefault());
   window.webContents.on('will-attach-webview', event => event.preventDefault());
@@ -506,6 +527,73 @@ function parseOSC(buffer, depth = 0) {
   }
   if (cursor !== buffer.length) throw new Error('Unexpected OSC payload.');
   return [{ address, args }];
+}
+
+function oscString(value) {
+  const bytes = Buffer.from(`${value}\0`, 'utf8');
+  return Buffer.concat([bytes, Buffer.alloc((4 - bytes.length % 4) % 4)]);
+}
+
+function encodeOSC(address, args) {
+  if (typeof address !== 'string' || !/^\/[\x21-\x7e]{0,254}$/.test(address)) throw new Error('Invalid OSC address.');
+  if (!Array.isArray(args) || args.length > 16) throw new Error('Invalid OSC arguments.');
+  let tags = ',';
+  const payload = args.map(arg => {
+    if (typeof arg === 'boolean') { tags += arg ? 'T' : 'F'; return Buffer.alloc(0); }
+    if (typeof arg === 'string') { tags += 's'; return oscString(arg.slice(0, 1024)); }
+    if (typeof arg !== 'number' || !Number.isFinite(arg)) throw new Error('OSC values must be finite numbers, strings or booleans.');
+    const buffer = Buffer.alloc(4);
+    if (Number.isInteger(arg) && Math.abs(arg) < 2 ** 31) { tags += 'i'; buffer.writeInt32BE(arg); } else { tags += 'f'; buffer.writeFloatBE(arg); }
+    return buffer;
+  });
+  return Buffer.concat([oscString(address), oscString(tags), ...payload]);
+}
+
+// OSC output (manual p. 196): sends state changes to a controller or another app.
+async function sendOSC(host, port, messages) {
+  if (typeof host !== 'string' || !/^(\d{1,3}\.){3}\d{1,3}$/.test(host) || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid OSC output host or port.');
+  if (!Array.isArray(messages) || messages.length > 256) throw new Error('Invalid OSC message batch.');
+  if (!oscOutSocket) {
+    oscOutSocket = dgram.createSocket('udp4');
+    oscOutSocket.on('error', error => { void log(`OSC out: ${error.message}`); });
+    await new Promise(resolve => oscOutSocket.bind(0, resolve));
+    oscOutSocket.setBroadcast(true);
+  }
+  for (const message of messages) oscOutSocket.send(encodeOSC(message.address, message.args || []), port, host);
+  return true;
+}
+
+async function stopDMX() {
+  const sender = dmxSender; dmxSender = null;
+  await sender?.stop().catch(() => {});
+  return true;
+}
+
+async function startDMX(options) {
+  await stopDMX();
+  const sender = new DmxSender({ protocol: options?.protocol === 'sacn' ? 'sacn' : 'artnet', host: typeof options?.host === 'string' ? options.host : undefined,
+    port: Number.isInteger(options?.port) ? options.port : undefined, rate: Number.isFinite(options?.rate) ? options.rate : 44, sourceName: 'Prism Live' });
+  sender.on('error', error => notify('prism:warning', `DMX output: ${error.message}`));
+  await sender.start();
+  dmxSender = sender;
+  return true;
+}
+
+async function stopDMXInput() {
+  const receiver = dmxReceiver; dmxReceiver = null;
+  await receiver?.stop().catch(() => {});
+  return true;
+}
+
+async function startDMXInput(options) {
+  await stopDMXInput();
+  const receiver = new DmxReceiver({ protocol: options?.protocol === 'sacn' ? 'sacn' : 'artnet', port: Number.isInteger(options?.port) ? options.port : undefined,
+    bindAddress: typeof options?.bindAddress === 'string' ? options.bindAddress : '0.0.0.0', universes: Array.isArray(options?.universes) ? options.universes.slice(0, 64) : undefined });
+  receiver.on('dmx', frame => notify('prism:dmx-input', { universe: frame.universe, data: frame.data }));
+  receiver.on('error', error => notify('prism:warning', `DMX input: ${error.message}`));
+  await receiver.start();
+  dmxReceiver = receiver;
+  return true;
 }
 
 async function stopOSC() {
@@ -661,6 +749,40 @@ function setupIPC() {
   handle('prism:osc-start', startOSC);
   handle('prism:osc-stop', stopOSC);
   handle('prism:osc-status', () => ({ ...oscState }));
+  handle('prism:osc-send', (host, port, messages) => sendOSC(host, port, messages));
+  handle('prism:dmx-start', startDMX);
+  handle('prism:dmx-stop', stopDMX);
+  handle('prism:dmx-input-start', startDMXInput);
+  handle('prism:dmx-input-stop', stopDMXInput);
+  ipcMain.on('prism:dmx-send', (event, frames) => {
+    if (event.sender !== editor?.webContents || !dmxSender || !Array.isArray(frames) || frames.length > 64) return;
+    for (const frame of frames) {
+      if (!Array.isArray(frame) || !Number.isInteger(frame[0]) || !(frame[1] instanceof Uint8Array) || frame[1].length > 512) continue;
+      try { dmxSender.send(frame[0], frame[1]); } catch { /* invalid universe for this protocol */ }
+    }
+  });
+  handle('prism:isf-scan', async folder => {
+    let directory = typeof folder === 'string' && folder ? folder : null;
+    if (!directory) {
+      const result = await dialog.showOpenDialog(editor, { title: 'Import ISF shader folder', properties: ['openDirectory'] });
+      if (result.canceled || !result.filePaths[0]) return null;
+      directory = result.filePaths[0];
+    }
+    return { folder: directory, files: (await scanISFFolder(directory)).map(({ name, text }) => ({ name, text })) };
+  });
+  handle('prism:capture-sources', async () => (await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 0, height: 0 } }))
+    .slice(0, 64).map(source => ({ id: source.id, name: source.name, screen: source.id.startsWith('screen:') })));
+  handle('prism:capture-select', id => { captureSourceId = typeof id === 'string' ? id.slice(0, 200) : ''; return true; });
+  handle('prism:output-window-place', (frameName, displayId, fullscreen) => {
+    const child = outputWindows.get(frameName);
+    if (!child || child.isDestroyed()) return false;
+    const displays = screen.getAllDisplays(), display = displays.find(item => String(item.id) === String(displayId));
+    if (display) { child.setFullScreen(false); child.setBounds(display.bounds); }
+    child.setFullScreen(!!fullscreen && !!display && !hiddenTestWindows);
+    if (!hiddenTestWindows) child.showInactive();
+    return true;
+  });
+  handle('prism:output-window-close', frameName => { outputWindows.get(frameName)?.close(); return true; });
   ipcMain.on('prism:output-frame', (event, data) => {
     try {
       checkSender(event);
@@ -727,10 +849,18 @@ app.whenReady().then(async () => {
   });
   // Electron 44 requests midiSysex even for requestMIDIAccess({sysex:false}).
   // Both permission labels are therefore restricted to this trusted editor frame.
-  const canUseMIDI = (contents, permission, details) => ['midi', 'midiSysex'].includes(permission)
+  // MIDI, capture devices/screens and audio device selection are limited to
+  // the trusted editor frame.
+  const canUseMIDI = (contents, permission, details) => ['midi', 'midiSysex', 'media', 'display-capture', 'speaker-selection'].includes(permission)
     && contents === editor?.webContents && details?.isMainFrame !== false && isAppURL(contents.getURL());
   session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => callback(canUseMIDI(contents, permission, details)));
   session.defaultSession.setPermissionCheckHandler((contents, permission, _origin, details) => canUseMIDI(contents, permission, details));
+  session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+    if (request.frame !== editor?.webContents.mainFrame) { callback({}); return; }
+    desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 0, height: 0 } })
+      .then(sources => callback({ video: sources.find(source => source.id === captureSourceId) || sources.find(source => source.id.startsWith('screen:')) || sources[0] }))
+      .catch(() => callback({}));
+  });
   setupIPC();
   await createEditor();
 }).catch(async error => {
@@ -751,6 +881,9 @@ app.on('before-quit', event => {
   void (async () => {
     await mediaConverter?.close();
     await stopOSC();
+    await stopDMX();
+    await stopDMXInput();
+    oscOutSocket?.close();
     await saveQueue;
     for (const record of recordings.values()) {
       record.finishing = true;
@@ -772,4 +905,4 @@ app.on('before-quit', event => {
 });
 
 // Kept available for protocol tests without exposing it through the renderer bridge.
-module.exports = { parseOSC };
+module.exports = { parseOSC, encodeOSC };

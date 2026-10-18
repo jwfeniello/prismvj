@@ -15,6 +15,12 @@ export const DASHBOARD_PARAMETERS = Object.freeze({
     ['rotation', 'Rotate Z', -180, 180], ['pan', 'Pan', -1, 1],
     ['x', 'Position X', -1, 1], ['y', 'Position Y', -1, 1],
   ],
+  group: [
+    ['opacity', 'Video', 0, 1], ['volume', 'Audio', 0, 1],
+    ['speed', 'Speed', 0, 4], ['scale', 'Scale', 0, 10],
+    ['rotation', 'Rotate Z', -180, 180], ['pan', 'Pan', -1, 1],
+    ['x', 'Position X', -1, 1], ['y', 'Position Y', -1, 1],
+  ],
   composition: [
     ['masterOpacity', 'Video', 0, 1], ['masterVolume', 'Audio', 0, 4],
     ['crossfader', 'Crossfader', 0, 1], ['speed', 'Speed', 0, 4],

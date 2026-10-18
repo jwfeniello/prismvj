@@ -1,5 +1,23 @@
 # Implementation status
 
+## 2026-10-18 manual-parity pass
+
+Built on branch `feature/manual-parity` and packaged as `release/manual-parity`, which the launcher now prefers. This pass adds:
+- a parameter system: path addressing, a definition registry, and a GLSL contract shared by catalog and imported effects
+- 84 video effects with opacity/blend, multi-pass and feedback, plus presets
+- 19 Web Audio effects at four scopes
+- 40 generators, the Text Animator, capture/screen sources and the Video Router
+- ISF import
+- parameter animation (timeline, BPM, clip position, FFT, dashboard) with envelopes
+- groups, mask layers, effect clips, layer lock/duplicate/clear
+- a keyboard/MIDI/OSC/DMX shortcut system with MIDI feedback and clock sync
+- Advanced Output (screens, slices, masks, warps, soft edges, test card)
+- same-process GPU output windows
+- Art-Net/sACN DMX output and input, OSC output
+- audio device preferences
+
+Verification: `npm test` 242 passed; `npm run test:ui` 30 passed plus 5 new feature specs; `npm run test:desktop` 31 passed plus the new output-window desktop test; packaged smoke passed for `release/manual-parity`. Undo now coalesces only continuous slider edits. Known gaps are listed in the README.
+
 ## 2026-10-11 opaque DXV reverse playback
 
 The reported `spinning eli head_DXV 3 Normal Quality No Alpha.mov` is 3840×2160, 57 frames at 30 fps. FFprobe reports RGBA for DXV even when every alpha plane is fully opaque; the old cache therefore encoded a 61 MB alpha-bearing reverse VP9 file. The converter now scans DXV alpha planes across all frames, writes opaque MOV playback as H.264/AAC MP4 with eight-frame keyframe intervals, and retains VP9/Opus WebM for genuinely transparent MOVs. Existing cached opaque DXV assets are checked and migrated on their next import while the original MOV remains untouched. The renderer also skips repeated full-frame alpha readbacks for native MOVs with verified alpha status.

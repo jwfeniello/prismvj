@@ -1,6 +1,6 @@
 // In-place composition editing keeps the live transport and decoder references
 // intact. Validate every destination before changing a source or a row.
-import { createClip, createLayer, LIMITS } from './model.js';
+import { createClip, createLayer, createGroup, LIMITS } from './model.js';
 import { visibleSlot, reconcilePersistent } from './persistent-clips.js';
 
 let sequence = 0;
@@ -191,7 +191,7 @@ function cloneClip(clip, freshIds = false) {
     copy.id = uid('clip');
     if (copy.audio) copy.audio.id = uid('audio');
     if (copy.mask) copy.mask.id = uid('mask');
-    for (const effect of copy.effects) effect.id = uid('effect');
+    for (const effect of [...copy.effects, ...copy.audioEffects]) effect.id = uid('effect');
   }
   return copy;
 }
@@ -213,7 +213,7 @@ export function pasteClip(project, to, clipboard) {
   if (visibleSlot(project, target.layer, target.deckId, target.column).persistentFrom &&
       visibleSlot(project, target.layer, target.deckId, target.column).persistentFrom !== target.deckId)
     throw new RangeError('The destination is covered by a persistent clip. Move the covered clip or turn off persistence first.');
-  if (!clipboard || clipboard.version !== 1 || !['copy', 'cut'].includes(clipboard.mode) || !clipboard.clip || !['audio', 'video', 'image', 'source'].includes(clipboard.clip.kind)) throw new TypeError('The clip clipboard is invalid.');
+  if (!clipboard || clipboard.version !== 1 || !['copy', 'cut'].includes(clipboard.mode) || !clipboard.clip || !['audio', 'video', 'image', 'source', 'effect'].includes(clipboard.clip.kind)) throw new TypeError('The clip clipboard is invalid.');
   const current = clipboard.mode === 'cut' && clipboard.projectId === project.id ? findClipSlot(project, clipboard.clipId) : null;
   if (current) {
     const clip = moveClip(project, current, to);
@@ -230,4 +230,84 @@ export function pasteClip(project, to, clipboard) {
   // was removed or its original composition was closed.
   clipboard.mode = 'copy';
   return clip;
+}
+
+// Groups (manual pp. 41–44) hold contiguous layers. Moving a layer into a
+// group places it at the top of that group's run; a group never stays empty.
+function groupRun(project, groupId) {
+  const indexes = project.layers.map((layer, index) => layer.groupId === groupId ? index : -1).filter(index => index >= 0);
+  return indexes.length ? { first: indexes[0], last: indexes.at(-1) } : null;
+}
+
+export function pruneGroups(project) {
+  project.groups = (project.groups || []).filter(group => project.layers.some(layer => layer.groupId === group.id));
+}
+
+export function setLayerGroup(project, layerId, groupId) {
+  const layer = project.layers[indexOf(project.layers, layerId, 'Layer')];
+  if (groupId !== null && !(project.groups || []).some(group => group.id === groupId)) throw new RangeError('Group does not exist.');
+  if (layer.groupId === groupId) return layer;
+  const run = groupId ? groupRun(project, groupId) : null;
+  layer.groupId = groupId;
+  if (run) {
+    project.layers.splice(project.layers.indexOf(layer), 1);
+    const again = groupRun(project, groupId);
+    project.layers.splice(again ? again.last + 1 : run.first, 0, layer);
+  } else if (!groupId) {
+    // Leaving a group: step out above the group's remaining run.
+    const previous = project.layers.indexOf(layer);
+    const neighbours = project.layers.filter(item => item !== layer && item.groupId && (project.layers.indexOf(item) === previous - 1 || project.layers.indexOf(item) === previous + 1));
+    if (neighbours.length === 2 && neighbours[0].groupId === neighbours[1].groupId) {
+      project.layers.splice(previous, 1);
+      const remaining = groupRun(project, neighbours[0].groupId);
+      project.layers.splice(remaining.last + 1, 0, layer);
+    }
+  }
+  pruneGroups(project);
+  return layer;
+}
+
+export function createGroupForLayer(project, layerId, name) {
+  if ((project.groups ||= []).length >= LIMITS.groups) throw new RangeError(`A composition can have at most ${LIMITS.groups} groups.`);
+  const group = createGroup(nameOf(name, `Group ${project.groups.length + 1}`));
+  project.groups.push(group);
+  const layer = project.layers[indexOf(project.layers, layerId, 'Layer')];
+  const previous = layer.groupId;
+  layer.groupId = group.id;
+  if (previous) {
+    // Stepping out of the old group keeps both runs contiguous.
+    layer.groupId = null;
+    setLayerGroup(project, layerId, null);
+    layer.groupId = group.id;
+  }
+  pruneGroups(project);
+  return group;
+}
+
+export function ungroup(project, groupId) {
+  for (const layer of project.layers) if (layer.groupId === groupId) layer.groupId = null;
+  pruneGroups(project);
+}
+
+export function duplicateLayer(project, layerId) {
+  const index = indexOf(project.layers, layerId, 'Layer');
+  if (project.layers.length >= LIMITS.layers) throw new RangeError(`A composition can have at most ${LIMITS.layers} layers.`);
+  const source = project.layers[index];
+  let count = 0;
+  for (const { slots } of rows(project)) count += slots.filter(Boolean).length;
+  const copies = Object.values(source.clips).flat().filter(Boolean).length;
+  if (count + copies > LIMITS.clips) throw new RangeError(`A composition can have at most ${LIMITS.clips} clips.`);
+  const layer = { ...structuredClone({ ...source, clips: undefined }), id: uid('layer'), name: `${source.name} copy`, activeClipId: null, clips: Object.create(null) };
+  if (layer.mask) layer.mask.id = uid('mask');
+  for (const effect of [...(layer.effects || []), ...(layer.audioEffects || [])]) effect.id = uid('effect');
+  for (const deck of project.decks) layer.clips[deck.id] = (source.clips[deck.id] || []).map(clip => clip ? cloneClip(clip, true) : null);
+  project.layers.splice(index + 1, 0, layer);
+  return layer;
+}
+
+export function clearLayerClips(project, layerId) {
+  const layer = project.layers[indexOf(project.layers, layerId, 'Layer')];
+  for (const deck of project.decks) layer.clips[deck.id] = (layer.clips[deck.id] || []).map(() => null);
+  layer.activeClipId = null;
+  return layer;
 }

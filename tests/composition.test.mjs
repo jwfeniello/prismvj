@@ -141,14 +141,14 @@ test('moving a quantized queued clip preserves its launch beat on the new layer'
 test('copy paste makes independent clip, media, cue, and effect identities', () => {
   const { project, a, address } = fixture();
   const clipboard = copyClip(project, address());
-  a.name = 'Changed after copy'; a.effects[0].amount = 0.7;
+  a.name = 'Changed after copy'; a.effects[0].params.amount = 0.7;
   const pasted = pasteClip(project, address(0, 2), clipboard);
   assert.notEqual(pasted.id, a.id); assert.equal(pasted.name, 'A');
   assert.notEqual(pasted.audio.id, a.audio.id); assert.equal(pasted.audio.url, a.audio.url);
   assert.notEqual(pasted.mask.id, a.mask.id); assert.notEqual(pasted.effects[0].id, a.effects[0].id);
-  assert.equal(pasted.effects[0].amount, 0.3);
-  pasted.cues[0] = 0.9; pasted.effects[0].amount = 0.1; pasted.mask.invert = true;
-  assert.equal(a.cues[0], 0); assert.equal(a.effects[0].amount, 0.7); assert.equal(a.mask.invert, false);
+  assert.equal(pasted.effects[0].params.amount, 0.3);
+  pasted.cues[0] = 0.9; pasted.effects[0].params.amount = 0.1; pasted.mask.invert = true;
+  assert.equal(a.cues[0], 0); assert.equal(a.effects[0].params.amount, 0.7); assert.equal(a.mask.invert, false);
   const again = pasteClip(project, address(1, 5), clipboard);
   assert.notEqual(again.audio.id, pasted.audio.id); assert.equal(again.cues[0], 0);
   assert.doesNotThrow(() => validateProject(serializeProject(project)));

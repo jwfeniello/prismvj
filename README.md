@@ -16,7 +16,7 @@ npm run build
 npm start
 ```
 
-`npm run package` produces `release/reverse-smooth-dxv/PrismLive-win32-x64/PrismLive.exe`. The launcher prefers that updated build and retains the earlier packages as fallbacks. Close the running app and reopen the launcher to use an update. Keep the entire packaged directory together. Once packaged, the app runs offline without Node.js or a development server.
+`npm run package` produces `release/manual-parity/PrismLive-win32-x64/PrismLive.exe`. The launcher prefers that updated build and retains the earlier packages as fallbacks. Close the running app and reopen the launcher to use an update. Keep the entire packaged directory together. Once packaged, the app runs offline without Node.js or a development server.
 
 ## Using the current build
 
@@ -45,6 +45,20 @@ npm start
 
 The browser development view is useful for testing. Files imported there use temporary browser URLs and need importing again after a restart. Use the Windows application for persistent media references.
 
+### Manual-parity additions
+
+- **Effects:** 84 video effects in the Effects tab, grouped by category and searchable (Ctrl+/). Each effect has its own parameters, Opacity, Blend mode, Bypass (B), presets (Save as… / apply from the effect card or the browser) and drag-to-reorder. Drop effects on a clip, a layer header or any panel; Alt-drop adds one at 0% opacity. Dropping an effect on an empty slot creates an **Effect Clip** that processes every layer beneath it. Older projects' effects still load.
+- **Audio effects:** switch the Effects tab to **Audio** for 19 effects (EQ, filters, delay, ping-pong, reverb, distortion, bit crusher, compressor, limiter, flanger, chorus, phaser, tremolo, auto pan, stereo width, gain), each with Dry/Wet, on clips, layers, groups and the composition.
+- **Sources:** 40 generators (shapes, patterns, fractals, particles, lasers, audio spectrum/waveform, colour bars, test card and more), the **Text Animator** with per-character animation, capture devices (cameras), **screen capture**, and the **Video Router** (layers below, or a chosen layer or group). Source parameters appear in the clip panel.
+- **ISF shaders:** Effects tab → *Import .fs files…* or *Import folder…* loads Interactive Shader Format effects and generators.
+- **Parameter animation:** click the ⚙ beside any parameter to animate it by Timeline, BPM Sync, Clip Position, Audio Analysis (composition, group, layer, clip or an external input with L/M/H bands, gain and fall) or a Dashboard dial (several parameters per dial, each with its own range). Shapes include ramp, sine, triangle, square, random and a drawable envelope.
+- **Groups:** right-click a layer name → *Group › New*. Groups render their layers on transparent black, then mix as one layer with their own blend, opacity, audio, speed, bypass/solo/eject, effects, transform and column triggers. The **Group** tab shows the group panel.
+- **Layers:** mask mode (luma/alpha, inverted), lock content, duplicate, clear clips, previous/next clip.
+- **Shortcuts:** Ctrl+Shift+K (keyboard) or Ctrl+Shift+M (MIDI), or the Control tab's Edit buttons for OSC and DMX. Click a highlighted control, then give the input. Modes: value, toggle, momentary, trigger, set and relative (encoders). MIDI feedback is sent to controllers, BPM can follow MIDI clock, and shortcut sets can be saved as presets.
+- **Advanced Output:** Output → *Advanced Output…* edits screens, slices, polygon slices, masks, perspective, grid and bezier warping, soft edges, colour correction, test card, identify and presets. Output windows now share the editor's process, so the composition goes to them GPU-to-GPU every frame instead of as 30 fps JPEG frames.
+- **DMX and OSC out:** the Control tab sends pixel-mapped fixtures over Art-Net or sACN, receives DMX for shortcuts, and can send OSC feedback for OSC shortcuts.
+- **Preferences:** audio output device, external FFT input device and MIDI clock sync.
+
 ## Keyboard
 
 | Key | Action |
@@ -63,6 +77,8 @@ The browser development view is useful for testing. Files imported there use tem
 | Ctrl+S / Ctrl+Shift+S / Ctrl+O | Save / Save as / Open |
 | Ctrl+Z / Ctrl+Y | Undo / redo edits |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste selected clips |
+| Ctrl+Shift+K / Ctrl+Shift+M | Keyboard / MIDI shortcut edit mode (Escape exits) |
+| Ctrl+/ | Search effects |
 
 ## Verification
 
@@ -81,6 +97,8 @@ The engine tests use an installed Chrome browser (`CHROME_PATH` overrides its pa
 UI tests run a fixed production build. Desktop tests use an isolated temporary profile and hidden windows. Automation is detected from test/debug launches as well as the explicit headless flag; native dialogs are disabled. Startup checks the page and assets before opening a window. Startup failures exit with diagnostics in the profile's `prism.log`; the launcher also captures errors under `E:\resolume-data\logs`. Builds retain prior hashed assets to protect windows already loading them. Keep builds and desktop tests sequential for repeatable verification.
 
 ## Remaining work
+
+Still outstanding after the manual-parity pass: Advanced Output slices that use a layer or group as input show the composition (layer textures are not yet shared with output windows); screen delay is stored but not applied; multi-select scale/rotate in the output editor; SMPTE timecode, Ableton Link, NDI/Spout/Syphon, FFGL/VST plugins, and native DXV/HAP decoding.
 
 The [newer manual coverage](docs/NEW-MANUAL-COVERAGE.md), [full requirements](docs/REQUIREMENTS.md), and [acceptance plan](docs/ACCEPTANCE.md) preserve the complete manual scope. Significant remaining items include hierarchical groups, advanced output slices/warping/masks/edge blending, complete effect coverage, unresolved blend compatibility, audio effect hosting, multi-parameter dashboards and parameter animation/FFT control, camera capture, extended MIDI/OSC feedback, DMX/Art-Net and SMPTE, native GPU DXV decoding and legacy content/plugin compatibility, original project import, and sustained hardware/device testing.
 

@@ -223,7 +223,7 @@ test('real paired audio plays and copied clips have independent media and effect
   await page.locator('#use-audio').check();
   await expect.poll(async () => (await diagnostics(page)).stats.audioRms).toBeGreaterThan(0.01);
   await pickFile(page, '#choose-mask', await maskPNG(page)); await expect(page.locator('#mask-enabled')).toBeChecked();
-  await page.locator('[data-browser="effects"]').click(); await page.locator('[data-add-effect="invert"]').click();
+  await page.locator('[data-browser="effects"]').click(); await page.locator('[data-add-effect="invert-rgb"]').click();
   await page.locator('#copy-clip').click(); await slotFor(page, layerId, 6).click(); await page.locator('#paste-clip').click();
   const after = await diagnostics(page), original = clipIn(after.project, clipId);
   const duplicate = after.project.layers.find(layer => layer.id === layerId).clips[after.project.selectedDeckId][6];

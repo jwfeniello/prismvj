@@ -1,0 +1,72 @@
+/* Advanced Output editor. Every selector is prefixed with ao- to avoid collisions. */
+.ao-root{--ao-accent:#84ffd4;--ao-panel:#282828;--ao-edge:#050505;--ao-muted:#929292;position:relative;width:100%;height:100%;display:grid;grid-template-rows:34px minmax(0,1fr);grid-template-columns:250px minmax(0,1fr) 300px;background:#080808;color:#d1d1d1;font:12px 'Segoe UI',Arial,sans-serif;user-select:none;overflow:hidden}
+.ao-root *{box-sizing:border-box}
+.ao-root button,.ao-root select,.ao-root input{font:inherit}
+.ao-root button,.ao-root select{color:#d1d1d1;background:#363636;border:1px solid #101010;border-radius:2px;padding:3px 7px;min-width:0;cursor:pointer}
+.ao-root button:hover{background:#505050}
+.ao-root button.ao-active,.ao-root button.ao-primary{color:#112e24;background:var(--ao-accent);border-color:#528e7a}
+.ao-root button:disabled{opacity:.4;cursor:default}
+.ao-root button.ao-danger{color:#e5989d}
+.ao-root input[type=text],.ao-root input[type=number],.ao-root select{background:#111;color:#ddd;border:1px solid #363636;border-radius:0;padding:2px 5px;min-width:0}
+.ao-root input[type=checkbox]{accent-color:var(--ao-accent);margin:0 4px 0 0}
+.ao-root input[type=range]{appearance:none;width:100%;height:15px;margin:0;background:#282828;border:1px solid #080808;cursor:pointer}
+.ao-root input[type=range]::-webkit-slider-runnable-track{height:100%;background:linear-gradient(90deg,#303030,#141414)}
+.ao-root input[type=range]::-webkit-slider-thumb{appearance:none;width:4px;height:100%;background:#569681;border:0}
+.ao-root :focus-visible{outline:1px solid var(--ao-accent);outline-offset:-1px}
+.ao-header{grid-column:1/-1;display:flex;align-items:center;gap:4px;padding:0 8px;background:#343434;border-bottom:2px solid var(--ao-edge);min-width:0}
+.ao-header h1{font-size:12px;font-weight:600;margin:0 10px 0 0;white-space:nowrap}
+.ao-header .ao-sep{width:1px;height:18px;background:#111;margin:0 4px}
+.ao-header input[type=text]{width:120px}
+.ao-header select{max-width:150px}
+.ao-spacer{flex:1;min-width:0}
+.ao-list{display:flex;flex-direction:column;min-height:0;background:#151515;border-right:2px solid var(--ao-edge)}
+.ao-list-tools{display:flex;flex-wrap:wrap;gap:2px;padding:4px;background:#292929;border-bottom:2px solid #070707}
+.ao-list-tools button{font-size:10px;padding:2px 5px}
+.ao-tree{flex:1;min-height:0;overflow:auto;scrollbar-width:thin;scrollbar-color:#4b4b4b #151515}
+.ao-row{display:flex;align-items:center;gap:4px;min-height:24px;padding:2px 6px;border-bottom:1px solid #0b0b0b;cursor:pointer;white-space:nowrap}
+.ao-row:hover{background:#242424}
+.ao-row.ao-screen-row{background:#2b2b2b;border-top:1px solid #393939;min-height:34px}
+.ao-row.ao-screen-row.ao-current{background:#285244;border-top-color:#386655}
+.ao-row.ao-item-row{padding-left:22px}
+.ao-row.ao-mask-row{padding-left:30px;color:#c9b8e6}
+.ao-row.ao-selected{background:#3a5d51;color:#fff}
+.ao-row .ao-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.ao-row small{display:block;font-size:9px;color:var(--ao-muted)}
+.ao-row .ao-swatch{width:8px;height:8px;flex:0 0 8px}
+.ao-row .ao-mini{padding:0 4px;font-size:9px;background:transparent;border:0;color:#aaa;opacity:0}
+.ao-row:hover .ao-mini,.ao-row.ao-selected .ao-mini{opacity:1}
+.ao-row .ao-fold{width:14px;padding:0;background:transparent;border:0;color:#999}
+.ao-row input.ao-rename{flex:1;min-width:0}
+.ao-badge{font-size:9px;color:#9ab;padding:0 3px;border:1px solid #3b4b45}
+.ao-center{display:flex;flex-direction:column;min-width:0;min-height:0}
+.ao-tabs{display:flex;height:26px;background:#292929;border-bottom:2px solid #070707}
+.ao-tabs button{flex:1;border:0;border-right:1px solid #090909;border-radius:0;background:#222}
+.ao-tabs button.ao-active{background:#343434;color:#eee;box-shadow:inset 0 -2px var(--ao-accent)}
+.ao-toolbar{display:flex;align-items:center;gap:3px;padding:3px 6px;background:#1d1d1d;border-bottom:1px solid #070707;min-height:28px;flex-wrap:wrap}
+.ao-toolbar button{font-size:10px;padding:2px 7px}
+.ao-toolbar .ao-hint{font-size:10px;color:var(--ao-muted);margin-left:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ao-stage{position:relative;flex:1;min-height:0;overflow:hidden;background:#030303;background-image:linear-gradient(45deg,#0a0a0a 25%,transparent 25%,transparent 75%,#0a0a0a 75%),linear-gradient(45deg,#0a0a0a 25%,transparent 25%,transparent 75%,#0a0a0a 75%);background-size:24px 24px;background-position:0 0,12px 12px}
+.ao-stage canvas{position:absolute;left:0;top:0}
+.ao-stage .ao-overlay{width:100%;height:100%;touch-action:none;cursor:default}
+.ao-stage .ao-gl{pointer-events:none}
+.ao-props{min-height:0;overflow:auto;background:#090909;border-left:2px solid var(--ao-edge);scrollbar-width:thin;scrollbar-color:#4b4b4b #151515}
+.ao-section{border-bottom:1px solid #030303;background:#151515}
+.ao-section>h3{margin:0;min-height:23px;background:#2b2b2b;border-top:1px solid #393939;border-bottom:1px solid #090909;padding:4px 8px;font-size:11px;font-weight:400;color:#cacaca}
+.ao-section-body{padding:3px 8px 6px}
+.ao-field{display:grid;grid-template-columns:86px minmax(0,1fr);gap:6px;align-items:center;min-height:24px;border-bottom:1px solid #0b0b0b}
+.ao-field>label{font-size:11px;text-align:right;color:#c2c2c2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ao-field input[type=text],.ao-field select{width:100%;height:20px}
+.ao-field .ao-range{display:grid;grid-template-columns:minmax(0,1fr) 46px;gap:4px;align-items:center}
+.ao-field .ao-range input[type=text]{text-align:right;padding:1px 3px;font-variant-numeric:tabular-nums}
+.ao-pair{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.ao-pair input{width:100%}
+.ao-checks{display:flex;flex-wrap:wrap;gap:4px 12px;padding:4px 0}
+.ao-checks label{display:flex;align-items:center;font-size:11px}
+.ao-actions{display:flex;flex-wrap:wrap;gap:3px;padding:5px 0}
+.ao-actions button{font-size:10px;padding:2px 6px}
+.ao-empty{padding:22px 12px;color:#858585;text-align:center;line-height:1.7}
+.ao-menu{position:fixed;z-index:1000;min-width:170px;background:#242424;border:1px solid #555;box-shadow:0 8px 30px #000a;padding:3px 0}
+.ao-menu button{display:block;width:100%;text-align:left;border:0;border-radius:0;background:transparent;padding:4px 12px}
+.ao-menu button:hover{background:#3a5d51}
+.ao-menu hr{border:0;border-top:1px solid #444;margin:3px 0}
+.ao-error{color:#e5989d}
