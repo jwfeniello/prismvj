@@ -130,3 +130,24 @@ test('invalid animation data is rejected or clamped', () => {
   assert.deepEqual(Object.keys(project.animations), ['bpm']);
   assert.equal(project.animations.bpm.min, 20); assert.equal(project.animations.bpm.max, 300);
 });
+
+test('BPM Sync speed steps and Timeline Duration change clip rate independently', () => {
+  const project = createProject();
+  const deck = project.selectedDeckId, [a, b] = project.layers;
+  const synced = a.clips[deck][0], timed = b.clips[deck][0];
+  Object.assign(synced, { beatSync: true, beats: 4, bpmSpeed: 2, speed: 3 });
+  project.bpm = 120;
+  Object.assign(timed, { duration: 8, stretch: 2, speed: 1 });
+  const transport = new Transport(project);
+  transport.trigger(a.id, synced.id, 0); transport.trigger(b.id, timed.id, 0);
+  transport.tick(0); transport.tick(0.5);
+  // 4 beats at 120 BPM take 2 s; double speed covers half the clip in 0.5 s.
+  close(transport.getState(a.id).position, 0.5);
+  // Duration stretch 2 plays the 8 s clip in 4 s.
+  close(transport.getState(b.id).position, 0.125);
+  const saved = validateProject(JSON.parse(JSON.stringify(project)));
+  assert.equal(saved.layers[0].clips[deck][0].bpmSpeed, 2);
+  assert.equal(saved.layers[1].clips[deck][0].stretch, 2);
+  synced.bpmSpeed = 3;
+  assert.equal(validateProject(JSON.parse(JSON.stringify(project))).layers[0].clips[deck][0].bpmSpeed, 1, 'off-grid BPM speeds fall back to 1');
+});

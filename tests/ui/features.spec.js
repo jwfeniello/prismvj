@@ -31,25 +31,68 @@ test('effects browser search, parameter cards, presets and bypass', async ({ pag
   expect(errors).toEqual([]);
 });
 
-test('parameter cog animates a playing clip in BPM sync', async ({ page }) => {
+test('cog menu animates a parameter inline in BPM sync with a live playhead and range bracket', async ({ page }) => {
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
   const panel = page.locator('[data-inspector-panel="clip"]');
   await panel.locator('.field [data-animate-path$="/rotation"]').click();
-  await page.locator('.animation-editor [data-anim-mode]').selectOption('bpm');
-  await page.locator('.animation-editor [data-anim="beats"]').fill('1');
-  await page.locator('.animation-editor [data-anim="beats"]').dispatchEvent('change');
-  await page.locator('.animation-editor [data-anim-close]').click();
+  await page.locator('.context-menu button', { hasText: 'BPM Sync' }).click();
+  const strip = panel.locator('.anim-strip').first();
+  await expect(strip).toContainText('BPM Sync');
+  await expect(strip.locator('[data-anim-field="beats"]')).toHaveValue('4');
+  await strip.locator('[data-anim-beats="half"]').click();
+  await expect(panel.locator('.anim-strip [data-anim-field="beats"]')).toHaveValue('2');
+  await panel.locator('.anim-strip [data-anim-loop="loop"]').click();
+  await expect(panel.locator('.anim-strip [data-anim-loop="loop"]')).toHaveClass(/active/);
   const first = await diagnostics(page), id = first.project.layers.at(-1).activeClipId;
   await page.waitForTimeout(250);
   const second = await diagnostics(page);
   const a = clipById(first.project, id), b = clipById(second.project, id);
-  expect(b.animations.rotation.mode).toBe('bpm');
+  expect(b.animations.rotation).toMatchObject({ mode: 'bpm', beats: 2, loop: 'loop' });
   expect(b.rotation).not.toBe(a.rotation);
-  await expect(panel.locator('.field [data-animate-path$="/rotation"]')).toHaveClass(/animated/);
+  const left = await panel.locator('.anim-strip .anim-playhead').evaluate(element => element.style.left);
+  await page.waitForTimeout(150);
+  expect(await panel.locator('.anim-strip .anim-playhead').evaluate(element => element.style.left)).not.toBe(left);
+  // Drag the bracket's max end to the middle of the slider: the range now tops out near 0°.
+  const handle = panel.locator('.anim-bracket [data-end="max"]');
+  const slider = panel.locator('.field.is-animated input[type="range"][data-prop="rotation"]');
+  const box = await slider.boundingBox(), from = await handle.boundingBox();
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+  await page.mouse.down(); await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 4 }); await page.mouse.up();
+  const ranged = clipById((await diagnostics(page)).project, id).animations.rotation;
+  expect(Math.abs(ranged.max)).toBeLessThan(10);
+  await panel.locator('.field [data-animate-path$="/rotation"]').click();
+  await page.locator('.context-menu button', { hasText: 'Reset animation' }).click();
+  await expect(panel.locator('.anim-strip')).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 
+test('clip transport switches to BPM Sync with beats, speed steps, play modes and in/out bar', async ({ page }) => {
+  const errors = []; page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  const panel = page.locator('[data-inspector-panel="clip"]');
+  await panel.locator('#transport-mode').selectOption('bpm');
+  await expect(panel.locator('#clip-beats')).toBeVisible();
+  const id = (await diagnostics(page)).project.layers.at(-1).activeClipId;
+  const beats = clipById((await diagnostics(page)).project, id).beats;
+  await panel.locator('[data-clip-beats="double"]').click();
+  await panel.locator('[data-bpm-speed="2"]').click();
+  await panel.locator('[data-playmode="pingpong"]').click();
+  await panel.locator('[data-away="continue"]').click();
+  let clip = clipById((await diagnostics(page)).project, id);
+  expect(clip).toMatchObject({ beatSync: true, beats: beats * 2, bpmSpeed: 2, speed: 1, loop: 'pingpong', trigger: 'continue' });
+  const bar = panel.locator('#clip-inout'), box = await bar.boundingBox();
+  await page.mouse.move(box.x + 1, box.y + box.height / 2); await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.25, box.y + box.height / 2, { steps: 4 }); await page.mouse.up();
+  clip = clipById((await diagnostics(page)).project, id);
+  expect(clip.inPoint).toBeGreaterThan(0.2); expect(clip.inPoint).toBeLessThan(0.3);
+  await panel.locator('#transport-mode').selectOption('timeline');
+  await panel.locator('#clip-duration').fill('2'); await panel.locator('#clip-duration').press('Enter');
+  await expect(panel.locator('#clip-duration')).toHaveValue('2.00');
+  await panel.locator('[data-direction="0"]').click();
+  expect(clipById((await diagnostics(page)).project, id).paused).toBe(true);
+  expect(errors).toEqual([]);
+});
 test('layer menu creates a group with its own row, inspector and column triggers', async ({ page }) => {
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');

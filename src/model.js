@@ -1,7 +1,7 @@
 // Composition data and a clock-driven transport. No DOM or media decoders live here.
 import { BLEND_IDS, TRANSITION_IDS, normalizeBlend } from './blends.js';
 import { normalizeDashboard } from './dashboard.js';
-import { normalizeAnimations } from './animation.js';
+import { normalizeAnimations, BPM_SPEEDS } from './animation.js';
 import './fx/builtins.js';
 import { effectDefinition, audioEffectDefinition, sourceDefinition, normalizeDefinitionParams, isDefinitionId, EFFECT_MIX_PARAMS } from './fx/registry.js';
 import { ownerParam } from './params.js';
@@ -117,7 +117,7 @@ export function createClip(kind = 'source', options = {}) {
     fit: choice(input.fit, ['contain', 'cover', 'width', 'height', 'stretch', 'original'], 'contain'), mask: mask(input.mask), renderOrder: renderOrder(input.renderOrder),
     width: dimension(input.width), height: dimension(input.height), nativeWidth: number(input.nativeWidth, 0, 0, 65536), nativeHeight: number(input.nativeHeight, 0, 0, 65536),
     red: bool(input.red, true), green: bool(input.green, true), blue: bool(input.blue, true), alpha: bool(input.alpha, true), hasAlpha: bool(input.hasAlpha),
-    speed: number(input.speed, 1, 0, 16), direction: choice(input.direction, [-1, 0, 1], 1),
+    speed: number(input.speed, 1, 0, 16), bpmSpeed: choice(input.bpmSpeed, BPM_SPEEDS, 1), stretch: number(input.stretch, 1, 0.0001, 10000), direction: choice(input.direction, [-1, 0, 1], 1),
     loop: choice(input.loop, ['loop', 'once', 'once-clear', 'pingpong', 'random'], 'loop'), random: bool(input.random),
     beatSync: bool(input.beatSync), beats: number(input.beats, 16, 0.03125, 4096), beatLoop: choice(input.beatLoop, BEAT_LOOPS, 0), paused: bool(input.paused),
     inPoint, outPoint, opacity: number(input.opacity, 1, 0, 1), volume: number(input.volume, 1, 0, 4), pan: number(input.pan, 0, -1, 1),
@@ -566,8 +566,10 @@ export class Transport {
   _rate(state) {
     const clip = state.clip;
     if (clip.paused || clip.direction === 0) return 0;
-    return clip.beatSync ? number(this.project.bpm, 120, 20, 999) / 60 / number(clip.beats, 16, 0.03125, 4096)
-      : number(clip.speed, 1, 0, 16) * number(this.project.speed, 1, 0, 16) * (this._speeds?.get(state.layerId) ?? 1) / number(clip.duration, 8, 0.01, 86400);
+    // BPM Sync has its own power-of-two speed (manual p. 60), separate from
+    // the Timeline speed; Timeline playback also applies the Duration stretch.
+    return clip.beatSync ? number(this.project.bpm, 120, 20, 999) / 60 / number(clip.beats, 16, 0.03125, 4096) * (BPM_SPEEDS.includes(clip.bpmSpeed) ? clip.bpmSpeed : 1)
+      : number(clip.speed, 1, 0, 16) * number(clip.stretch, 1, 0.0001, 10000) * number(this.project.speed, 1, 0, 16) * (this._speeds?.get(state.layerId) ?? 1) / number(clip.duration, 8, 0.01, 86400);
   }
 
   _direction(state) {

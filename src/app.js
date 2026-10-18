@@ -5,11 +5,11 @@ import { createProject, createLayer, createClip, validateProject, serializeProje
 import { listEffects, listAudioEffects, listSources, effectDefinition, audioEffectDefinition, sourceDefinition, registerEffect, registerSource } from './fx/registry.js';
 import { defaultParams } from './fx/shader-template.js';
 import { parseISF } from './fx/isf.js';
-import { Animator } from './animation.js';
+import { Animator, BPM_SPEEDS } from './animation.js';
 import { applyAnimations } from './automation.js';
 import { PROPERTY_PARAMS, resolvePath, readOwner } from './params.js';
 import { effectStackHTML, bindEffectStacks, sourceParamsHTML, cogButton, refreshAnimatedControls, readPresets, applyPreset } from './ui/param-controls.js';
-import { openAnimationEditor, closeAnimationEditor } from './ui/animation-editor.js';
+import { animationMenuItems, decorateAnimations, updateAnimationStrips, inOutBarHTML, bindInOutBar } from './ui/animation-strip.js';
 import { ShortcutManager } from './ui/shortcuts.js';
 import { registerProjectExtension } from './model.js';
 import { normalizeOutputConfig, screenFromComposition } from './output/output-model.js';
@@ -67,6 +67,13 @@ const heldPointers = new Map();
 const oscHolds = new Map();
 let pendingDashboardDrag=null;
 const animator=new Animator();
+let showRemaining=false,historyTimer=null;
+const PLAYMODES=[['loop','⟳','Loop'],['pingpong','⇄','Ping pong'],['random','⚄','Random'],['once-clear','⏏','Play once and eject'],['once','⇥','Play once and hold']];
+// Inline animation strips (see ui/animation-strip.js).
+const inspectorHosts=[];
+const animationContext={getProject:()=>project,animator,spectrum:source=>spectrumFor(source),
+  pixelScale:key=>key==='x'?project.width:project.height,
+  changed:(structural,{keepPanels=false}={})=>{changed(structural?true:'coalesce');if(structural&&!keepPanels)renderInspector();}};
 let animatedCount=0,lastAnimationRefresh=0,lastFeedback=0,lastFrameTime=0,effectSearch='',sourceSearch='',selectedGroupId=null,refreshQueued=false;
 const shortcutHolds=new Map();
 let shortcuts,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
@@ -107,6 +114,7 @@ function initialize() {
     <footer class="statusbar"><span class="status-dot"></span><span id="status-text">Ready</span><span class="spacer"></span><span id="memory-status"></span><span id="beat-status">BEAT 1.1</span><span>PRISM LIVE 0.1</span></footer>`;
   $('.deckbar').after($('[data-layout-splitter="workspace"]'),$('.toolbar'));
   installResizableLayout($('#app'));
+  inspectorHosts.push(...$$('[data-inspector-panel]'));
   const snapshotButton=document.createElement('button');snapshotButton.id='snapshot-output';snapshotButton.textContent='Snapshot';snapshotButton.title='Save the current output as PNG';$('#record').before(snapshotButton);
   engine = new LiveEngine($('#output-canvas'), {onError: message => toast(message, true)});
   outputs=new OutputWindows({source:$('#output-canvas'),desktop,onError:message=>toast(message,true),onClosed:()=>{outputOpen=outputs.active;$('#output').classList.toggle('active',outputOpen);}});
@@ -180,7 +188,7 @@ function showMediaPreparation(item){
 // Undo snapshots serialize the whole composition. Continuous edits (slider
 // drags, history='coalesce') become one step after a short pause; any other
 // edit commits immediately so it stays its own undo step.
-let historyTimer=null;
+
 function changed(history=true){dirty=true;$('#save-state').textContent='UNSAVED';clearTimeout(saveTimer);saveTimer=setTimeout(autosave,800);if(history==='coalesce'){clearTimeout(historyTimer);historyTimer=setTimeout(commitHistory,250);}else if(history)commitHistory();}
 function commitHistory(){clearTimeout(historyTimer);historyTimer=null;const value=snapshot();if(value!==lastHistory){undoStack.push(lastHistory);if(undoStack.length>60)undoStack.shift();redoStack=[];lastHistory=value;}}
 async function autosave(){try{const data=serializeProject(project);if(desktop)await desktop.autosave(data);else localStorage.setItem('prism-recovery',JSON.stringify(data));$('#save-state').textContent=dirty?'RECOVERY SAVED':'SAVED';}catch(e){toast(`Recovery could not be saved: ${e.message}`,true);}}
@@ -257,6 +265,41 @@ function refreshControls(animatedOnly=false){
   for(const row of $$('[data-group-row]')){const group=(project.groups||[]).find(item=>item.id===row.dataset.groupRow);if(!group)continue;for(const input of $$('[data-group-prop]',row))if(input!==focused&&input.type==='range')input.value=group[input.dataset.groupProp];}
   for(const [selector,key] of [['#bpm','bpm'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])if($(selector)!==focused)$(selector).value=project[key];
   $('#pause').classList.toggle('active',project.paused);$('#blackout').classList.toggle('active',project.blackout);$('#bypass-all').classList.toggle('active',project.bypass);
+}
+// Clip transport (manual pp. 58–63): Timeline or BPM Sync, in/out bar,
+// direction and play mode buttons, Duration or Beats, and Playmode Away.
+function speedLabel(value){return value===0?'0':value<1?`1/${Math.round(1/value)}`:`${value}×`;}
+function generated(clip){return clip.kind==='source'||clip.kind==='effect';}
+function playDuration(clip){return generated(clip)?clip.duration:(clip.outPoint-clip.inPoint)*clip.duration/(clip.stretch||1);}
+function clipTransportHTML(clip){
+  const bpm=clip.beatSync,mode=clip.random?'random':clip.loop;
+  const radios=(attribute,items,active)=>`<div class="radio-group" role="radiogroup">${items.map(([value,icon,label])=>`<button ${attribute}="${value}" class="${active(value)?'active':''}" title="${label}" aria-label="${label}" aria-pressed="${active(value)}">${icon}</button>`).join('')}</div>`;
+  return `<div class="section transport-section"><div class="row transport-head"><h3 class="grow">Transport <span class="muted">· ${esc(clip.kind)}</span></h3><select id="transport-mode" aria-label="Transport mode"><option value="timeline" ${bpm?'':'selected'}>Timeline</option><option value="bpm" ${bpm?'selected':''}>BPM Sync</option></select></div>
+    <input id="timeline" class="timeline" type="range" min="0" max="1" step=".001" value="0" aria-label="Clip playhead">${inOutBarHTML('id="clip-inout"',clip.inPoint,clip.outPoint)}
+    <div class="time-labels"><span id="clip-time" title="Click to switch between time and time remaining" role="button" tabindex="0">00:00.00</span><span>${bpm?`${clip.beats} beats`:`${playDuration(clip).toFixed(2)} s`}</span></div>
+    <div class="transport-row">${radios('data-direction',[[-1,'◀','Play backward'],[0,'Ⅱ','Pause'],[1,'▶','Play forward']],value=>value===0?clip.paused:clip.direction===value&&!clip.paused)}${radios('data-playmode',PLAYMODES,value=>value===mode)}<span class="grow"></span><button id="retrigger" title="Restart clip (piano clips play while held)" aria-label="Restart clip">↻</button></div>
+    ${bpm?`<div class="transport-row"><label class="anim-label">Speed</label><div class="radio-group speed-steps">${BPM_SPEEDS.map(value=>`<button data-bpm-speed="${value}" class="${(clip.bpmSpeed??1)===value?'active':''}">${speedLabel(value)}</button>`).join('')}</div></div><div class="transport-row"><label class="anim-label">Beats</label><div class="beat-field"><button data-clip-beats="half" title="Divide by 2">÷2</button><button data-clip-beats="minus" title="One beat less">−</button><input id="clip-beats" type="number" min=".03125" max="4096" step="any" value="${clip.beats}" aria-label="Clip beats"><button data-clip-beats="plus" title="One beat more">+</button><button data-clip-beats="double" title="Multiply by 2">×2</button></div></div>`
+      :`${range('Speed','speed',clip.speed,0,4)}<div class="transport-row"><label class="anim-label">Duration</label><div class="beat-field"><input id="clip-duration" type="number" min=".01" max="86400" step="any" value="${playDuration(clip).toFixed(2)}" aria-label="Duration in seconds"><span class="unit">s</span></div></div>`}
+    <div class="transport-row"><label class="anim-label" title="What happens when you trigger this clip again after playing something else">Away</label>${radios('data-away',[['restart','Restart','Play from the start'],['continue','Pick-up','Continue where it was']],value=>clip.trigger===value)}</div>`;
+}
+function bindClipTransport(clip,$){
+  const bpmBeats=()=>2**Math.max(-2,Math.min(10,Math.round(Math.log2(Math.max(0.01,playDuration(clip))*project.bpm/60))));
+  $('#transport-mode').onchange=event=>{
+    clip.beatSync=event.target.value==='bpm';
+    // Resolume guesses beats to the nearest power of two and keeps speed on the grid.
+    if(clip.beatSync)clip.beats=bpmBeats();
+    changed();renderInspector();
+  };
+  for(const button of $$('[data-direction="0"]'))button.onclick=()=>{clip.paused=!clip.paused;changed();renderInspector();};
+  for(const button of $$('[data-playmode]'))button.onclick=()=>{clip.loop=button.dataset.playmode;clip.random=false;changed();renderInspector();};
+  for(const button of $$('[data-bpm-speed]'))button.onclick=()=>{clip.bpmSpeed=Number(button.dataset.bpmSpeed);changed();renderInspector();};
+  for(const button of $$('[data-clip-beats]'))button.onclick=()=>{const op=button.dataset.clipBeats;clip.beats=Math.max(.03125,Math.min(4096,op==='half'?clip.beats/2:op==='double'?clip.beats*2:op==='plus'?Math.floor(clip.beats)+1:Math.max(1,Math.ceil(clip.beats)-1)));changed();renderInspector();};
+  $('#clip-beats')?.addEventListener('change',event=>{clip.beats=Math.max(.03125,Math.min(4096,Number(event.target.value)||16));changed();renderInspector();});
+  // Duration sets how long in→out lasts at speed 1, independent of the Speed slider.
+  $('#clip-duration')?.addEventListener('change',event=>{const seconds=Math.max(.01,Math.min(86400,Number(event.target.value)||1));if(generated(clip))clip.duration=seconds;else clip.stretch=(clip.outPoint-clip.inPoint)*clip.duration/seconds;changed();renderInspector();});
+  for(const button of $$('[data-away]'))button.onclick=()=>{clip.trigger=button.dataset.away;changed();renderInspector();};
+  const time=$('#clip-time');if(time){time.onclick=()=>{showRemaining=!showRemaining;};time.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();showRemaining=!showRemaining;}};}
+  bindInOutBar($('#clip-inout'),()=>[clip.inPoint,clip.outPoint],(lo,hi,done)=>{clip.inPoint=lo;clip.outPoint=hi;changed(done?true:'coalesce');if(done)renderInspector();});
 }
 function promptText(title,value=''){return new Promise(resolve=>{const dialog=showDialog(title,`<input id="prompt-text" type="text" value="${esc(value)}" maxlength="120" style="width:100%">`,[['Cancel','cancel'],['OK','ok']]);const input=$('#prompt-text',dialog);input.select();input.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();dialog.close('ok');}};dialog.addEventListener('close',()=>resolve(dialog.returnValue==='ok'?input.value.trim()||null:null));});}
 function addEffect(target,data,alt=false){
@@ -394,16 +437,28 @@ function bindGroupRows(){
     for(const button of $$('[data-group-column]',row))button.onclick=()=>triggerColumn(Number(button.dataset.groupColumn),{groupId:group.id});
   }
 }
+// Context menu. Items are [label, action, disabled] or [label, [subitems]].
 function showMenu(event,items){
-  $('.context-menu')?.remove();
-  const menu=document.createElement('div');menu.className='context-menu';menu.setAttribute('role','menu');
-  menu.innerHTML=items.map(([label,,disabled],index)=>label==='-'?'<hr>':`<button role="menuitem" data-menu="${index}" ${disabled?'disabled':''}>${esc(label)}</button>`).join('');
-  document.body.append(menu);
-  menu.style.left=`${Math.min(event.clientX,innerWidth-menu.offsetWidth-8)}px`;menu.style.top=`${Math.min(event.clientY,innerHeight-menu.offsetHeight-8)}px`;
-  for(const button of $$('[data-menu]',menu))button.onclick=()=>{menu.remove();items[Number(button.dataset.menu)][1]();};
-  const close=e=>{if(!menu.contains(e.target)){menu.remove();document.removeEventListener('pointerdown',close,true);}};
-  setTimeout(()=>document.addEventListener('pointerdown',close,true),0);
-  menu.querySelector('button')?.focus();
+  for(const old of $$('.context-menu'))old.remove();
+  const close=()=>{for(const menu of $$('.context-menu'))menu.remove();document.removeEventListener('pointerdown',outside,true);};
+  const outside=e=>{if(!e.target.closest('.context-menu'))close();};
+  const open=(entries,x,y,level)=>{
+    for(const menu of $$('.context-menu'))if(Number(menu.dataset.level)>=level)menu.remove();
+    const menu=document.createElement('div');menu.className='context-menu';menu.dataset.level=level;menu.setAttribute('role','menu');
+    menu.innerHTML=entries.map(([label,action,disabled],index)=>label==='-'?'<hr>':`<button role="menuitem" data-menu="${index}" ${disabled?'disabled':''} ${Array.isArray(action)?'aria-haspopup="menu"':''}>${esc(label)}${Array.isArray(action)?'<span class="submenu-arrow">›</span>':''}</button>`).join('');
+    document.body.append(menu);
+    menu.style.left=`${Math.max(4,Math.min(x,innerWidth-menu.offsetWidth-8))}px`;menu.style.top=`${Math.max(4,Math.min(y,innerHeight-menu.offsetHeight-8))}px`;
+    for(const button of $$('[data-menu]',menu)){
+      const action=entries[Number(button.dataset.menu)][1];
+      const openChild=()=>{const rect=button.getBoundingClientRect();open(action,rect.right-2,rect.top-3,level+1);};
+      if(Array.isArray(action)){button.onclick=openChild;button.onpointerenter=openChild;button.onkeydown=e=>{if(e.key==='ArrowRight'){e.preventDefault();openChild();$('.context-menu[data-level="'+(level+1)+'"] button')?.focus();}};}
+      else{button.onclick=()=>{close();action();};button.onpointerenter=()=>{for(const menu of $$('.context-menu'))if(Number(menu.dataset.level)>level)menu.remove();};}
+    }
+    menu.onkeydown=e=>{if(e.key==='Escape'){e.stopPropagation();close();}else if(e.key==='ArrowLeft'&&level>0){menu.remove();}};
+    menu.querySelector('button:not([disabled])')?.focus();
+  };
+  open(items,event.clientX,event.clientY,0);
+  setTimeout(()=>document.addEventListener('pointerdown',outside,true),0);
 }
 // Layer menu (manual pp. 40–42): groups, duplicate, rename, clear and remove.
 function layerMenu(layer,event){
@@ -608,7 +663,7 @@ function decorateInspector(host,scope){
       const advanced=makeSection('Trigger & playback',null);
       for(const field of [...transportSection.querySelectorAll(':scope > .select-field')])advanced.append(field);
       for(const key of ['inPoint','outPoint'])moveField(key,advanced);
-      for(const heading of [...transportSection.querySelectorAll(':scope > h3')].slice(1)){
+      for(const heading of [...transportSection.querySelectorAll(':scope > h3')].filter(item=>!item.textContent.startsWith('Transport'))){
         const buttons=heading.nextElementSibling,section=makeSection(heading.textContent.startsWith('BeatLoopr')?'BeatLoopr':'Cue points',null);
         heading.remove();if(buttons?.classList.contains('cue-buttons'))section.append(buttons);
       }
@@ -643,7 +698,7 @@ function renderInspectorPanel(inspectorTab,host,prefix){
   if(inspectorTab==='clip')html+=`<div class="section clip-persistence"><h3>Deck behavior</h3><label><input id="clip-persistent" type="checkbox" ${clip.persistent?'checked':''}> Persistent across decks</label><small>Shows this clip in the same layer and column on every deck. Covered clips stay in their original deck.</small></div>`;
   if(inspectorTab==='clip')html+=`<div class="section clip-label-color"><h3>Clip label</h3><div class="row"><label>Highlight <input id="clip-label-color" type="color" value="${esc(clip.labelColor||'#8affd7')}"></label><button id="clear-clip-label" class="icon-btn">Clear color</button></div></div>`;
   if(inspectorTab==='clip')html+=`<div class="section"><h3>Snapshot</h3><button id="snapshot-clip" class="icon-btn">Save clip frame as PNG</button></div>`;
-  if(inspectorTab==='clip')html+=`<div class="section"><h3>Transport <span class="muted">· ${esc(clip.kind)}</span></h3><div class="transport-buttons"><button data-direction="-1" class="${clip.direction===-1&&!clip.paused?'active':''}">◀ Reverse</button><button id="clip-pause" class="${clip.paused?'active':''}">Ⅱ Pause</button><button data-direction="1" class="${clip.direction===1&&!clip.paused?'active':''}">▶ Forward</button><button id="retrigger">↻</button></div><input id="timeline" class="timeline" type="range" min="0" max="1" step=".001" value="0" aria-label="Clip playhead"><div class="time-labels"><span id="clip-time">00:00.00</span><span>${clip.duration.toFixed(2)} s</span></div>${select('Playback','loop',clip.loop,['loop','once','once-clear','pingpong','random'])}${select('Restart behavior','trigger',clip.trigger,['restart','continue','piano'])}${select('Trigger style','triggerStyle',clip.triggerStyle,['inherit','normal','piano'])}${select('Clip target','clipTarget',clip.clipTarget,['inherit','own','selected','free'])}<div class="select-field"><label>Beat snap</label><select id="clip-quantize">${[[null,'Composition'],[0,'Immediate'],[.25,'1/4 beat'],[1,'1 beat'],[4,'1 bar'],[8,'2 bars']].map(([v,label])=>`<option value="${v===null?'inherit':v}" ${clip.quantize===v?'selected':''}>${label}</option>`).join('')}</select></div>${select('Autopilot','autoPilot',clip.autoPilot,['inherit','off','next','previous','random'])}<div class="select-field"><label for="beat-sync">BPM sync</label><input id="beat-sync" type="checkbox" ${clip.beatSync?'checked':''}><label>Beats</label><input id="clip-beats" aria-label="Clip beats" type="number" min=".25" max="1024" step=".25" value="${clip.beats}" style="width:65px"></div>${range('Speed','speed',clip.speed,.1,4)}${range('In point','inPoint',clip.inPoint,0,.99)}${range('Out point','outPoint',clip.outPoint,.01,1)}<h3 style="margin-top:14px">BeatLoopr</h3><div class="cue-buttons">${[0,4,2,1,.5,.25].map(v=>`<button data-beat-loop="${v}" class="${clip.beatLoop===v?'active':''}">${v||'Off'}</button>`).join('')}</div><h3 style="margin-top:14px">Cue points <small>Shift-click to set</small></h3><div class="cue-buttons">${clip.cues.map((c,i)=>`<button data-cue="${i}" title="${(c*100).toFixed(1)}%">${i+1} · ${(c*100).toFixed(0)}%</button>`).join('')}</div></div><div class="section"><h3>Video & audio</h3>${range('Opacity','opacity',clip.opacity,0,1)}${range('Volume','volume',clip.volume,0,4)}${range('Pan','pan',clip.pan,-1,1)}${clip.kind==='source'?`<div class="select-field"><label>Duration (s)</label><input id="source-duration" type="number" value="${clip.duration}" min=".1" max="3600" step=".1" style="width:90px"></div><div class="select-field"><label>Color</label><input type="color" id="source-color" value="${esc(clip.color)}"></div>`:''}${clip.kind!=='source'?'<div class="row"><button id="relink-clip">Reconnect media</button></div>':''}${clip.path?`<small title="${esc(clip.path)}">${esc(clip.path.split(/[\\/]/).pop())}</small>`:''}</div>`;
+  if(inspectorTab==='clip')html+=`${clipTransportHTML(clip)}${select('Restart behavior','trigger',clip.trigger,['restart','continue','piano'])}${select('Trigger style','triggerStyle',clip.triggerStyle,['inherit','normal','piano'])}${select('Clip target','clipTarget',clip.clipTarget,['inherit','own','selected','free'])}<div class="select-field"><label>Beat snap</label><select id="clip-quantize">${[[null,'Composition'],[0,'Immediate'],[.25,'1/4 beat'],[1,'1 beat'],[4,'1 bar'],[8,'2 bars']].map(([v,label])=>`<option value="${v===null?'inherit':v}" ${clip.quantize===v?'selected':''}>${label}</option>`).join('')}</select></div>${select('Autopilot','autoPilot',clip.autoPilot,['inherit','off','next','previous','random'])}${range('In point','inPoint',clip.inPoint,0,.99)}${range('Out point','outPoint',clip.outPoint,.01,1)}<h3 style="margin-top:14px">BeatLoopr</h3><div class="cue-buttons">${[0,4,2,1,.5,.25].map(v=>`<button data-beat-loop="${v}" class="${clip.beatLoop===v?'active':''}">${v||'Off'}</button>`).join('')}</div><h3 style="margin-top:14px">Cue points <small>Shift-click to set</small></h3><div class="cue-buttons">${clip.cues.map((c,i)=>`<button data-cue="${i}" title="${(c*100).toFixed(1)}%">${i+1} · ${(c*100).toFixed(0)}%</button>`).join('')}</div></div><div class="section"><h3>Video & audio</h3>${range('Opacity','opacity',clip.opacity,0,1)}${range('Volume','volume',clip.volume,0,4)}${range('Pan','pan',clip.pan,-1,1)}${clip.kind==='source'&&!sourceDefinition(clip.source)?.params?.some(param=>param.key==='color')?`<div class="select-field"><label>Color</label><input type="color" id="source-color" value="${esc(clip.color)}"></div>`:''}${clip.kind!=='source'?'<div class="row"><button id="relink-clip">Reconnect media</button></div>':''}${clip.path?`<small title="${esc(clip.path)}">${esc(clip.path.split(/[\\/]/).pop())}</small>`:''}</div>`;
   if(inspectorTab==='clip'&&clip.kind==='source')html+=sourceParamsHTML(clip);
   if(inspectorTab==='clip'&&clip.kind==='effect')html+='<div class="section"><h3>Effect clip</h3><small>Effects on this clip process every layer beneath it while it plays, like an adjustment layer. Use the layer opacity or a transition to fade it in.</small></div>';
   if(inspectorTab==='group')html+=`<div class="section"><h3>Group mixing</h3>${range('Video','opacity',group.opacity,0,1)}${range('Audio','volume',group.volume,0,1)}${range('Pan','pan',group.pan,-1,1)}${range('Speed','speed',group.speed,0,4)}<div class="select-field"><label for="prop-blend">Blend mode</label><select id="prop-blend" data-prop="blend">${blendOptions(group.blend)}</select></div>${select('Crossfader','crossfader',group.crossfader,['none','A','B'])}<div class="row"><label><input id="group-bypass" type="checkbox" ${group.bypass?'checked':''}> Bypass</label><label><input id="group-solo" type="checkbox" ${group.solo?'checked':''}> Solo</label><button id="group-clear" class="icon-btn">Eject all</button></div><small>${project.layers.filter(item=>item.groupId===group.id).length} layers. What happens in the group stays in the group.</small></div>`;
@@ -687,15 +742,14 @@ function renderInspectorPanel(inspectorTab,host,prefix){
   }
   if(clip&&inspectorTab==='clip'){
     for(const b of $$('[data-direction]'))b.onclick=()=>{clip.direction=+b.dataset.direction;clip.paused=false;changed();renderInspector();};
-    $('#clip-pause').onclick=()=>{clip.paused=!clip.paused;changed();renderInspector();};
+
     $('#retrigger').onpointerdown=event=>{if(event.button!==0||!transport.isPiano(clip))return;const inputId=id(),owner=findClip(clip.id).layer,held={layerId:owner.id,clipId:clip.id,inputId};heldPointers.set(event.pointerId,held);trigger(owner,clip,()=>heldPointers.get(event.pointerId)===held,{inputId,selectedLayerId});};
     $('#retrigger').onclick=()=>{if(!transport.isPiano(clip))trigger(findClip(clip.id).layer,clip);};
     $('#timeline').oninput=e=>{const layer=playingLayerFor(clip.id)||findClip(clip.id).layer;if(layer.activeClipId===clip.id)transport.seek(layer.id,+e.target.value);else toast('Trigger this clip before moving its live playhead.');};
-    $('#beat-sync').onchange=e=>{clip.beatSync=e.target.checked;changed();};
+    bindClipTransport(clip,$);
     $('#clip-quantize').onchange=e=>{clip.quantize=e.target.value==='inherit'?null:+e.target.value;changed();};
     for(const b of $$('[data-beat-loop]'))b.onclick=()=>{clip.beatLoop=+b.dataset.beatLoop;changed();renderInspector();};
-    $('#source-duration')?.addEventListener('change',e=>{clip.duration=Math.max(.1,Math.min(3600,+e.target.value||5));changed();renderInspector();});
-    $('#clip-beats').onchange=e=>{clip.beats=Math.max(.25,Math.min(1024,+e.target.value||16));changed();};
+
     for(const b of $$('[data-cue]'))b.onclick=e=>{const l=playingLayerFor(clip.id)||findClip(clip.id).layer;if(l.activeClipId!==clip.id)return toast('Trigger this clip before using its cue points.');if(e.shiftKey){transport.setCue?.(l.id,+b.dataset.cue);changed();renderInspector();}else {transport.cue?.(l.id,+b.dataset.cue);changed();renderInspector();}};
     $('#relink-clip')?.addEventListener('click',()=>reconnectComponent(clip,'video'));
     $('#source-color')?.addEventListener('input',e=>{clip.color=e.target.value;changed();});
@@ -711,6 +765,7 @@ function renderInspectorPanel(inspectorTab,host,prefix){
   }
   decorateInspector(host,inspectorTab);
   addPropertyCogs(host,inspectorTab,target);
+  decorateAnimations(host,animationContext);
   bindDashboard(host,target,inspectorTab);
   if(inspectorTab==='composition'){
     $('#composition-description').onchange=event=>{project.description=event.target.value;changed();};
@@ -836,12 +891,15 @@ function bindStatic(){
   window.addEventListener('blur',()=>{pendingDashboardDrag=null;for(const [key,value] of heldKeys){releaseHeld(value);heldKeys.delete(key);}for(const value of heldPointers.values())releaseHeld(value);heldPointers.clear();});
   window.addEventListener('dragover',e=>e.preventDefault());window.addEventListener('drop',e=>e.preventDefault());
   document.addEventListener('pointerdown',()=>engine.audioContext?.resume().catch(()=>{}));
-  // Parameter cogwheels open the animation editor (manual p. 141).
+  // Parameter cogwheels open the animation menu (manual p. 141).
   document.addEventListener('click',event=>{
     const cog=event.target.closest('[data-animate-path]');
     if(!cog||document.documentElement.dataset.shortcutEdit)return;
     event.preventDefault();event.stopPropagation();
-    openAnimationEditor(cog,cog.dataset.animatePath,{getProject:()=>project,changed:()=>changed(),spectrum:source=>spectrumFor(source),onClose:()=>renderInspector()});
+    const rect=cog.getBoundingClientRect(),path=cog.dataset.animatePath,panel=cog.closest('[data-inspector-panel]');
+    const owner=panel?inspectorTarget(panel.dataset.scope):null;
+    const dashboardNames=(owner?.dashboard||[]).map((dial,index)=>dial.key?`Dial ${index+1} (${dial.key})`:`Dial ${index+1}`);
+    showMenu({clientX:rect.left,clientY:rect.bottom+2},animationMenuItems(project,path,{dashboardNames,changed:()=>{changed();renderInspector();}}));
   });
   window.addEventListener('beforeunload',()=>{if(dirty)autosave();for(const url of objectURLs)URL.revokeObjectURL(url);});
 }
@@ -1249,6 +1307,7 @@ function frame(timestamp){
     animatedCount=applyAnimations(project,frames,animator,{dt:project.paused?0:dt,beat:transport.beat,spectrum:(source,owner)=>engine.spectrum(source,owner)});
     engine.render(project,frames,t,{beat:transport.beat});
     if(animatedCount&&t-lastAnimationRefresh>1/30){lastAnimationRefresh=t;refreshControls();}
+    for(const host of inspectorHosts)if(host.animationStrips?.length)updateAnimationStrips(host,animationContext);
     if(shortcuts&&t-lastFeedback>.05){lastFeedback=t;shortcuts.syncFeedback();}
     outputs?.present(t);
     if(outputEditor&&t-(outputEditor.lastUpdate||0)>1/30){outputEditor.lastUpdate=t;outputEditor.update?.($('#output-canvas'));}
@@ -1262,7 +1321,7 @@ function frame(timestamp){
       if(progress)progress.style.transform=`scaleX(${Math.max(0,Math.min(1,f.position))})`;
       if(f.clip.id===selectedClipId&&f.layer.activeClipId===f.clip.id){
         if(inspectorPlayhead&&document.activeElement!==inspectorPlayhead)inspectorPlayhead.value=f.position;
-        if(inspectorTime)inspectorTime.textContent=formatTime(f.time);
+        if(inspectorTime)inspectorTime.textContent=showRemaining?`-${formatTime(Math.max(0,(f.clip.outPoint-f.position)*f.clip.duration))}`:formatTime(f.time);
       }
     }
     paintFrames++;if(t-lastPaint>.1){lastPaint=t;for(const layer of project.layers){const queued=transport.getState(layer.id)?.pendingClipId;for(const slot of queuedSlots.get(layer.id)||[])slot.classList.toggle('queued',slot.dataset.clip===queued);}const beat=transport.beat??t*project.bpm/60;$('#beat-status').textContent=`BEAT ${Math.floor(beat/4)%999+1}.${Math.floor(beat%4)+1}`;if(recorder?.state==='recording')$('#record').textContent='■ '+formatTime(t-recordingStarted);}

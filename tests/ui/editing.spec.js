@@ -72,7 +72,7 @@ test('changing column counts keeps live playheads and exposes the new slots', as
   const initial = await diagnostics(page), layer = initial.project.layers.at(-1);
   const liveId = layer.activeClipId;
   await slotFor(page, layer.id, 0).click({ button: 'right' });
-  await page.locator('#source-duration').fill('120'); await page.locator('#source-duration').blur();
+  await page.locator('#clip-duration').fill('120'); await page.locator('#clip-duration').blur();
   expect(clipIn((await diagnostics(page)).project, liveId).duration).toBe(120);
   await page.locator('#timeline').fill('0.4'); await page.locator('#timeline').blur();
   const starting = (await diagnostics(page)).frames.find(frame => frame.clipId === liveId).time;
@@ -121,7 +121,7 @@ test('cut and paste across decks moves a playing clip without restarting it', as
   const initial = await diagnostics(page), layer = initial.project.layers.at(-1), oldDeck = initial.project.selectedDeckId;
   const liveId = layer.activeClipId;
   await slotFor(page, layer.id, 0).click({ button: 'right' });
-  await page.locator('#source-duration').fill('120'); await page.locator('#source-duration').blur();
+  await page.locator('#clip-duration').fill('120'); await page.locator('#clip-duration').blur();
   expect(clipIn((await diagnostics(page)).project, liveId).duration).toBe(120);
   await page.locator('#timeline').fill('0.4'); await page.locator('#timeline').blur();
   const before = (await diagnostics(page)).frames.find(frame => frame.clipId === liveId).time;

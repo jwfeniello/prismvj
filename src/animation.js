@@ -8,6 +8,8 @@ export const ANIMATION_LOOPS = Object.freeze(['loop', 'pingpong', 'once', 'rando
 export const ANIMATION_SHAPES = Object.freeze(['ramp', 'sine', 'triangle', 'square', 'random', 'envelope']);
 export const FFT_SOURCES = Object.freeze(['composition', 'group', 'layer', 'clip', 'external']);
 export const FFT_RESPONSES = Object.freeze(['up', 'down', 'speed+', 'speed-']);
+// BPM Sync speeds stay on the beat grid (manual p. 60): powers of two only.
+export const BPM_SPEEDS = Object.freeze([0, 0.125, 0.25, 0.5, 1, 2, 4, 8, 16]);
 // Spectra are log-frequency (20 Hz–20 kHz), so 0.3 ≈ 160 Hz and 0.7 ≈ 2.5 kHz.
 export const FFT_BANDS = Object.freeze({ low: [0, 0.3], mid: [0.3, 0.7], high: [0.7, 1] });
 const VALUE_TYPES = ['float', 'int', 'bool', 'choice'];
@@ -135,14 +137,21 @@ export class Animator {
 
   reset(animation) { this.states.delete(animation); }
 
+  // Last evaluated position within the in/out window (0..1) for playheads,
+  // and the smoothed audio level for FFT meters.
+  phase(animation) { return this.states.get(animation)?.phase ?? 0; }
+  level(animation) { return this.states.get(animation)?.level ?? 0; }
+
   evaluate(animation, context = {}) {
     const state = this._state(animation), dt = clamp(finite(context.dt) ? context.dt : 0, 0, 1);
     const direction = animation.direction, rate = animation.speed * direction;
     let normalized;
     if (animation.mode === 'dashboard') {
       normalized = clamp(context.dial?.(animation.dial) ?? 0);
+      state.phase = normalized;
     } else if (animation.mode === 'clip') {
-      normalized = shapeValue(animation, clamp(finite(context.clipPosition) ? context.clipPosition : 0));
+      state.phase = clamp(finite(context.clipPosition) ? context.clipPosition : 0);
+      normalized = shapeValue(animation, state.phase);
     } else if (animation.mode === 'fft') {
       const spectrum = context.spectrum?.(animation.fft.source) || null;
       const level = clamp(bandLevel(spectrum, animation.fft.lo, animation.fft.hi) * animation.fft.gain);
@@ -151,9 +160,11 @@ export class Animator {
       state.level = level >= state.level ? level : state.level + (level - state.level) * release;
       if (animation.fft.response === 'up' || animation.fft.response === 'down') {
         normalized = animation.fft.response === 'up' ? state.level : 1 - state.level;
+        state.phase = normalized;
       } else {
         state.travel += dt * state.level * 2 * (animation.fft.response === 'speed-' ? -1 : 1) / Math.max(0.01, animation.duration / 4);
         const folded = foldPhase(animation, state.travel);
+        state.phase = folded.phase;
         normalized = shapeValue(animation, folded.phase, folded.cycle);
       }
     } else {
@@ -173,6 +184,7 @@ export class Animator {
       }
       if (animation.loop === 'once') state.travel = travel = direction < 0 ? clamp(travel, -1, 0) : clamp(travel, 0, 1);
       const folded = foldPhase(animation, direction < 0 && animation.loop !== 'pingpong' ? 1 + travel : travel);
+      state.phase = folded.phase;
       normalized = shapeValue(animation, folded.phase, folded.cycle);
     }
     return outputValue(animation, normalized);

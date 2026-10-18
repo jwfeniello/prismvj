@@ -54,18 +54,6 @@
 .context-menu button{text-align:left;border:0;background:transparent;padding:5px 10px}
 .context-menu button:hover:not(:disabled),.context-menu button:focus-visible{background:#3d5f54}
 .context-menu hr{border:0;border-top:1px solid #1a1a1a;margin:3px 0}
-.animation-editor{position:fixed;z-index:1001;width:268px;max-height:80vh;overflow:auto;background:#262626;border:1px solid #0b0b0b;box-shadow:0 10px 30px rgba(0,0,0,.65);padding:8px;display:flex;flex-direction:column;gap:6px}
-.animation-editor header{display:flex;align-items:center;justify-content:space-between}
-.animation-editor header button{border:0;background:transparent}
-.anim-field{display:grid;grid-template-columns:82px minmax(0,1fr);align-items:center;gap:6px;color:#bdbdbd}
-.anim-field input,.anim-field select{width:100%}
-.anim-pair{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.anim-pair .anim-field{grid-template-columns:44px minmax(0,1fr)}
-.anim-check{display:flex;align-items:center;gap:4px;color:#bdbdbd}
-.anim-transport,.anim-bands{display:flex;gap:4px;align-items:center}
-.anim-transport select,.anim-bands select{flex:1}
-.anim-spectrum,.anim-envelope{width:100%;background:#111;border:1px solid #363636;touch-action:none}
-.anim-envelope{cursor:crosshair}
 .shortcut-list{display:flex;flex-direction:column;gap:2px;margin-top:6px}
 .shortcut-row{display:flex;align-items:center;gap:4px;padding:2px 0;border-bottom:1px solid #1a1a1a}
 .shortcut-row .shortcut-input{min-width:70px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent)}
@@ -80,4 +68,47 @@ html[data-shortcut-edit] .statusbar{background:#1d3d74}
 .dmx-fixture{border:1px solid #2c2c2c;background:#1e1e1e;padding:4px;margin:4px 0}
 .dmx-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px;margin-top:3px}
 .dmx-grid label{display:flex;flex-direction:column;font-size:10px;color:#a0a0a0;gap:1px}
-.dmx-grid input,.dmx-grid select{width:100%}
+.dmx-grid input,.dmx-grid select{width:100%}/* Resolume-style transports: radio buttons, mini timeline with a live
+   playhead, in/out bar, beats/duration fields and the animation range bracket. */
+.radio-group{display:inline-flex;border:1px solid #0d0d0d;border-radius:2px;overflow:hidden}
+.radio-group button{border:0;border-right:1px solid #0d0d0d;border-radius:0;background:#2f2f2f;padding:1px 6px;min-width:22px;line-height:16px}
+.radio-group button:last-child{border-right:0}
+.radio-group button.active{background:#3f8cff;color:#fff}
+.speed-steps button{min-width:0;padding:1px 4px;font-size:10px}
+.beat-field{display:inline-flex;align-items:center;gap:2px}
+.beat-field button{padding:1px 5px;min-width:20px}
+.beat-field input{width:56px;text-align:right}
+.beat-field .unit{color:#8f8f8f;margin-left:2px}
+.anim-strip{margin:0 0 4px 12px;padding:4px 6px;background:#1c2330;border-left:2px solid #3f8cff;display:flex;flex-direction:column;gap:4px}
+.anim-head,.anim-row,.transport-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.anim-mode{color:#8fb8ff;font-weight:600;font-size:11px}
+.anim-shape{padding:0 2px!important;font-size:10px}
+.anim-label{color:#a9a9a9;min-width:44px}
+.anim-row input[type=range]{flex:1;min-width:60px}
+.anim-value{width:34px;text-align:right;color:#cfcfcf;font-variant-numeric:tabular-nums}
+.anim-check{display:flex;align-items:center;gap:4px;color:#bdbdbd}
+.anim-timeline{position:relative;height:12px;background:#0f1218;border:1px solid #0a0a0a}
+.anim-window{position:absolute;top:0;bottom:0;background:#26354d}
+.anim-playhead{position:absolute;top:-2px;bottom:-2px;width:2px;margin-left:-1px;background:#5aa0ff;box-shadow:0 0 4px #5aa0ff}
+.anim-meter{position:relative;width:70px;height:6px;background:#0f1218;border:1px solid #0a0a0a}
+.anim-meter span{position:absolute;left:0;top:0;bottom:0;background:#84ffd4;width:0}
+.anim-spectrum,.anim-envelope{width:100%;height:54px;background:#0f1218;border:1px solid #0a0a0a;touch-action:none;cursor:crosshair}
+.anim-envelope{height:64px}
+.inout-bar{position:relative;height:7px;background:#0f1218;border:1px solid #0a0a0a;cursor:pointer;touch-action:none}
+.inout-band{position:absolute;top:0;bottom:0;background:#2b5aa8}
+.inout-handle{position:absolute;top:-3px;bottom:-3px;width:6px;background:#5aa0ff;cursor:ew-resize}
+.inout-handle[data-handle="in"]{left:-3px}.inout-handle[data-handle="out"]{right:-3px}
+.transport-head select{max-width:110px}
+.transport-section .timeline{margin-top:2px}
+.transport-section .inout-bar{margin:2px 0 4px}
+#clip-time{cursor:pointer}
+.is-animated{position:relative}
+.is-animated input[type=range]::-webkit-slider-thumb{background:#5aa0ff}
+.anim-bracket{position:absolute;pointer-events:none}
+.anim-bracket-band{position:absolute;top:0;bottom:0;border-top:2px solid #5aa0ff;border-bottom:2px solid #5aa0ff;background:rgba(90,160,255,.12)}
+.anim-bracket-handle{position:absolute;top:-3px;bottom:-3px;width:5px;margin-left:-2px;background:#5aa0ff;pointer-events:auto;cursor:ew-resize;border-radius:1px}
+.anim-bracket.inverted .anim-bracket-band{border-color:#ffb34a;background:rgba(255,179,74,.12)}
+.anim-bracket.inverted .anim-bracket-handle{background:#ffb34a}.context-menu button{display:flex;align-items:center;gap:8px}
+.submenu-arrow{margin-left:auto;color:#9a9a9a}
+.transport-section .transport-row>.anim-label{min-width:77px;text-align:right;padding-right:4px}
+.transport-section .transport-row{padding:1px 0}
