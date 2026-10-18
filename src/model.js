@@ -578,6 +578,18 @@ export class Transport {
     state.clip.cues[index] = state.position; return true;
   }
 
+  // Ableton Link: keep the beat clock in phase with the session within a bar
+  // (quantum). Only the phase matters, not the absolute beat number. Small
+  // drift is eased out; a larger offset jumps so quantized launches stay on the grid.
+  syncBeat(beat, quantum = 4, nowSeconds) {
+    if (!Number.isFinite(beat)) return 0;
+    this.tick(nowSeconds);
+    const q = number(quantum, 4, 1, 64);
+    const offset = mod(beat - this._beat + q / 2, q) - q / 2;
+    this._beat += Math.abs(offset) > 0.25 ? offset : offset * 0.2;
+    return offset;
+  }
+
   resync(nowSeconds) { this.tick(nowSeconds); this._beat = 0; for (const entry of this._entries.values()) if (entry.pending) this._request(entry, entry.pending.clip, 0, entry.pending); }
 
   getState(layerId) {

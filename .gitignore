@@ -5,3 +5,5 @@ test-results/
 playwright-report/
 docs/manual*.txt
 *.log
+native/link/build/
+electron/native/stale-*.node

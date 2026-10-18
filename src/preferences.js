@@ -1,5 +1,5 @@
 // Booleans are interface switches; strings name audio devices by id.
-const defaults = Object.freeze({ clipPanelFollowsTrigger:true, showAudioControls:true, showLayerTransport:false, showTransitions:true, midiClockSync:false });
+const defaults = Object.freeze({ clipPanelFollowsTrigger:true, showAudioControls:true, showLayerTransport:false, showTransitions:true, midiClockSync:false, linkEnabled:false, linkStartStop:false });
 const devices = Object.freeze({ audioInputDevice:'', audioOutputDevice:'', smpteInputDevice:'' });
 export function normalizePreferences(value) {
   return { ...Object.fromEntries(Object.entries(defaults).map(([key,fallback]) => [key,typeof value?.[key]==='boolean'?value[key]:fallback])),

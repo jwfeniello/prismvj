@@ -179,3 +179,18 @@ test('random play mode jumps every interval within the distance, and relative pi
   transport.trigger(layer.id, other.id, 6);
   close(transport.getState(layer.id).position, 0.5 + 0.4 * 0.5);
 });
+test('Link beat sync aligns the phase within a bar and eases small drift', () => {
+  const transport = new Transport(createProject());
+  transport.tick(10);
+  const before = transport.beat;
+  // Session is 1.5 beats ahead in the bar: jump.
+  close(transport.syncBeat(before + 1.5 + 64, 4, 10), 1.5);
+  close(transport.beat % 4, (before + 1.5) % 4);
+  // 0.1 beat of drift is eased in by 20 %.
+  const eased = transport.beat;
+  transport.syncBeat(eased + 0.1, 4, 10);
+  close(transport.beat - eased, 0.02);
+  // Offsets wrap to the nearest bar edge (3.9 ahead is 0.1 behind).
+  const wrapped = transport.beat;
+  close(transport.syncBeat(wrapped + 3.9, 4, 10), -0.1);
+});

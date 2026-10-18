@@ -12,6 +12,7 @@ const { isAutomatedLaunch, validateBuiltPage } = require('./startup.cjs');
 const { createMediaConverter } = require('./media-converter.cjs');
 const { scanISFFolder } = require('./isf-library.cjs');
 const { DmxSender, DmxReceiver } = require('./dmx-network.cjs');
+const abletonLink = require('./link.cjs');
 
 // Test profiles and automation/debugging switches also imply hidden mode. A
 // forgotten environment flag must never put test windows or dialogs on stage.
@@ -776,6 +777,11 @@ function setupIPC() {
   handle('prism:osc-stop', stopOSC);
   handle('prism:osc-status', () => ({ ...oscState }));
   handle('prism:osc-send', (host, port, messages) => sendOSC(host, port, messages));
+  handle('prism:link-status', () => abletonLink.status());
+  handle('prism:link-enable', enabled => abletonLink.setEnabled(enabled, state => notify('prism:link-state', state)));
+  handle('prism:link-tempo', bpm => abletonLink.setTempo(bpm));
+  handle('prism:link-playing', playing => abletonLink.setPlaying(playing));
+  handle('prism:link-start-stop-sync', enabled => abletonLink.setStartStopSync(enabled));
   handle('prism:dmx-start', startDMX);
   handle('prism:dmx-stop', stopDMX);
   handle('prism:dmx-input-start', startDMXInput);
@@ -909,6 +915,7 @@ app.on('before-quit', event => {
     await stopOSC();
     await stopDMX();
     await stopDMXInput();
+    abletonLink.stop();
     oscOutSocket?.close();
     await saveQueue;
     for (const record of recordings.values()) {

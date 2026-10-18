@@ -80,6 +80,8 @@ const animationContext={getProject:()=>project,animator,spectrum:source=>spectru
 let animatedCount=0,lastAnimationRefresh=0,lastFeedback=0,lastFrameTime=0,effectSearch='',sourceSearch='',selectedGroupId=null,refreshQueued=false;
 const shortcutHolds=new Map();
 let timecode=null,lastTimecodeLabel='';
+// Ableton Link session as last reported by the main process.
+let link={available:false,enabled:false,peers:0,tempo:0,playing:false,receivedAt:0,beat:0,quantum:4},lastLinkTempo=0,lastLinkPlaying=null;
 let shortcuts,thumbnailer=null,lastColumn=-1,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
 const oscSent=new Map();
 let lastPaint=0,paintFrames=0,paintStart=0,lastActive='';
@@ -91,7 +93,7 @@ const snapshot = () => JSON.stringify(validateProject(project));
 function initialize() {
   $('#app').innerHTML = `
     <header class="topbar"><div class="brand">Prism Live</div><input type="text" class="project-title" id="project-name" aria-label="Composition name" value="${esc(project.name)}"><span class="pill" id="save-state">LOCAL SESSION</span><div class="spacer"></div><button id="new-project">New</button><button id="open-project">Open</button><button id="save-project">Save</button><div class="divider"></div><button id="record">● Record</button><button id="output" class="primary">Output</button><button id="preferences" title="Preferences">Settings</button><button id="help" title="Keyboard shortcuts">?</button></header>
-    <div class="toolbar"><label>BPM</label><input id="bpm" class="tempo" type="number" min="20" max="300" step=".1" value="${project.bpm}" aria-label="Tempo"><button id="tap" class="icon-btn">Tap</button><button id="resync" class="icon-btn" title="Resync beat clock">↻</button><div class="divider"></div><label>Quantize</label><select id="quantize" aria-label="Trigger quantization"><option value="0">Immediate</option><option value=".25">¼ beat</option><option value="1">1 beat</option><option value="4">1 bar</option><option value="8">2 bars</option></select><div class="divider"></div><button data-global-direction="backward" class="icon-btn" title="Reverse all active clips; right-click to pin">◀</button><button data-global-direction="forward" class="icon-btn" title="Forward all active clips; right-click to pin">▶</button><button data-global-direction="random" class="icon-btn" title="Random playback; right-click to pin">R</button><button id="pause" class="icon-btn" title="Pause composition; right-click to pin paused clip launches">Ⅱ Pause</button><label>Speed</label><input id="global-speed" aria-label="Global speed" type="range" min=".1" max="4" step=".01" value="1"><output id="speed-value">1.00×</output><div class="spacer"></div><button id="bypass-all" class="icon-btn">Bypass all</button><button id="clear-all" class="icon-btn">Clear all</button><button id="blackout" class="icon-btn">Blackout</button></div>
+    <div class="toolbar"><label>BPM</label><input id="bpm" class="tempo" type="number" min="20" max="300" step=".1" value="${project.bpm}" aria-label="Tempo"><button id="tap" class="icon-btn">Tap</button><button id="link" class="icon-btn link-button" title="Ableton Link: sync tempo and beat with other apps on the network. Right-click for options." hidden>Link</button><button id="resync" class="icon-btn" title="Resync beat clock">↻</button><div class="divider"></div><label>Quantize</label><select id="quantize" aria-label="Trigger quantization"><option value="0">Immediate</option><option value=".25">¼ beat</option><option value="1">1 beat</option><option value="4">1 bar</option><option value="8">2 bars</option></select><div class="divider"></div><button data-global-direction="backward" class="icon-btn" title="Reverse all active clips; right-click to pin">◀</button><button data-global-direction="forward" class="icon-btn" title="Forward all active clips; right-click to pin">▶</button><button data-global-direction="random" class="icon-btn" title="Random playback; right-click to pin">R</button><button id="pause" class="icon-btn" title="Pause composition; right-click to pin paused clip launches">Ⅱ Pause</button><label>Speed</label><input id="global-speed" aria-label="Global speed" type="range" min=".1" max="4" step=".01" value="1"><output id="speed-value">1.00×</output><div class="spacer"></div><button id="bypass-all" class="icon-btn">Bypass all</button><button id="clear-all" class="icon-btn">Clear all</button><button id="blackout" class="icon-btn">Blackout</button></div>
     <section class="workspace"><div class="layer-label row"><span class="muted">Composition</span><button id="previous-column" class="icon-btn" title="Trigger previous column" aria-label="Trigger previous column">◀</button><button id="next-column" class="icon-btn" title="Trigger next column" aria-label="Trigger next column">▶</button><div class="spacer"></div><button id="insert-layer" class="icon-btn" title="Insert layer below selected">↧</button><button id="add-layer" class="icon-btn" title="Add layer">+</button></div><div id="column-viewport"><div id="column-heads" class="column-heads"></div></div><div id="layer-bank" class="layer-bank"></div></section>
     <nav class="deckbar"><div class="crossfade"><button id="cross-a" title="Fade to A">A</button><input id="crossfader" type="range" min="0" max="1" step=".001" value=".5" aria-label="Crossfader"><button id="cross-b" title="Fade to B">B</button></div><div id="decks" class="row"></div><button id="add-deck" class="icon-btn" title="Add deck">+</button><button id="deck-actions" class="icon-btn" title="Edit selected deck">Deck…</button><button id="column-actions" class="icon-btn" title="Edit columns">Columns…</button><span class="spacer"></span><button id="copy-clip" class="icon-btn" title="Copy selected clip (Ctrl+C)">Copy</button><button id="cut-clip" class="icon-btn" title="Cut selected clip (Ctrl+X)">Cut</button><button id="paste-clip" class="icon-btn" title="Paste into selected slot (Ctrl+V)">Paste</button></nav>
     <div class="layout-splitter horizontal" data-layout-splitter="workspace" role="separator" aria-label="Resize top and bottom sections" aria-orientation="horizontal" tabindex="0"></div>
@@ -126,6 +128,7 @@ function initialize() {
   shortcuts.clock.enabled=preferences.midiClockSync;
   if(preferences.midiClockSync)shortcuts.enableMidi().catch(()=>{});
   if(preferences.smpteInputDevice)startTimecode();
+  setupLink();
   if(preferences.audioInputDevice)engine.setExternalAudioInput(preferences.audioInputDevice).catch(error=>toast(`External audio input unavailable: ${error.message}`,true));
   fileBrowser=new FilesBrowser({desktop,onImport:item=>item?placeMedia(item,currentLayer()):importFiles(),onPreview:item=>startPreview(createClip(item.kind,item)),onRelink:relinkAll,onError:message=>toast(message,true)});
   bindStatic();
@@ -372,6 +375,47 @@ async function startTimecode(){
   }catch(error){toast(`SMPTE input unavailable: ${error.message}`,true);}
   updateTimecodeStatus();
 }
+// Ableton Link (manual: BPM sync with other apps). The main process streams
+// the session; the beat clock follows its phase and tempo changes flow both ways.
+async function setupLink(){
+  if(!desktop?.linkStatus)return;
+  const status=await desktop.linkStatus().catch(()=>null);
+  if(!status?.available)return;
+  $('#link').hidden=false;
+  desktop.onLinkState(state=>{
+    const previous=link;
+    link={...state,receivedAt:now()};
+    if(!state.enabled){updateLinkButton();return;}
+    if(Math.abs(state.tempo-project.bpm)>0.005&&Math.abs(state.tempo-lastLinkTempo)>0.0001){
+      lastLinkTempo=state.tempo;project.bpm=Math.round(state.tempo*1000)/1000;
+      if(document.activeElement!==$('#bpm'))$('#bpm').value=Number(project.bpm.toFixed(2));
+    }
+    transport.syncBeat(state.beat,state.quantum,now());
+    if(preferences.linkStartStop&&previous.playing!==state.playing&&lastLinkPlaying!==state.playing){lastLinkPlaying=state.playing;project.paused=!state.playing;syncGlobals();}
+    if(previous.peers!==state.peers||previous.enabled!==state.enabled)updateLinkButton();
+  });
+  if(preferences.linkStartStop)await desktop.linkStartStopSync(true).catch(()=>{});
+  if(preferences.linkEnabled)await toggleLink(true);
+}
+async function toggleLink(on=!link.enabled){
+  try{
+    const state=await desktop.linkEnable(on);
+    link={...link,...state,receivedAt:now()};
+    // Joining a session adopts its tempo; an empty session takes ours.
+    if(on&&state.peers===0)await desktop.linkTempo(project.bpm);
+    preferences=writePreferences({...preferences,linkEnabled:on});
+    updateLinkButton();
+    if(on)toast(state.peers?`Link: joined a session with ${state.peers} peer${state.peers===1?'':'s'} at ${state.tempo.toFixed(1)} BPM.`:'Link on: waiting for peers on the network.');
+  }catch(error){toast(error.message,true);}
+}
+function updateLinkButton(){
+  const button=$('#link');if(!button)return;
+  button.classList.toggle('active',!!link.enabled);
+  button.textContent=link.enabled?`Link ${link.peers}`:'Link';
+  button.title=link.enabled?`Ableton Link · ${link.peers} peer${link.peers===1?'':'s'} · ${(link.tempo||project.bpm).toFixed(2)} BPM. Right-click for options.`:'Ableton Link: sync tempo and beat with other apps on the network. Right-click for options.';
+}
+// Our tempo edits go to the Link session (not echoes of its own changes).
+function linkTempoChanged(){if(link.enabled&&Math.abs(project.bpm-lastLinkTempo)>0.0001){lastLinkTempo=project.bpm;desktop.linkTempo(project.bpm).catch(()=>{});}}
 function timecodeFps(){return timecode?.state.fps||(preferences.smpteFps==='auto'?25:Number(preferences.smpteFps));}
 function followTimecode(frames){
   const state=timecode.state;
@@ -933,7 +977,7 @@ function renderBrowser(){
 }
 
 function bindStatic(){
-  for(const [selector,key] of [['#project-name','name'],['#bpm','bpm'],['#quantize','quantize'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])$(selector).oninput=e=>{project[key]=key==='name'?e.target.value:+e.target.value;markFaders($('.monitor-footer'));if(key==='bpm')project.bpm=Math.max(20,Math.min(300,project.bpm||120));$('#speed-value').textContent=project.speed.toFixed(2)+'×';changed('coalesce');};
+  for(const [selector,key] of [['#project-name','name'],['#bpm','bpm'],['#quantize','quantize'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])$(selector).oninput=e=>{project[key]=key==='name'?e.target.value:+e.target.value;markFaders($('.monitor-footer'));if(key==='bpm'){project.bpm=Math.max(20,Math.min(300,project.bpm||120));linkTempoChanged();}$('#speed-value').textContent=project.speed.toFixed(2)+'×';changed('coalesce');};
   $('#pause').onclick=()=>{project.paused=!project.paused;changed();syncGlobals();};
   const direction=(mode,pin=false)=>{if(pin&&project.directionPin===mode)project.directionPin=null;else transport.setGlobalDirection(mode,{pin});changed();syncGlobals();renderInspector();};
   for(const button of $$('[data-global-direction]')){button.onclick=()=>direction(button.dataset.globalDirection);button.oncontextmenu=event=>{event.preventDefault();direction(button.dataset.globalDirection,true);};}
@@ -943,7 +987,9 @@ function bindStatic(){
   $('#blackout').onclick=()=>{project.blackout=!project.blackout;syncGlobals();};
   $('#clear-all').onclick=()=>{triggerRequests.clear();for(const l of project.layers)transport.stop(l.id);renderLayers();};
   $('#resync').onclick=()=>transport.resync?.(now());
-  $('#tap').onclick=()=>{const t=now();if(t-(tapTimes.at(-1)||0)>2)tapTimes=[];tapTimes.push(t);if(tapTimes.length>6)tapTimes.shift();if(tapTimes.length>1){project.bpm=Math.max(20,Math.min(300,60*(tapTimes.length-1)/(t-tapTimes[0])));$('#bpm').value=project.bpm.toFixed(1);changed();}};
+  $('#tap').onclick=()=>{const t=now();if(t-(tapTimes.at(-1)||0)>2)tapTimes=[];tapTimes.push(t);if(tapTimes.length>6)tapTimes.shift();if(tapTimes.length>1){project.bpm=Math.max(20,Math.min(300,60*(tapTimes.length-1)/(t-tapTimes[0])));$('#bpm').value=project.bpm.toFixed(1);linkTempoChanged();changed();}};
+  $('#link').onclick=()=>toggleLink();
+  $('#link').oncontextmenu=event=>{event.preventDefault();showMenu(event,[[link.enabled?'Disable Link':'Enable Link',()=>toggleLink()],[`${preferences.linkStartStop?'✓':'\u2007'} Start/stop sync (pause with the session)`,async()=>{preferences=writePreferences({...preferences,linkStartStop:!preferences.linkStartStop});await desktop.linkStartStopSync(preferences.linkStartStop).catch(()=>{});}],['Start session playing',()=>desktop.linkPlaying(true),!link.enabled],['Stop session',()=>desktop.linkPlaying(false),!link.enabled]]);};
   for(const [selector,side] of [['#cross-a','A'],['#cross-b','B']]){const button=$(selector);button.onpointerdown=event=>{if(event.button===0)crossfaderButton(side,true);};button.onpointerup=button.onpointerleave=()=>crossfaderButton(side,false);button.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();crossfaderButton(side,true);}};button.onkeyup=event=>{if(event.key==='Enter'||event.key===' ')crossfaderButton(side,false);};}
   $('#layer-bank').onscroll=e=>{$('#column-viewport').scrollLeft=e.target.scrollLeft;};
   for(const b of $$('[data-inspector]'))b.onclick=()=>{inspectorTab=b.dataset.inspector;renderInspector();if(browserTab==='effects')renderBrowser();};
@@ -1535,7 +1581,7 @@ window.prismDiagnostics=()=>{
   return {project:serializeProject(project),preferences:{...preferences},
     frames:frames.map(frame=>({clipId:frame.clip.id,layerId:frame.layer.id,sourceLayerId:frame.sourceLayerId,voiceId:frame.voiceId,inputId:transport.getState(frame.layer.id)?.inputId,direction:frame.direction,position:frame.position,time:frame.time,weight:frame.weight})),
     voices:frames.map(frame=>{const voiceId=frame.sourceLayerId!==frame.layer.id?frame.voiceId:undefined;const media=engine.getMedia(frame.clip.id,voiceId),audio=engine.getAudio(frame.clip.id,voiceId);return {clipId:frame.clip.id,layerId:frame.layer.id,voiceId:frame.voiceId,mediaTime:media?.currentTime??null,audioTime:audio?.currentTime??null,mediaPaused:media?.paused??null,audioPaused:audio?.paused??null};}),
-    stats:engine?.getStats?.(),recording:recorder?.state||'inactive',outputs:outputs?[...outputs.windows.values()].map(entry=>({name:entry.name,width:entry.canvas.width,height:entry.canvas.height})):[]};
+    stats:engine?.getStats?.(),recording:recorder?.state||'inactive',link:{available:link.available,enabled:link.enabled,peers:link.peers,tempo:link.tempo,beat:transport.beat},outputs:outputs?[...outputs.windows.values()].map(entry=>({name:entry.name,width:entry.canvas.width,height:entry.canvas.height})):[]};
 };
 // Renders the composition and every output window once, then samples each
 // at its centre (for automated output checks).
