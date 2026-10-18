@@ -143,3 +143,27 @@ test('sources browser adds catalog generators and an effect clip from an effect 
   expect(slot.effects[0].type).toBe('invert-rgb');
   expect(errors).toEqual([]);
 });
+
+test('effect sliders drag normally; only the grip reorders effects', async ({ page }) => {
+  const errors = []; page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await page.locator('[data-browser="effects"]').click();
+  await page.locator('[data-inspector="layer"]').click();
+  await page.locator('[data-add-effect="hue-rotate"]').click();
+  await page.locator('[data-add-effect="blur"]').click();
+  const panel = page.locator('[data-inspector-panel="context"]');
+  const slider = panel.locator('.effect-card').first().locator('input[type="range"][data-param-path$="/opacity"]');
+  await slider.scrollIntoViewIfNeeded();
+  const box = await slider.boundingBox();
+  await page.mouse.move(box.x + box.width - 3, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.3, box.y + box.height / 2, { steps: 6 });
+  await page.mouse.up();
+  let effects = (await diagnostics(page)).project.layers.at(-1).effects;
+  expect(effects.map(effect => effect.type)).toEqual(['hue-rotate', 'blur']);
+  expect(effects[0].opacity).toBeLessThan(0.5);
+  await panel.locator('.effect-card').nth(1).locator('.drag-grip').dragTo(panel.locator('.effect-card').first());
+  effects = (await diagnostics(page)).project.layers.at(-1).effects;
+  expect(effects.map(effect => effect.type)).toEqual(['blur', 'hue-rotate']);
+  expect(errors).toEqual([]);
+});

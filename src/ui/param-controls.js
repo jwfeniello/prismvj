@@ -90,8 +90,8 @@ function effectCard(effect, index, audio) {
   const name = definition?.name || effect.type;
   const presets = definition ? readPresets()[presetKey(effect.type, audio)] || [] : [];
   const missing = definition ? '' : '<small class="effect-missing">This effect is not loaded on this computer. Its settings are kept.</small>';
-  return `<div class="effect-card ${effect.enabled ? '' : 'bypassed'}" data-effect="${esc(effect.id)}" data-effect-index="${index}" draggable="true">
-    <div class="effect-head"><span class="drag-grip" title="Drag to reorder">≡</span><button class="fx-bypass ${effect.enabled ? '' : 'active'}" data-fx-bypass title="Bypass (B)">B</button>${cogButton(`${base}/enabled`, effect, 'enabled')}<strong class="grow" title="${esc(definition?.category || '')}">${esc(name)}</strong>
+  return `<div class="effect-card ${effect.enabled ? '' : 'bypassed'}" data-effect="${esc(effect.id)}" data-effect-index="${index}">
+    <div class="effect-head"><span class="drag-grip" draggable="true" title="Drag to reorder">≡</span><button class="fx-bypass ${effect.enabled ? '' : 'active'}" data-fx-bypass title="Bypass (B)">B</button>${cogButton(`${base}/enabled`, effect, 'enabled')}<strong class="grow" title="${esc(definition?.category || '')}">${esc(name)}</strong>
       ${definition ? `<select class="fx-preset" data-fx-preset aria-label="${esc(name)} preset"><option value="">Preset</option>${presets.map((preset, i) => `<option value="${i}">${esc(preset.name)}</option>`).join('')}<option value="save">Save as…</option>${presets.length ? '<option value="delete">Delete preset…</option>' : ''}</select>` : ''}
       <button data-fx-move="-1" title="Move up">↑</button><button data-fx-move="1" title="Move down">↓</button><button data-fx-remove title="Remove (X)">×</button></div>
     <div class="effect-body">${missing}${audio ? '' : `<div class="param-row"><label>Blend</label><select data-fx-blend>${blendOptions(effect.blend || 'normal')}</select></div>${paramControlHTML({ key: 'opacity', label: 'Opacity', type: 'float', min: 0, max: 1, default: 1 }, effect.opacity ?? 1, `${base}/opacity`, effect, 'opacity')}`}
@@ -148,10 +148,11 @@ export function bindEffectStacks(host, owner, ctx) {
           if (name) { const all = readPresets(); all[presetKey(effect.type, audio)] = presets.filter(item => item.name !== name); writePresets(all); ctx.changed(true); }
         } else if (value !== '' && presets[Number(value)]) { applyPreset(effect, presets[Number(value)]); ctx.changed(true); }
       };
-      card.addEventListener('dragstart', event => {
-        if (event.target !== card) return;
+      // Only the ≡ grip reorders; sliders and other controls keep normal dragging.
+      card.querySelector('.drag-grip').addEventListener('dragstart', event => {
         event.dataTransfer.setData('application/prism-effect-move', JSON.stringify({ id: effect.id, audio }));
         event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setDragImage(card, 12, 12);
       });
       card.addEventListener('dragover', event => { if (event.dataTransfer.types.includes('application/prism-effect-move')) { event.preventDefault(); card.classList.add('drag-over'); } });
       card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
