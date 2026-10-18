@@ -1,4 +1,4 @@
-# Prism Live architecture
+# PrismVJ architecture
 
 Windows desktop performance application based on the behavior in the supplied Resolume 4 manual. The full manual scope is tracked in REQUIREMENTS.md; initial implementation is not a claim of complete parity.
 

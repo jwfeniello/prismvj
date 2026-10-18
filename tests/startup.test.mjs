@@ -86,7 +86,7 @@ test('Electron startup failure stays silent and debugger-launched windows never 
     await t.test('missing dist exits nonzero, logs the cause and creates no window or dialog', async () => {
       const result = await runFixture(temporary, profile);
       assert.equal(result.code, 1, JSON.stringify(result));
-      assert.match(result.stderr, /Prism Live could not start:.*build is missing or incomplete/);
+      assert.match(result.stderr, /PrismVJ could not start:.*build is missing or incomplete/);
       assert.equal(await readFile(lifecycle, 'utf8').catch(error => error.code === 'ENOENT' ? '' : Promise.reject(error)), '');
       const log = await readFile(path.join(profile, 'prism.log'), 'utf8');
       assert.match(log, /Startup failed:.*index\.html/);

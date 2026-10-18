@@ -56,7 +56,7 @@ export class OutputWindows {
     if (!child) { this.onError('The output window could not be opened.'); return null; }
     let doc;
     try { doc = child.document; } catch { child.close(); this.onError('The output window is isolated from the editor; using the compatibility output.'); return null; }
-    doc.title = `Prism Live — ${screen.name || 'Output'}`;
+    doc.title = `PrismVJ — ${screen.name || 'Output'}`;
     doc.body.style.cssText = 'margin:0;background:#000;overflow:hidden;cursor:none';
     const canvas = doc.createElement('canvas');
     canvas.style.cssText = 'display:block;width:100vw;height:100vh;object-fit:contain;background:#000';

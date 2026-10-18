@@ -8,7 +8,7 @@ import { _electron as electron } from '@playwright/test';
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const executable = process.argv[2]
   ? path.resolve(process.argv[2])
-  : path.join(root, 'release', 'reverse-smooth-dxv', 'PrismLive-win32-x64', 'PrismLive.exe');
+  : path.join(root, 'release', 'prismvj', 'PrismVJ-win32-x64', 'PrismVJ.exe');
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'prism-snapshot-smoke-'));
 const profile = path.join(temporary, 'profile');
 let application;

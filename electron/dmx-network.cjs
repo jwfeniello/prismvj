@@ -85,7 +85,7 @@ function encodeArtPoll({ flags = 0, diagPriority = 0x10 } = {}) {
 
 // Minimal Art-Net 4 ArtPollReply (239 bytes). Up to 4 ports sharing one Net/Sub-Net; direction 'output' means
 // the node consumes Art-Net (what a DMX input like Prism's shortcuts listener is), 'input' means it produces it.
-function encodeArtPollReply({ ip = '0.0.0.0', port = ARTNET_PORT, version = 1, shortName = 'Prism Live', longName = 'Prism Live',
+function encodeArtPollReply({ ip = '0.0.0.0', port = ARTNET_PORT, version = 1, shortName = 'PrismVJ', longName = 'PrismVJ',
   nodeReport = '', oem = 0xffff, estaMan = 0, ports = [], mac, bindIndex = 0, style = 0 } = {}) {
   if (!net.isIPv4(ip) || !isInt(port, 0, 65535) || !isInt(version, 0, 0xffff) || !isInt(oem, 0, 0xffff) || !isInt(estaMan, 0, 0xffff)
     || !isInt(bindIndex, 0, 255) || !isInt(style, 0, 255) || !Array.isArray(ports) || ports.length > 4) throw new RangeError('Invalid ArtPollReply fields.');
@@ -158,7 +158,7 @@ function e131MulticastAddress(universe) {
   return `239.255.${universe >> 8}.${universe & 0xff}`;
 }
 
-function encodeE131({ universe, sequence = 0, priority = 100, sourceName = 'Prism Live', cid, data, options = 0, syncAddress = 0, startCode = 0 } = {}) {
+function encodeE131({ universe, sequence = 0, priority = 100, sourceName = 'PrismVJ', cid, data, options = 0, syncAddress = 0, startCode = 0 } = {}) {
   if (!isInt(universe, 1, 63999) || !isInt(sequence, 0, 255) || !isInt(priority, 0, 200) || !isInt(options, 0, 255)
     || !isInt(syncAddress, 0, 63999) || !isInt(startCode, 0, 255)) throw new RangeError('Invalid E1.31 header fields.');
   if (!isBytes(cid) || cid.length !== 16) throw new TypeError('E1.31 CID must be 16 bytes.');
@@ -238,7 +238,7 @@ function emitError(emitter, error) { if (emitter.listenerCount('error')) emitter
 class DmxSender extends EventEmitter {
   #socket = null; #entries = new Map(); #lastFlush = -Infinity; #flushTimer = null; #keepAliveTimer = null; #broadcast = false;
 
-  constructor({ protocol = 'artnet', host, port, rate = 44, sourceName = 'Prism Live', priority = 100, cid, keepAliveMs,
+  constructor({ protocol = 'artnet', host, port, rate = 44, sourceName = 'PrismVJ', priority = 100, cid, keepAliveMs,
     bindAddress = '0.0.0.0', localPort = 0 } = {}) {
     super();
     this.protocol = validateProtocol(protocol);

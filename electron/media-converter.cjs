@@ -97,7 +97,7 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
   let thumbnailsActive = 0;
   let thumbnailPeak = 0;
 
-  const checkOpen = () => { if (closed) throw new Error('Media preparation stopped because Prism Live is closing.'); };
+  const checkOpen = () => { if (closed) throw new Error('Media preparation stopped because PrismVJ is closing.'); };
   const emit = (event, listeners) => {
     if (closed) return;
     // A disconnected window must not turn a successful conversion into a failure.
@@ -132,7 +132,7 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
       child.once('error', error => { finish(); reject(error); });
       child.once('close', code => {
         finish();
-        if (closed) reject(new Error('Media preparation stopped because Prism Live is closing.'));
+        if (closed) reject(new Error('Media preparation stopped because PrismVJ is closing.'));
         else if (aborted) reject(abortError());
         else if (timedOut) reject(new Error(`${path.basename(executable)} took too long while preparing this media.`));
         else if (code !== 0) reject(new Error(errorOutput.trim() || `${path.basename(executable)} exited with code ${code}.`));

@@ -457,7 +457,7 @@ function windowOptions(extra = {}) {
 function lockWindow(window) {
   window.webContents.setWindowOpenHandler(({ url, frameName }) => {
     if (window !== editor || url !== 'about:blank' || !/^prism-output-[a-z0-9-]{1,40}$/.test(frameName) || outputWindows.size >= 16) return { action: 'deny' };
-    return { action: 'allow', overrideBrowserWindowOptions: windowOptions({ show: false, title: 'Prism Live — Output', autoHideMenuBar: true, backgroundColor: '#000000', minWidth: 160, minHeight: 90 }) };
+    return { action: 'allow', overrideBrowserWindowOptions: windowOptions({ show: false, title: 'PrismVJ — Output', autoHideMenuBar: true, backgroundColor: '#000000', minWidth: 160, minHeight: 90 }) };
   });
   window.webContents.on('did-create-window', (child, { frameName }) => {
     if (window !== editor) { child.close(); return; }
@@ -475,8 +475,8 @@ function lockWindow(window) {
     void log(`Renderer stopped: ${details.reason}`);
     if (window === output) { window.close(); return; }
     if (hiddenTestWindows) { console.error(`Renderer stopped: ${details.reason}`); app.exit(1); return; }
-    dialog.showMessageBox({ type: 'error', title: 'Prism Live', message: 'The display process stopped.',
-      detail: 'Your saved compositions and recovery files are preserved. Restart Prism Live to recover the last autosave.' }).catch(() => {});
+    dialog.showMessageBox({ type: 'error', title: 'PrismVJ', message: 'The display process stopped.',
+      detail: 'Your saved compositions and recovery files are preserved. Restart PrismVJ to recover the last autosave.' }).catch(() => {});
   });
 }
 
@@ -487,7 +487,7 @@ function loadWindow(window, isOutput = false) {
 
 async function createEditor() {
   if (!devURL) await validateBuiltPage(path.join(app.getAppPath(), 'dist'));
-  editor = new BrowserWindow(windowOptions({ width: 1540, height: 960, minWidth: 1000, minHeight: 650, title: 'Prism Live', show: false }));
+  editor = new BrowserWindow(windowOptions({ width: 1540, height: 960, minWidth: 1000, minHeight: 650, title: 'PrismVJ', show: false }));
   editor.setMenu(null);
   lockWindow(editor);
   editor.on('closed', () => { editor = null; if (output && !output.isDestroyed()) output.close(); });
@@ -503,7 +503,7 @@ async function openOutput(displayId) {
     if (!hiddenTestWindows) output.show();
     return true;
   }
-  output = new BrowserWindow(windowOptions({ ...display.bounds, show: false, title: 'Prism Live — Output',
+  output = new BrowserWindow(windowOptions({ ...display.bounds, show: false, title: 'PrismVJ — Output',
     fullscreen: !hiddenTestWindows && displays.length > 1, frame: displays.length === 1, minWidth: 320, minHeight: 180 }));
   output.setMenu(null);
   lockWindow(output);
@@ -619,7 +619,7 @@ async function stopDMX() {
 async function startDMX(options) {
   await stopDMX();
   const sender = new DmxSender({ protocol: options?.protocol === 'sacn' ? 'sacn' : 'artnet', host: typeof options?.host === 'string' ? options.host : undefined,
-    port: Number.isInteger(options?.port) ? options.port : undefined, rate: Number.isFinite(options?.rate) ? options.rate : 44, sourceName: 'Prism Live' });
+    port: Number.isInteger(options?.port) ? options.port : undefined, rate: Number.isFinite(options?.rate) ? options.rate : 44, sourceName: 'PrismVJ' });
   sender.on('error', error => notify('prism:warning', `DMX output: ${error.message}`));
   await sender.start();
   dmxSender = sender;
@@ -857,7 +857,7 @@ function setupIPC() {
 }
 
 app.whenReady().then(async () => {
-  app.setName('Prism Live');
+  app.setName('PrismVJ');
   if (devURL && !/^http:\/\/(127\.0\.0\.1|localhost):\d+\/?$/.test(devURL)) {
     throw new Error('PRISM_DEV_URL must be a localhost HTTP origin with an explicit port.');
   }
@@ -927,7 +927,7 @@ app.whenReady().then(async () => {
 }).catch(async error => {
   // Report startup failure without a blocking native modal, including failures
   // that occur between preflight and navigation. The launcher captures stderr.
-  console.error(`Prism Live could not start: ${error.message}`);
+  console.error(`PrismVJ could not start: ${error.message}`);
   await fs.mkdir(app.getPath('userData'), { recursive: true }).catch(() => {});
   await log(`Startup failed: ${error.message}`);
   app.exit(1);

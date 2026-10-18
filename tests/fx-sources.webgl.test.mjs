@@ -231,7 +231,7 @@ test('legacy sources reproduce the original engine generators', { skip: !browser
 
 test('text params normalize like the other param types', () => {
   const defaults = normalizeTextParams();
-  assert.equal(defaults.text, 'Prism Live');
+  assert.equal(defaults.text, 'PrismVJ');
   assert.equal(defaults.animate, false);
   assert.equal(TEXT_ANIMATOR.params.length, Object.keys(defaults).length);
   const values = normalizeTextParams({ text: 'A\r\nB', size: 9, alignment: 7, color: 'red', animate: true });
@@ -240,7 +240,7 @@ test('text params normalize like the other param types', () => {
   assert.equal(values.alignment, 1);
   assert.equal(values.color, '#ffffff');
   assert.equal(values.animate, true);
-  assert.equal(normalizeTextParams({ text: 42 }).text, 'Prism Live');
+  assert.equal(normalizeTextParams({ text: 42 }).text, 'PrismVJ');
   assert.equal(TEXT_ANIMATOR.kind, 'canvas');
   assert.equal(TEXT_ANIMATOR.params.find(param => param.key === 'text').type, 'text');
 });

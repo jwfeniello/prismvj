@@ -7,16 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { _electron as electron } from '@playwright/test';
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-const reverseSmoothExecutable = path.join(root, 'release', 'reverse-smooth-dxv', 'PrismLive-win32-x64', 'PrismLive.exe');
-const smoothExecutable = path.join(root, 'release', 'smooth-transport', 'PrismLive-win32-x64', 'PrismLive.exe');
-const resizedExecutable = path.join(root, 'release', 'resizable-panels', 'PrismLive-win32-x64', 'PrismLive.exe');
-const snapshotExecutable = path.join(root, 'release', 'snapshots', 'PrismLive-win32-x64', 'PrismLive.exe');
-const persistentExecutable = path.join(root, 'release', 'persistent-clips', 'PrismLive-win32-x64', 'PrismLive.exe');
-const manualExecutable = path.join(root, 'release', 'new-manual-dashboard', 'PrismLive-win32-x64', 'PrismLive.exe');
-const reverseExecutable = path.join(root, 'release', 'reverse-thumbnails', 'PrismLive-win32-x64', 'PrismLive.exe');
-const movExecutable = path.join(root, 'release', 'mov-support', 'PrismLive-win32-x64', 'PrismLive.exe');
-const currentExecutable = existsSync(reverseSmoothExecutable) ? reverseSmoothExecutable : existsSync(smoothExecutable) ? smoothExecutable : existsSync(resizedExecutable) ? resizedExecutable : existsSync(snapshotExecutable) ? snapshotExecutable : existsSync(persistentExecutable) ? persistentExecutable : existsSync(manualExecutable) ? manualExecutable : existsSync(reverseExecutable) ? reverseExecutable : existsSync(movExecutable) ? movExecutable : path.join(root, 'release', 'current', 'PrismLive-win32-x64', 'PrismLive.exe');
-const executable = process.argv[2] ? path.resolve(process.argv[2]) : existsSync(currentExecutable) ? currentExecutable : path.join(root, 'release', 'PrismLive-win32-x64', 'PrismLive.exe');
+const executable = process.argv[2] ? path.resolve(process.argv[2]) : path.join(root, 'release', 'prismvj', 'PrismVJ-win32-x64', 'PrismVJ.exe');
 const packageFolder = path.dirname(executable);
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'prism-package-smoke-'));
 const profile = path.join(temporary, 'profile');

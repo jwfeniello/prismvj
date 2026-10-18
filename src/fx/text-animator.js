@@ -35,7 +35,7 @@ export const TEXT_ANIMATOR = Object.freeze({
   category: 'Text',
   kind: 'canvas',
   params: Object.freeze([
-    Object.freeze({ key: 'text', label: 'Text', type: 'text', default: 'Prism Live', maxLength: 4000 }),
+    Object.freeze({ key: 'text', label: 'Text', type: 'text', default: 'PrismVJ', maxLength: 4000 }),
     pick('font', 'Font', TEXT_FONTS.map(font => font.label)),
     pick('style', 'Style', ['Regular', 'Bold', 'Italic', 'Bold Italic'], 1),
     Object.freeze({ key: 'color', label: 'Color', type: 'color', default: '#ffffff' }),

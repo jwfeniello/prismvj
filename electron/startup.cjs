@@ -19,10 +19,10 @@ async function validateBuiltPage(directory) {
     if (!stat.isFile() || !stat.size || stat.size > 1024 * 1024) throw new Error('invalid entry page');
     html = await fs.readFile(page, 'utf8');
   } catch (error) {
-    throw new Error(`Prism Live's application build is missing or incomplete: ${page}. Finish npm run build before launching. (${error.code || error.message})`);
+    throw new Error(`PrismVJ's application build is missing or incomplete: ${page}. Finish npm run build before launching. (${error.code || error.message})`);
   }
   const references = [...html.matchAll(/<(?:script|link)\b[^>]*\b(?:src|href)\s*=\s*["']([^"']+)["']/gi)].map(match => match[1]);
-  if (!references.some(reference => /\.js(?:[?#]|$)/i.test(reference))) throw new Error(`Prism Live's application build has no compiled JavaScript: ${page}. Run npm run build.`);
+  if (!references.some(reference => /\.js(?:[?#]|$)/i.test(reference))) throw new Error(`PrismVJ's application build has no compiled JavaScript: ${page}. Run npm run build.`);
   for (const reference of references) {
     if (/^(?:data:|https?:\/\/)/i.test(reference)) continue;
     let asset;
@@ -33,7 +33,7 @@ async function validateBuiltPage(directory) {
       const stat = await fs.stat(asset);
       if (!stat.isFile() || !stat.size) throw new Error('empty asset');
     } catch (error) {
-      throw new Error(`Prism Live's application build is incomplete: ${asset}. Finish npm run build before launching. (${error.code || error.message})`);
+      throw new Error(`PrismVJ's application build is incomplete: ${asset}. Finish npm run build before launching. (${error.code || error.message})`);
     }
   }
   return page;

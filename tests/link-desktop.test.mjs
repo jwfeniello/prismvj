@@ -1,5 +1,5 @@
 // Ableton Link in the real app: a separate Link peer (Ableton's library in
-// another process) and Prism Live must share tempo in both directions.
+// another process) and PrismVJ must share tempo in both directions.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
@@ -15,7 +15,7 @@ const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const addon = path.join(root, 'electron', 'native', 'prism_link.node');
 const electronPath = createRequire(import.meta.url)('electron');
 
-test('Link session tempo flows between Prism Live and another peer', { skip: !existsSync(addon), timeout: 120000 }, async () => {
+test('Link session tempo flows between PrismVJ and another peer', { skip: !existsSync(addon), timeout: 120000 }, async () => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'prism-link-'));
   const profile = path.join(temporary, 'profile'), peerScript = path.join(temporary, 'peer.cjs');
   await mkdir(profile, { recursive: true });
@@ -38,7 +38,7 @@ test('Link session tempo flows between Prism Live and another peer', { skip: !ex
     await page.locator('#link').click();
     // Joining adopts the session tempo.
     await page.waitForFunction(() => { const d = window.prismDiagnostics(); return d.link.peers >= 1 && Math.abs(d.project.bpm - 128) < 0.01; }, null, { timeout: 20000 });
-    await expectPeer(() => peerState?.peers >= 1, 'peer sees Prism Live');
+    await expectPeer(() => peerState?.peers >= 1, 'peer sees PrismVJ');
     // Our tempo change reaches the peer.
     await page.locator('#bpm').fill('140'); await page.locator('#bpm').dispatchEvent('input');
     await expectPeer(() => Math.abs((peerState?.tempo || 0) - 140) < 0.01, 'peer adopts 140 BPM');
