@@ -24,9 +24,12 @@ async function finishMove(error) {
   throw error;
 }
 
+const RUNTIME = new Set(['package.json', 'electron', 'dist', 'src', 'node_modules']);
+
 const paths = await packager({
   dir: root, name: 'PrismVJ', platform: 'win32', arch: 'x64', out: path.join(root, out), overwrite: true, tmpdir,
-  ignore: [/^\/release($|\/)/, /^\/\.git/, /^\/tests($|\/)/, /^\/docs($|\/)/, /^\/test-results($|\/)/, /^\/native($|\/)/, /^\/electron\/native($|\/)/],
+  // Ship only what the app loads at runtime; everything else in the folder stays out.
+  ignore: file => !!file && (!RUNTIME.has(file.split('/')[1]) || file === '/electron/native' || file.startsWith('/electron/native/')),
   extraResource: existsSync(link) ? [link] : [],
 }).catch(finishMove);
 console.log(`Wrote new app to: ${path.relative(root, paths[0])}${existsSync(link) ? ' (with Ableton Link)' : ' (Ableton Link not built)'}`);
