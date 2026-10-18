@@ -1,0 +1,30 @@
+import { test, expect } from '@playwright/test';
+
+test('persistent clip covers and restores deck content, and covered clip can be moved', async ({page}) => {
+  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  await page.goto('/');
+  let project=await page.evaluate(()=>prismDiagnostics().project);
+  const layer=project.layers.at(-1),home=project.decks[0],other=project.decks[1];
+  const pin=layer.clips[home.id][0],covered=layer.clips[other.id][0];
+  const row=page.locator(`.layer-row[data-layer="${layer.id}"]`);
+  await row.locator(`[data-slot="0"]`).click({button:'right'});
+  await page.locator('#clip-persistent').check();
+  await page.locator(`[data-deck="${other.id}"]`).click();
+  await expect(row.locator('[data-slot="0"]')).toHaveAttribute('data-clip',pin.id);
+  await expect(row.locator('[data-slot="0"] .covered-clip')).toBeVisible();
+  project=await page.evaluate(()=>prismDiagnostics().project);
+  expect(project.layers.at(-1).clips[other.id][0].id).toBe(covered.id);
+  await page.locator('[data-source="solid"]').dragTo(row.locator('[data-slot="0"]'));
+  project=await page.evaluate(()=>prismDiagnostics().project);
+  expect(project.layers.at(-1).clips[other.id][0].id).toBe(covered.id);
+  await row.locator('[data-slot="0"] .covered-clip').dragTo(row.locator('[data-slot="4"]'));
+  project=await page.evaluate(()=>prismDiagnostics().project);
+  expect(project.layers.at(-1).clips[other.id][0]).toBeNull();
+  expect(project.layers.at(-1).clips[other.id][4].id).toBe(covered.id);
+  await expect(row.locator('[data-slot="0"] .covered-clip')).toHaveCount(0);
+  await row.locator('[data-slot="0"]').click({button:'right'});
+  await page.locator('#clip-persistent').uncheck();
+  await expect(row.locator('[data-slot="0"]')).toHaveClass(/empty-slot/);
+  await expect(row.locator('[data-slot="4"]')).toHaveAttribute('data-clip',covered.id);
+  expect(errors).toEqual([]);
+});
