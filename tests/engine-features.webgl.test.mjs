@@ -174,3 +174,30 @@ test('audio spectrum is available per source and region readback returns output 
   assert.equal(result.spectrum, 64);
   await tab.close();
 });
+
+test('generators keep animating across the clip loop point instead of jumping back', options, async () => {
+  const tab = await page();
+  const result = await tab.evaluate(() => {
+    const p = project(), l = layer('l'); p.layers = [l];
+    const grid = clip('g', '#46d9c4', { source: 'grid', duration: 5 });
+    const at = (voiceId, time, rate, direction = 1) => ({ ...frame(l, grid, time), voiceId, rate, direction });
+    const grab = () => { const data = new Uint8Array(96 * 54 * 4); engine.gl.readPixels(0, 0, 96, 54, engine.gl.RGBA, engine.gl.UNSIGNED_BYTE, data); return data; };
+    // What a restart would look like: the pattern at transport time 0.1 s.
+    engine.render(p, [at('restart', 0.1, 1)], 1);
+    const restarted = grab();
+    // The transport wraps from 4.9 s to 0.1 s; the generator clock continues to 5.1 s.
+    engine.render(p, [at('live', 4.9, 1)], 10);
+    engine.render(p, [at('live', 0.1, 1)], 10.2);
+    const continued = engine.generatorClocks.get('live').time, wrapped = grab();
+    engine.render(p, [at('live', 0.1, 0)], 11);
+    const paused = engine.generatorClocks.get('live').time;
+    engine.render(p, [at('live', 0.1, 1, -1)], 11.5);
+    const reversed = engine.generatorClocks.get('live').time;
+    return { continued, paused, reversed, differs: wrapped.some((value, index) => value !== restarted[index]) };
+  });
+  assert.ok(Math.abs(result.continued - 5.1) < 1e-6, `clock ${result.continued}`);
+  assert.ok(result.differs, 'the wrapped frame must not show the restarted pattern');
+  assert.ok(Math.abs(result.paused - 5.1) < 1e-6, 'a paused clip holds its generator');
+  assert.ok(Math.abs(result.reversed - 4.6) < 1e-6, `reverse runs the clock backwards: ${result.reversed}`);
+  await tab.close();
+});

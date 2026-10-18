@@ -199,6 +199,7 @@ export class LiveEngine {
     this.fxPrograms = new Map();
     this.feedback = new Map();
     this.canvasSources = new Map();
+    this.generatorClocks = new Map();
     this.layerCache = new Map();
     this.cacheRequests = new Set();
     this.analysers = new Map();
@@ -1322,7 +1323,24 @@ export class LiveEngine {
     return next;
   }
 
+  // Generators animate on their own continuous clock. The clip position loops
+  // over the clip duration (used by autopilot), which would snap the pattern
+  // back to its start at every loop. The clock follows the clip's playback
+  // rate and direction, so pause, speed and reverse still apply.
+  _generatorTime(frame, now) {
+    if (!Number.isFinite(frame.rate)) return frame.time;
+    const key = frame.voiceId || frame.clip.id;
+    let clock = this.generatorClocks.get(key);
+    if (!clock) { clock = { time: number(frame.time), last: now }; this.generatorClocks.set(key, clock); }
+    const elapsed = Math.min(1, Math.max(0, now-clock.last));
+    clock.time += elapsed*number(frame.rate)*(number(frame.direction, 1) < 0 ? -1 : 1);
+    clock.last = now;
+    clock.used = this.frameIndex;
+    return clock.time;
+  }
+
   _pruneCanvasSources() {
+    for (const [key, clock] of this.generatorClocks) if (this.frameIndex - clock.used > 300) this.generatorClocks.delete(key);
     for (const [id, source] of this.canvasSources) if (this.frameIndex - source.used > 300) {
       source.instance?.dispose?.();
       if (source.texture && !this.lost) this.gl.deleteTexture(source.texture);
@@ -1346,7 +1364,7 @@ export class LiveEngine {
         if (hasMedia(frame.clip) && (!entry?.ready || entry.failed)) continue;
         // Effect clips process everything beneath them (an adjustment layer).
         const source = frame.clip.kind === 'effect' ? (this.routerBase ? (this._copy(this.routerBase, this.targets[0]), this._fullFrame(this.targets[0])) : null)
-          : this._source(frame.clip, entry, frame.time);
+          : this._source(frame.clip, entry, frame.clip.kind === 'source' && !liveSource(frame.clip) ? this._generatorTime(frame, now) : frame.time);
         if (!source) continue;
         let processed = this._process(source, frame.clip, now);
         if (normalizeDimensions) {
