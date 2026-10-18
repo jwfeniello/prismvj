@@ -8,7 +8,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import converterModule from '../electron/media-converter.cjs';
 
-const { createMediaConverter, discoverExecutable, sourceHasAlpha } = converterModule;
+const { createMediaConverter, discoverExecutable, sourceHasAlpha, gpuVideoCodec } = converterModule;
 const execute = promisify(execFile);
 const hash = buffer => createHash('sha256').update(buffer).digest('hex');
 
@@ -18,6 +18,15 @@ test('MOV alpha metadata includes packed, planar and high bit depth formats', ()
   }
   for (const pix_fmt of ['yuv420p', 'yuv444p10le', 'rgb24', 'gbrp12le']) assert.equal(sourceHasAlpha({ pix_fmt }), false, pix_fmt);
   assert.equal(sourceHasAlpha({ pix_fmt: 'yuv420p', tags: { alpha_mode: '1' } }), true);
+});
+
+test('HAP and DXV streams play from the original file; other codecs are converted', () => {
+  assert.deepEqual(gpuVideoCodec({ codec_name: 'hap', codec_tag_string: 'HapY' }), { codec: 'hap', tag: 'HapY', hasAlpha: false });
+  for (const tag of ['Hap5', 'HapM']) assert.equal(gpuVideoCodec({ codec_name: 'hap', codec_tag_string: tag }).hasAlpha, true);
+  // DXV alpha depends on each frame's texture format, read by the renderer.
+  assert.deepEqual(gpuVideoCodec({ codec_name: 'dxv', codec_tag_string: 'DXD3', pix_fmt: 'rgba' }), { codec: 'dxv', tag: 'DXD3' });
+  for (const codec_name of ['prores', 'qtrle', 'h264']) assert.equal(gpuVideoCodec({ codec_name }), null);
+  assert.equal(gpuVideoCodec(undefined), null);
 });
 
 test('opaque MOV uses H.264/AAC playback copies in both directions', { timeout: 120000 }, async () => {

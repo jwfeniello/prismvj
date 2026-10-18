@@ -4,9 +4,18 @@ import { buildEffectShader, buildSourceShader, bindParams, uniformNames, effectP
 import { effectDefinition, sourceDefinition } from './fx/registry.js';
 import { AudioEffectChain } from './audio-fx.js';
 import { crossfadeGain } from './model.js';
+import { GpuVideoPlayer } from './gpu-video/player.js';
+import { GpuVideoSurface, GPU_VIDEO_FRAGMENT, GPU_VIDEO_UNIFORMS, gpuVideoFormats } from './gpu-video/gl.js';
 
+const withQuery = (url, query) => `${url}${url.includes('?') ? '&' : '?'}${query}`;
 const reverseMediaURL = clip => clip?.kind === 'video' && /\.mov$/i.test(clip.path || '')
-  && /^prism-media:/i.test(clip.url || '') ? `${clip.url}${clip.url.includes('?') ? '&' : '?'}reverse=1` : null;
+  && /^prism-media:/i.test(clip.url || '') ? withQuery(clip.url, 'reverse=1') : null;
+// Desktop registration marks movies whose frames are DXT/BC textures (HAP,
+// DXV) with ?gpu=<codec>. They play from the original file through compressed
+// textures; without S3TC support they use a converted copy (?converted=1).
+const gpuCodec = clip => clip?.kind === 'video' ? /[?&]gpu=(hap|dxv)(?:&|$)/.exec(clip.url || '')?.[1] || null : null;
+// A fallback conversion runs on first request, so allow it to finish.
+const CONVERTED_TIMEOUT = 30 * 60 * 1000;
 
 // GPU compositor. All intermediate textures use premultiplied alpha.
 const VERTEX = `#version 300 es
@@ -256,6 +265,7 @@ export class LiveEngine {
         this._initGL();
         for (const entry of this.media.values()) {
           entry.texture = null;
+          entry.surface = null;
           entry.dirty = true;
           entry.lastUpload = -1;
         }
@@ -428,6 +438,9 @@ export class LiveEngine {
     this.maskProgram = this._program(MASK, ['uImage', 'uMask', 'uAlpha', 'uInvert', 'uLuma']);
     this.channelsProgram = this._program(CHANNELS, ['uImage', 'uChannels']);
     this.parallelCompile = gl.getExtension('KHR_parallel_shader_compile');
+    // Compressed formats for HAP and DXV; their program compiles on first use.
+    this.gpuFormats = gpuVideoFormats(gl);
+    this.gpuVideoProgram = null;
     this.vao = gl.createVertexArray();
     gl.bindVertexArray(this.vao);
     gl.disable(gl.DEPTH_TEST);
@@ -493,16 +506,18 @@ export class LiveEngine {
     if (!clip) return null;
     const mediaId = voiceMediaId(clip.id, voiceId), pairId = auxiliaryId('audio', mediaId), reverseId = auxiliaryId('reverse', mediaId), audioAsset = clip.audio;
     if (!audioAsset) this.remove(pairId);
-    const reversedURL = reverseMediaURL(clip);
+    const reversedURL = this._reverseURL(clip), gpu = this._gpuVideo(clip);
     if (!reversedURL) this.remove(reverseId);
     // Decode both tracks independently. The audio defines the shared timeline;
     // the video's native duration is retained for stretching it onto that clock.
-    const mainAsset = audioAsset ? { ...clip } : clip;
-    const main = liveSource(clip) ? this._prepareCapture(clip, mediaId) : !hasMedia(clip) ? Promise.resolve(null) : this._prepareMedia(mainAsset, mediaId, 'main', clip.id, mediaId);
+    const mainAsset = gpuCodec(clip) && !gpu ? { ...clip, url: this._mediaURL(clip), loadTimeout: CONVERTED_TIMEOUT } : audioAsset ? { ...clip } : clip;
+    const main = liveSource(clip) ? this._prepareCapture(clip, mediaId) : !hasMedia(clip) ? Promise.resolve(null)
+      : gpu ? this._prepareGpu(clip, mediaId) : this._prepareMedia(mainAsset, mediaId, 'main', clip.id, mediaId);
     const paired = audioAsset ? this._prepareMedia({ ...audioAsset, kind: 'audio', name: audioAsset.name || `${clip.name || 'Clip'} audio` }, pairId, 'audio', clip.id, mediaId) : Promise.resolve(null);
     const reversed = reversedURL ? this._prepareMedia({ ...mainAsset, url: reversedURL }, reverseId, 'reverse', clip.id, mediaId) : Promise.resolve(null);
     const [element, audio, reverseElement] = await Promise.all([main, paired, reversed]);
     if (clip.audio !== audioAsset) return element;
+    if (gpu) this._prepareEmbeddedAudio(clip, mediaId);
     if (element && clip.kind !== 'image') element.muted = !!clip.audio || clip.useAudio === false;
     if (reverseElement) reverseElement.muted = !!clip.audio || clip.useAudio === false;
     if (element && clip.kind === 'video' && Number.isFinite(element.duration)) clip.videoDuration = element.duration;
@@ -565,6 +580,53 @@ export class LiveEngine {
   }
 
   removeMask(maskId) { this.remove(auxiliaryId('mask', maskId)); }
+
+  _gpuVideo(clip) { return this.gpuFormats?.dxt1 ? gpuCodec(clip) : null; }
+  _mediaURL(clip) { return gpuCodec(clip) && !this._gpuVideo(clip) ? withQuery(clip.url, 'converted=1') : mediaURL(clip); }
+  _reverseURL(clip) { return this._gpuVideo(clip) ? null : reverseMediaURL(clip); }
+  _entryKind(clip) { return liveSource(clip) ? 'video' : this._gpuVideo(clip) ? 'gpu' : clip.kind; }
+
+  // GPU-decoded movie: frames are fetched and decompressed by workers and
+  // uploaded as compressed textures. Its element mirrors a <video> for callers.
+  _prepareGpu(clip, key) {
+    const url = clip.url, previous = this.media.get(key);
+    if (previous && previous.url === url && previous.kind === 'gpu') { previous.lastUsed = ++this.mediaClock; return previous.promise; }
+    if (previous) this.remove(key);
+    const player = new GpuVideoPlayer(url, { rgtc: !!this.gpuFormats.bc4 });
+    const entry = { id: key, ownerId: clip.id, cacheGroup: key, role: 'main', name: clip.name || 'Media', kind: 'gpu', url, element: player.element, player, surface: null,
+      texture: null, ready: false, failed: false, dirty: true, hasAlpha: clip.hasAlpha === true, alphaKnown: true, lastUpload: -1, lastTarget: null, lastNow: null, gain: 0,
+      active: false, cancel: () => player.dispose(), lastUsed: ++this.mediaClock, wantIndex: 0 };
+    this.media.set(key, entry);
+    this._pruneMedia(key);
+    entry.promise = player.open().then(info => {
+      if (this.disposed || this.media.get(key) !== entry) throw new Error('Media loading cancelled.');
+      entry.ready = true;
+      entry.hasAlpha = info.hasAlpha;
+      entry.cancel = null;
+      this._pruneMedia(key);
+      return player.element;
+    }, failure => {
+      entry.failed = true;
+      this._pruneMedia(entry.id);
+      const error = new Error(`Cannot load ${entry.name}: ${failure.message.replace(/\.$/, '')}.`);
+      if (this.media.get(key) === entry) this._error(`media-${key}`, error.message);
+      throw error;
+    });
+    return entry.promise;
+  }
+
+  // A movie's own soundtrack, extracted once by the desktop host. The reversed
+  // copy plays while the transport runs backwards.
+  _prepareEmbeddedAudio(clip, mediaId) {
+    const forwardId = auxiliaryId('embedded', mediaId), backwardId = auxiliaryId('embedded-reverse', mediaId);
+    const info = this.media.get(mediaId)?.player?.info;
+    if (!info?.hasAudio || clip.audio) { this.remove(forwardId); this.remove(backwardId); return; }
+    const name = `${clip.name || 'Clip'} audio`;
+    for (const [id, query] of [[forwardId, 'audio=1'], [backwardId, 'audio=1&reverse=1']]) {
+      this._prepareMedia({ kind: 'audio', name, url: withQuery(clip.url, query) }, id, 'audio', clip.id, mediaId)
+        .then(element => { element.muted = clip.useAudio === false; }, () => {});
+    }
+  }
 
   async _prepareMedia(clip, key = clip.id, role = 'main', ownerId = clip.id, cacheGroup = key) {
     const url = clip.url || clip.path;
@@ -651,7 +713,7 @@ export class LiveEngine {
         const error = new Error(`Loading ${entry.name} timed out. Check that its file is accessible.`);
         this._error(`media-${entry.id}`, error.message);
         reject(error);
-      }, 20000);
+      }, clip.loadTimeout || 20000);
       entry.cancel = () => { if (!done) { done = true; entry.gifController?.abort(); cleanup(); reject(new Error('Media loading cancelled.')); } };
       element.src = url;
       if (clip.kind !== 'image') element.load();
@@ -720,9 +782,49 @@ export class LiveEngine {
   }
   _draw() { this.gl.drawArrays(this.gl.TRIANGLES, 0, 3); }
 
+  // Uploads the frame chosen by _syncGpu or, while that one is still decoding,
+  // the nearest decoded frame behind it.
+  _uploadGpu(entry) {
+    const player = entry.player;
+    let frame = player.frame(entry.wantIndex);
+    if (!frame) {
+      if (!entry.element.paused && player.presented) player.lateFrame = true;
+      frame = player.closest(entry.wantIndex, entry.direction);
+    }
+    if (player.error && !frame) {
+      entry.failed = true;
+      this._error(`media-${entry.id}`, `Cannot decode ${entry.name}: ${player.error.message}`);
+      return null;
+    }
+    if (!frame) return entry.texture;
+    if (frame !== entry.uploadedFrame || entry.dirty || !entry.texture) {
+      const gl = this.gl, started = performance.now();
+      try {
+        this.gpuVideoProgram ||= this._program(GPU_VIDEO_FRAGMENT, GPU_VIDEO_UNIFORMS);
+        entry.surface ||= new GpuVideoSurface(gl, this.gpuFormats);
+        if (!entry.texture) entry.texture = this._texture();
+        entry.surface.upload(frame);
+        entry.surface.convert(this.gpuVideoProgram, entry.texture, player.info.width, player.info.height);
+      } catch (error) {
+        entry.failed = true;
+        this._error(`texture-${entry.id}`, `Cannot display ${entry.name}: ${error.message}`);
+        return null;
+      }
+      if (player.lateFrame) { player.late++; player.lateFrame = false; }
+      if (frame !== player.presented) player.presentedCount++;
+      player.presented = frame;
+      player.presentedTime = player.info.times[frame.index];
+      player.timing.uploadMs += (performance.now() - started - player.timing.uploadMs) * 0.1;
+      entry.uploadedFrame = frame;
+      entry.dirty = false;
+    }
+    return entry.texture;
+  }
+
   _upload(entry, time = 0) {
     const gl = this.gl;
     if (!entry.ready || entry.failed || entry.kind === 'audio') return null;
+    if (entry.kind === 'gpu') return this._uploadGpu(entry);
     const element = entry.animation?.frameAt(time) || entry.element;
     if (entry.kind === 'video' && element.readyState < 2) return entry.texture;
     if (!entry.texture) { entry.texture = this._texture(); entry.dirty = true; }
@@ -1301,6 +1403,27 @@ export class LiveEngine {
     entry.lastNow = now;
   }
 
+  // Chooses the movie frame for the transport position and keeps the frames
+  // ahead of it, in the playback direction, decoding in the workers.
+  _syncGpu(entry, clip, frame, project, timeScale = 1) {
+    if (!entry.ready || entry.failed) return;
+    const player = entry.player, info = player.info, duration = info.duration;
+    const timelineDuration = number(clip.duration, duration), end = Math.max(0, duration-1e-6);
+    const time = clamp((frame.time ?? number(frame.position)*timelineDuration)*timeScale, 0, end);
+    const rate = Math.abs(number(frame.rate, number(clip.speed, 1)))*timeScale;
+    const moving = !project.paused && !clip.paused && frame.playing !== false && clip.direction !== 0 && rate > 0;
+    const first = player.frameAt(clamp(number(clip.inPoint)*timelineDuration*timeScale, 0, end));
+    const last = player.frameAt(clamp(number(clip.outPoint, 1)*timelineDuration*timeScale-1e-6, 0, end));
+    entry.wantIndex = player.frameAt(time);
+    entry.direction = number(frame.direction, 1) < 0 ? -1 : 1;
+    entry.element.paused = !moving;
+    entry.element.playbackRate = rate;
+    // Frames per 60 Hz render; at high speed only every step-th frame is shown.
+    const step = Math.max(1, Math.floor(rate*info.frameRate/60));
+    player.request(entry.wantIndex, { direction: entry.direction, step, ahead: moving ? 6 : 0,
+      first, last: Math.max(first, last), wrap: (clip.loop || 'loop') === 'loop' });
+  }
+
   render(project, frames = [], now = performance.now()/1000, { beat } = {}) {
     if (this.disposed) return;
     const started = performance.now();
@@ -1330,7 +1453,8 @@ export class LiveEngine {
     for (const frame of frames) if (frame.clip) {
       const key = voiceMediaId(frame.clip.id, frame.sourceLayerId && frame.sourceLayerId !== frame.layer?.id ? frame.voiceId : frame.clip.id);
       this.protectedMedia.add(key);
-      if (reverseMediaURL(frame.clip)) this.protectedMedia.add(auxiliaryId('reverse', key));
+      if (this._reverseURL(frame.clip)) this.protectedMedia.add(auxiliaryId('reverse', key));
+      if (this._gpuVideo(frame.clip)) for (const role of ['embedded', 'embedded-reverse']) this.protectedMedia.add(auxiliaryId(role, key));
       if (frame.clip.audio) this.protectedMedia.add(auxiliaryId('audio', key));
     }
     const byLayer = new Map();
@@ -1345,11 +1469,11 @@ export class LiveEngine {
       let entry = this.media.get(mediaId);
       const reverseId = auxiliaryId('reverse', mediaId);
       let reverseEntry = this.media.get(reverseId);
-      const reversedURL = reverseMediaURL(clip);
+      const reversedURL = this._reverseURL(clip);
       const pairId = auxiliaryId('audio', mediaId);
       let pair = this.media.get(pairId);
       const live = liveSource(clip), media = hasMedia(clip);
-      const mainChanged = media && (!entry || entry.url !== mediaURL(clip) || entry.kind !== (live ? 'video' : clip.kind));
+      const mainChanged = media && (!entry || entry.url !== this._mediaURL(clip) || entry.kind !== this._entryKind(clip));
       const reverseChanged = reversedURL && (!reverseEntry || reverseEntry.url !== reversedURL);
       const pairChanged = clip.audio && (!pair || pair.url !== (clip.audio.url || clip.audio.path));
       if (mainChanged || reverseChanged || pairChanged) {
@@ -1360,7 +1484,23 @@ export class LiveEngine {
       }
       if (!reversedURL && reverseEntry) { this.remove(reverseId); reverseEntry = null; }
       if (!clip.audio && pair) { this.remove(pairId); pair = null; }
-      if (media) {
+      if (media && entry?.kind === 'gpu') {
+        active.add(entry.id);
+        entry.active = true;
+        entry.lastUsed = ++this.mediaClock;
+        const scale = clip.audio && entry.element.duration > 0 ? entry.element.duration/Math.max(0.001, number(clip.duration, 1)) : 1;
+        this._syncGpu(entry, clip, frame, project, scale);
+        // The soundtrack follows the transport like a reverse-capable movie.
+        const forward = this.media.get(auxiliaryId('embedded', mediaId)), backward = this.media.get(auxiliaryId('embedded-reverse', mediaId));
+        const backwards = frame.direction < 0 && !!backward?.ready, track = backwards ? backward : forward;
+        if (track && !clip.audio) {
+          active.add(track.id);
+          track.active = true;
+          track.lastUsed = ++this.mediaClock;
+          track.element.muted = clip.useAudio === false;
+          this._syncMedia(track, clip, frame, project, now, gain, 1, backwards);
+        }
+      } else if (media) {
         const reverse = frame.direction < 0 && !!reverseEntry?.ready;
         const selectedEntry = reverse ? reverseEntry : entry;
         if (selectedEntry) {
@@ -1705,10 +1845,21 @@ export class LiveEngine {
 
   getStats() {
     let dropped = 0;
-    for (const entry of this.media.values()) if (entry.kind === 'video') dropped += entry.element.getVideoPlaybackQuality?.().droppedVideoFrames || 0;
+    const gpuVideo = { clips: 0, fetchMs: 0, decodeMs: 0, uploadMs: 0, late: 0, workers: 0 };
+    for (const entry of this.media.values()) {
+      if (entry.kind === 'video' || entry.kind === 'gpu') dropped += entry.element.getVideoPlaybackQuality?.().droppedVideoFrames || 0;
+      if (entry.kind !== 'gpu' || !entry.player.timing.frames) continue;
+      const timing = entry.player.timing;
+      gpuVideo.clips++;
+      gpuVideo.fetchMs = Math.max(gpuVideo.fetchMs, timing.fetchMs);
+      gpuVideo.decodeMs = Math.max(gpuVideo.decodeMs, timing.decodeMs);
+      gpuVideo.uploadMs = Math.max(gpuVideo.uploadMs, timing.uploadMs);
+      gpuVideo.late += entry.player.late;
+      gpuVideo.workers = entry.player.pool.workers.length;
+    }
     const audio = this._readMeter(this.masterMeter);
     const layerAudio = Object.fromEntries([...this.audioLayers].map(([id, bus]) => [id, this._readMeter(bus.meter)]));
-    return { ...this.stats, droppedFrames: dropped, mediaCount: this.media.size, contextLost: this.lost,
+    return { ...this.stats, droppedFrames: dropped, mediaCount: this.media.size, contextLost: this.lost, gpuVideo,
       audioState: this._audioContext?.state || 'idle', audio, audioPeak: Math.max(...audio.peak), audioRms: Math.max(...audio.rms), layerAudio, mediaCacheLimit: this.maxMedia };
   }
 
@@ -1791,6 +1942,8 @@ export class LiveEngine {
     entry.audioNode?.disconnect();
     entry.gainNode?.disconnect();
     entry.panNode?.disconnect();
+    entry.player?.dispose();
+    entry.surface?.dispose(this.lost);
     if (entry.texture && !this.lost) this.gl.deleteTexture(entry.texture);
     for (const key of [...this.errors]) if (key.endsWith(`-${clipId}`)) this.errors.delete(key);
   }

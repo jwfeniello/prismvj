@@ -1,5 +1,13 @@
 # Implementation status
 
+## 2026-10-18 GPU-native HAP and DXV playback
+
+HAP and DXV3 MOVs no longer get transcoded playback copies. Import runs only ffprobe (about 70 ms) and registers the original file. Worker threads read frames by byte range and undo the HAP Snappy/chunk layer or the DXV LZ/opcode layer. The compositor then uploads the resulting DXT/BC blocks with `compressedTexSubImage2D`. Forward, reverse, speed and scrubbing all pick frames straight from the transport, with decoding running ahead of the playhead in the playback direction. The soundtrack is extracted once to FLAC, forward and reversed. GPUs without S3TC fall back to the converted copy on demand, and `PRISM_GPU_VIDEO=0` forces conversion for every MOV. Details are in [MEDIA.md](MEDIA.md#gpu-decoded-movies).
+
+Measured on an RTX 2060 SUPER (Electron, D3D11) with 1080p Hap Q: about 6–8 ms fetch and 5 ms Snappy/parsing per frame in a worker, and about 0.15 ms of upload and conversion on the render thread. In Node, CPU time per 1080p frame is 0.5–1.7 ms for Hap, 3–4.5 ms for Hap Alpha and 0.6–2.8 ms for Hap Q. Resolume's 720p DXV clips take 1–4 ms. Rendered pixels match FFmpeg's decoding to within DXT rounding: mean error 0.02–0.23, worst case 1–5 levels. DXV DXT1/DXT5 decompression is bit-exact with FFmpeg on the bundled Resolume clips.
+
+Verification: `npm test` 279 passed, `npm run test:ui` 43 passed and `npm run test:desktop` 50 passed, including the new `gpu-video.webgl` and `gpu-video-desktop` suites. One limit remains: DXV high quality (YCG6/YG10) has been checked only with synthetic literal-opcode frames, because no real HQ footage was available and FFmpeg can neither encode it nor convert YCoCg to RGB.
+
 ## 2026-10-18 manual-parity pass
 
 Built on branch `feature/manual-parity` and packaged as `release/manual-parity`, which the launcher now prefers. This pass adds:

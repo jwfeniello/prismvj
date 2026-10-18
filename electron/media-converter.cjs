@@ -18,6 +18,18 @@ function abortError(message = 'Media preparation was cancelled.') {
   return Object.assign(new Error(message), { name: 'AbortError' });
 }
 
+// HAP and DXV store frames as DXT/BC textures the renderer uploads directly,
+// so they need no playback copy. HAP variants are known by codec tag; DXV
+// declares its texture format (and so its alpha) per frame, which the
+// renderer reads when it opens the movie.
+const HAP_ALPHA_TAGS = new Set(['Hap5', 'HapM', 'Hap7']);
+function gpuVideoCodec(stream) {
+  const tag = String(stream?.codec_tag_string || '');
+  if (stream?.codec_name === 'hap') return { codec: 'hap', tag, hasAlpha: HAP_ALPHA_TAGS.has(tag) };
+  if (stream?.codec_name === 'dxv') return { codec: 'dxv', tag };
+  return null;
+}
+
 function sourceHasAlpha(stream) {
   const format = String(stream.pix_fmt || '').toLowerCase();
   return /^(rgba|bgra|argb|abgr|yuva|gbrap|ya\d|ayuv|vuya)/.test(format)
@@ -72,6 +84,8 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
   const thumbnailPending = new Map();
   const sequencePending = new Map();
   const videoThumbnailPending = new Map();
+  const probes = new Map();
+  const audioPending = new Map();
   const thumbnailWaiters = [];
   const thumbnailLimit = Math.max(1, Math.min(4, Math.floor(Number(thumbnailConcurrency)) || 2));
   const children = new Set();
@@ -160,6 +174,63 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
     });
     if (!inspected) throw new Error('Could not inspect DXV transparency.');
     return transparent;
+  }
+
+  // ffprobe output for one revision of a file, kept for the session.
+  async function probeSource(source, knownStat) {
+    checkOpen();
+    const absolute = path.resolve(source);
+    const stat = knownStat || await fs.stat(absolute);
+    const key = cacheKey(absolute, stat);
+    if (!probes.has(key)) {
+      const job = tools().then(({ ffprobe }) => run(ffprobe, ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', absolute], { timeout: THUMBNAIL_TIMEOUT }))
+        .then(output => JSON.parse(output));
+      probes.set(key, job);
+      job.catch(() => probes.delete(key));
+    }
+    return probes.get(key);
+  }
+
+  /**
+   * Describes a movie the renderer decodes on the GPU from the original file
+   * ({ codec: 'hap', tag, hasAlpha, hasAudio }), or null when it needs a
+   * converted playback copy.
+   */
+  async function gpuCodec(source, knownStat) {
+    const probe = await probeSource(source, knownStat);
+    const video = probe.streams?.find(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic);
+    const codec = gpuVideoCodec(video);
+    return codec && { ...codec, hasAudio: !!probe.streams?.some(stream => stream.codec_type === 'audio') };
+  }
+
+  /**
+   * The first audio track of a movie as cached FLAC, reversed when requested,
+   * for movies that play their video from the original file. Runs beside the
+   * conversion queue: it is short, and playback is waiting for it.
+   */
+  async function extractAudio(source, knownStat, { reverse = false } = {}) {
+    checkOpen();
+    const absolute = path.resolve(source);
+    const stat = knownStat || await fs.stat(absolute);
+    const key = cacheKey(absolute, stat);
+    const destination = path.join(cacheDirectory, `${key}.audio${reverse ? '.reverse' : ''}.flac`);
+    const current = await fs.stat(destination).catch(() => null);
+    if (current?.isFile() && current.size > 0) return destination;
+    if (audioPending.has(destination)) return audioPending.get(destination);
+    const job = (async () => {
+      await fs.mkdir(cacheDirectory, { recursive: true });
+      const temporary = path.join(cacheDirectory, `${key}.${randomUUID()}.part.flac`);
+      try {
+        const { ffmpeg } = await tools();
+        await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-n', '-i', absolute, '-map', '0:a:0', '-vn', '-map_metadata', '-1',
+          ...(reverse ? ['-af', 'areverse'] : []), '-c:a', 'flac', '-f', 'flac', temporary], { timeout: 10 * 60 * 1000 });
+        if (!(await fs.stat(temporary)).size) throw new Error('The movie has no decodable audio.');
+        await fs.rename(temporary, destination);
+        return destination;
+      } finally { await fs.unlink(temporary).catch(() => {}); }
+    })();
+    audioPending.set(destination, job);
+    try { return await job; } finally { audioPending.delete(destination); }
   }
 
   async function cached(key) {
@@ -635,10 +706,10 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
     for (const child of children) child.kill();
     for (const entry of sequencePending.values()) entry.controller.abort();
     await Promise.allSettled([...pending.values(), ...[...sequencePending.values()].map(entry => entry.job),
-      ...videoThumbnailPending.values()]);
+      ...videoThumbnailPending.values(), ...audioPending.values()]);
   }
 
-  return { prepare, thumbnail, prepareImageSequence, findImageSequence: detectImageSequence, videoThumbnail, stats, close };
+  return { prepare, thumbnail, prepareImageSequence, findImageSequence: detectImageSequence, videoThumbnail, gpuCodec, extractAudio, stats, close };
 }
 
-module.exports = { createMediaConverter, discoverExecutable, cacheKey, sourceHasAlpha, findImageSequence, imageSequenceFramePath };
+module.exports = { createMediaConverter, discoverExecutable, cacheKey, sourceHasAlpha, gpuVideoCodec, findImageSequence, imageSequenceFramePath };

@@ -14,7 +14,7 @@ This is a live coverage map, not a claim of feature parity. Existing detailed te
 | Output setup, input/output mapping and DMX | 102–139, 246–269 | A second output window, recording, and Output Snapshot work. Advanced slices, warping, edge blending, masks, LED fixture output and DMX remain. |
 | Parameters, animation, dashboard, envelopes | 140–153, 218–224 | Eight assignable dials now appear in each clip, layer and composition inspector. They accept a parameter drag handle or a dropdown, drive the selected numeric parameter, and persist in project files. Multiple parameters per dial, parameter and dial ranges, inversion, timeline/BPM/clip-position animation, audio analysis and envelopes remain. |
 | Shortcuts and external control | 157–216 | Basic keyboard, MIDI learn and a subset of OSC input work. Shortcut editing/presets, MIDI output, DMX input, OSC output, SMPTE and DJ sync remain. |
-| Media preparation and DXV | 228–245 | MOV including DXV/alpha is prepared to cached forward and reverse playback copies with thumbnails. Native DXV GPU decoding and export remain. |
+| Media preparation and DXV | 228–245 | DXV3 and HAP play natively: frames decompress in workers and upload as DXT/BC textures, in both directions, without a playback copy. Other MOVs are prepared to cached forward and reverse playback copies with thumbnails. DXV export remains. |
 
 ## Current manual-driven slice
 

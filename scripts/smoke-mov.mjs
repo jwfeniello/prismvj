@@ -23,7 +23,9 @@ const pageErrors = [];
 let application, page;
 
 async function launch() {
-  const env = { ...process.env, PRISM_HEADLESS: '1', PRISM_TEST_DATA: profile };
+  // These checks cover converted playback copies; DXV/HAP would otherwise play
+  // from the original file on the GPU (tests/gpu-video-desktop.test.mjs).
+  const env = { ...process.env, PRISM_HEADLESS: '1', PRISM_TEST_DATA: profile, PRISM_GPU_VIDEO: '0' };
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.PRISM_DEV_URL;
   application = await electron.launch({ ...(executable ? { executablePath: executable } : {}),
