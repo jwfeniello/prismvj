@@ -166,10 +166,16 @@ async function registerMedia(filePath, { sequence = null } = {}) {
   if (!kind) throw new Error(`Unsupported media extension: ${path.extname(absolute)}`);
   const stat = await fs.stat(absolute);
   if (!stat.isFile()) throw new Error('Media path is not a file.');
-  // DXV, ProRes and other MOV codecs need a browser playback copy. The clip
-  // always keeps the original path for save, reconnect and Show in Explorer.
+  // HAP and DXV play from the original file: the renderer uploads their DXT
+  // frames as GPU textures. ProRes and other MOV codecs need a browser
+  // playback copy. The clip always keeps the original path for save,
+  // reconnect and Show in Explorer.
+  const mov = !fps && path.extname(absolute).toLowerCase() === '.mov';
+  // PRISM_GPU_VIDEO=0 converts every MOV (for troubleshooting and for testing the copies).
+  const gpu = mov && process.env.PRISM_GPU_VIDEO !== '0' ? await converter().gpuCodec(absolute, stat) : null;
+  if (gpu) return registerGpuMovie(absolute, stat, gpu);
   const prepared = fps ? await converter().prepareImageSequence(absolute, { fps })
-    : path.extname(absolute).toLowerCase() === '.mov' ? await converter().prepare(absolute, stat) : null;
+    : mov ? await converter().prepare(absolute, stat) : null;
   const playbackPath = prepared?.playbackPath || absolute;
   // A changed original creates a fresh cache file and URL, leaving any decoder
   // that is still using an older revision undisturbed.
@@ -184,6 +190,29 @@ async function registerMedia(filePath, { sequence = null } = {}) {
   return { name: fps ? path.basename(path.dirname(absolute)) : path.basename(absolute), path: absolute, kind,
     ...(prepared ? { hasAlpha: prepared.hasAlpha } : {}), ...(fps ? { sequenceFps: fps } : {}),
     url: `prism-media://media/${token}/${encodeURIComponent(path.basename(fps ? prepared.playbackPath : absolute))}` };
+}
+
+// The URL carries the codec (?gpu=hap|dxv) and file revision, so a replaced file
+// opens a fresh decoder. Thumbnails, the soundtrack and a converted copy for
+// GPUs without S3TC textures are produced on first request.
+function registerGpuMovie(absolute, stat, gpu) {
+  let token = mediaPaths.get(absolute);
+  if (!token) { token = randomUUID(); mediaPaths.set(absolute, token); }
+  const previous = mediaTokens.get(token);
+  const revision = `${stat.size}-${Math.round(stat.mtimeMs)}`;
+  mediaTokens.set(token, { gpu: gpu.codec, playbackPath: absolute, stat, thumbnailPath: previous?.revision === revision ? previous.thumbnailPath : null, revision });
+  return { name: path.basename(absolute), path: absolute, kind: 'video', ...(gpu.hasAlpha !== undefined ? { hasAlpha: gpu.hasAlpha } : {}),
+    url: `prism-media://media/${token}/${encodeURIComponent(path.basename(absolute))}?gpu=${gpu.codec}&rev=${revision}` };
+}
+
+async function gpuMoviePath(asset, params) {
+  if (params.has('thumbnail')) return asset.thumbnailPath ||= await converter().thumbnail(asset.playbackPath, asset.stat);
+  if (params.has('audio')) return converter().extractAudio(asset.playbackPath, asset.stat, { reverse: params.has('reverse') });
+  if (params.has('converted') || params.has('reverse')) {
+    const prepared = await converter().prepare(asset.playbackPath, asset.stat);
+    return params.has('reverse') ? prepared.reversePath : prepared.playbackPath;
+  }
+  return asset.playbackPath;
 }
 
 // A folder (or a numbered frame) becomes an image-sequence clip.
@@ -840,7 +869,7 @@ app.whenReady().then(async () => {
     try {
       const url = new URL(request.url);
       const asset = url.hostname === 'media' && mediaTokens.get(url.pathname.split('/')[1]);
-      const filePath = typeof asset === 'string' ? asset : url.searchParams.has('reverse') ? asset?.reversePath
+      const filePath = typeof asset === 'string' ? asset : asset?.gpu ? await gpuMoviePath(asset, url.searchParams) : url.searchParams.has('reverse') ? asset?.reversePath
         : url.searchParams.has('thumbnail') ? asset?.thumbnailPath : asset?.playbackPath;
       if (!filePath || !['GET', 'HEAD'].includes(request.method)) return new Response('Not found', { status: 404 });
       const extension = path.extname(filePath).toLowerCase();
