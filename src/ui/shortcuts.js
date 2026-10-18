@@ -85,17 +85,22 @@ export class ShortcutManager {
     return [input.universe, input.dmxChannel];
   }
 
+  // 'selected' shortcuts follow the selected layer/clip (manual p. 152).
+  targetOf(shortcut) {
+    return shortcut.targetMode === 'selected' && this.ctx.retarget ? this.ctx.retarget(shortcut.target) || shortcut.target : shortcut.target;
+  }
+
   // Apply a normalized controller value (0..1). `pressed` distinguishes key/note down/up.
   execute(shortcut, normalized, pressed, inputId) {
     if (shortcut.enabled === false) return;
-    const project = this.ctx.getProject();
+    const project = this.ctx.getProject(), path = this.targetOf(shortcut);
     let value = shortcut.invert ? 1 - normalized : normalized;
-    if (shortcut.target.startsWith('action/')) {
-      if (shortcut.mode === 'momentary' || shortcut.mode === 'trigger' || shortcut.mode === 'toggle') this.ctx.runAction(shortcut.target, pressed, inputId);
-      else if (pressed) this.ctx.runAction(shortcut.target, true, inputId);
+    if (path.startsWith('action/')) {
+      if (shortcut.mode === 'momentary' || shortcut.mode === 'trigger' || shortcut.mode === 'toggle') this.ctx.runAction(path, pressed, inputId);
+      else if (pressed) this.ctx.runAction(path, true, inputId);
       return;
     }
-    const target = resolvePath(project, shortcut.target);
+    const target = resolvePath(project, path);
     if (!target || ['color', 'point', 'text'].includes(target.param.type)) return;
     const current = normalizedValue(target.param, readOwner(target.scope, target.owner, target.key));
     const ranged = v => shortcut.min + (shortcut.max - shortcut.min) * v;
@@ -214,8 +219,9 @@ export class ShortcutManager {
     for (const shortcut of this.list) {
       if (shortcut.source !== 'midi' || !shortcut.feedback || shortcut.input.type === 'pitch') continue;
       let normalized;
-      if (shortcut.target.startsWith('action/')) normalized = this.ctx.actionState?.(shortcut.target) ? 1 : 0;
-      else { const target = resolvePath(project, shortcut.target); if (!target || ['color', 'point', 'text'].includes(target.param.type)) continue; normalized = normalizedValue(target.param, readOwner(target.scope, target.owner, target.key)); }
+      const path = this.targetOf(shortcut);
+      if (path.startsWith('action/')) normalized = this.ctx.actionState?.(path) ? 1 : 0;
+      else { const target = resolvePath(project, path); if (!target || ['color', 'point', 'text'].includes(target.param.type)) continue; normalized = normalizedValue(target.param, readOwner(target.scope, target.owner, target.key)); }
       const byte = Math.round((shortcut.invert ? 1 - normalized : normalized) * 127);
       if (this.feedbackSent.get(shortcut.id) === byte) continue;
       this.feedbackSent.set(shortcut.id, byte);
@@ -235,6 +241,7 @@ export class ShortcutManager {
     const project = this.ctx.getProject(), presets = Object.keys(this.readPresets());
     const rows = this.list.map(shortcut => `<div class="shortcut-row" data-shortcut-id="${esc(shortcut.id)}"><span class="pill">${SOURCE_LABELS[shortcut.source]}</span>
       <span class="shortcut-input" title="${esc(describeInput(shortcut))}">${esc(describeInput(shortcut))}</span><span class="shortcut-target grow" title="${esc(shortcut.target)}">${esc(describePath(project, shortcut.target))}</span>
+      ${/^(layer|clip|group|action\/(clip|layer|group))\//.test(shortcut.target) ? `<select data-shortcut-field="targetMode" aria-label="Target" title="This: always the assigned item. Selected: whatever layer/clip is selected."><option value="fixed" ${shortcut.targetMode !== 'selected' ? 'selected' : ''}>This</option><option value="selected" ${shortcut.targetMode === 'selected' ? 'selected' : ''}>Selected</option></select>` : ''}
       <select data-shortcut-field="mode" aria-label="Mode">${['value', 'toggle', 'momentary', 'trigger', 'set', 'relative'].map(mode => `<option ${mode === shortcut.mode ? 'selected' : ''}>${mode}</option>`).join('')}</select>
       <input type="number" data-shortcut-field="min" min="0" max="1" step="0.01" value="${shortcut.min}" title="Range min" aria-label="Min"><input type="number" data-shortcut-field="max" min="0" max="1" step="0.01" value="${shortcut.max}" title="Range max" aria-label="Max">
       <label title="Invert"><input type="checkbox" data-shortcut-field="invert" ${shortcut.invert ? 'checked' : ''}>Inv</label>${shortcut.source === 'midi' ? `<label title="Send MIDI feedback"><input type="checkbox" data-shortcut-field="feedback" ${shortcut.feedback ? 'checked' : ''}>Out</label>` : ''}

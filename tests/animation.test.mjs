@@ -151,3 +151,31 @@ test('BPM Sync speed steps and Timeline Duration change clip rate independently'
   synced.bpmSpeed = 3;
   assert.equal(validateProject(JSON.parse(JSON.stringify(project))).layers[0].clips[deck][0].bpmSpeed, 1, 'off-grid BPM speeds fall back to 1');
 });
+test('random play mode jumps every interval within the distance, and relative pick-up keeps position', () => {
+  const project = createProject();
+  const deck = project.selectedDeckId, layer = project.layers[0];
+  const clip = layer.clips[deck][0];
+  Object.assign(clip, { duration: 10, loop: 'random', randomInterval: 0.5, randomDistance: 1 });
+  const transport = new Transport(project);
+  transport.trigger(layer.id, clip.id, 0);
+  transport.tick(0);
+  let previous = transport.getState(layer.id).position, jumps = 0;
+  for (let t = 0.1; t <= 5.0001; t += 0.1) {
+    transport.tick(t);
+    const position = transport.getState(layer.id).position;
+    const step = Math.abs(position - previous);
+    // Between jumps it plays at normal speed (0.01 per 0.1 s); jumps stay within 1 s (0.1).
+    if (step > 0.011 && step < 0.9) jumps++;
+    assert.ok(step <= 0.1 + 0.0101 || step >= 0.9, `jump ${step} exceeds distance`);
+    previous = position;
+  }
+  assert.ok(jumps >= 6 && jumps <= 11, `about one jump per 0.5 s, got ${jumps}`);
+
+  const other = layer.clips[deck][1];
+  Object.assign(other, { trigger: 'relative', inPoint: 0.5, outPoint: 1, duration: 10, loop: 'loop' });
+  Object.assign(clip, { loop: 'loop', randomInterval: null });
+  transport.trigger(layer.id, clip.id, 6);
+  transport.seek(layer.id, 0.4);
+  transport.trigger(layer.id, other.id, 6);
+  close(transport.getState(layer.id).position, 0.5 + 0.4 * 0.5);
+});

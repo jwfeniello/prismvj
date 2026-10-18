@@ -153,15 +153,22 @@ function absolutePath(value) {
   return path.resolve(value);
 }
 
-async function registerMedia(filePath) {
+// Image sequences (manual p. 65) play from a prepared video copy; the clip
+// keeps the first frame's path plus its frame rate (`sequenceFps`).
+const SEQUENCE_FPS = 25;
+const sequenceFps = value => Number.isFinite(value) && value > 0 && value <= 240 ? value : null;
+
+async function registerMedia(filePath, { sequence = null } = {}) {
   const absolute = absolutePath(filePath);
-  const kind = MEDIA.get(path.extname(absolute).toLowerCase());
+  const fps = sequenceFps(sequence);
+  const kind = fps ? 'video' : MEDIA.get(path.extname(absolute).toLowerCase());
   if (!kind) throw new Error(`Unsupported media extension: ${path.extname(absolute)}`);
   const stat = await fs.stat(absolute);
   if (!stat.isFile()) throw new Error('Media path is not a file.');
   // DXV, ProRes and other MOV codecs need a browser playback copy. The clip
   // always keeps the original path for save, reconnect and Show in Explorer.
-  const prepared = path.extname(absolute).toLowerCase() === '.mov' ? await converter().prepare(absolute, stat) : null;
+  const prepared = fps ? await converter().prepareImageSequence(absolute, { fps })
+    : path.extname(absolute).toLowerCase() === '.mov' ? await converter().prepare(absolute, stat) : null;
   const playbackPath = prepared?.playbackPath || absolute;
   // A changed original creates a fresh cache file and URL, leaving any decoder
   // that is still using an older revision undisturbed.
@@ -173,9 +180,16 @@ async function registerMedia(filePath) {
   } else if (prepared) {
     mediaTokens.set(token, { playbackPath, reversePath: prepared.reversePath, thumbnailPath: prepared.thumbnailPath });
   }
-  return { name: path.basename(absolute), path: absolute, kind,
-    ...(prepared ? { hasAlpha: prepared.hasAlpha } : {}),
-    url: `prism-media://media/${token}/${encodeURIComponent(path.basename(absolute))}` };
+  return { name: fps ? path.basename(path.dirname(absolute)) : path.basename(absolute), path: absolute, kind,
+    ...(prepared ? { hasAlpha: prepared.hasAlpha } : {}), ...(fps ? { sequenceFps: fps } : {}),
+    url: `prism-media://media/${token}/${encodeURIComponent(path.basename(fps ? prepared.playbackPath : absolute))}` };
+}
+
+// A folder (or a numbered frame) becomes an image-sequence clip.
+async function registerSequence(target, fps = SEQUENCE_FPS) {
+  const sequence = await converter().findImageSequence(absolutePath(target), { probe: false });
+  if (!sequence) throw new Error('No numbered image sequence was found in that folder.');
+  return registerMedia(sequence.firstFile, { sequence: fps });
 }
 
 async function mediaThumbnails(paths) {
@@ -222,7 +236,7 @@ function mediaIdentity(item) {
 }
 
 async function registerComponent(item, replacementPath = item.media.path) {
-  const registered = await registerMedia(replacementPath);
+  const registered = await registerMedia(replacementPath, { sequence: item.media.sequenceFps });
   if (!item.kinds.includes(registered.kind)) throw new Error(`This component needs ${item.kinds.join(' or ')} media.`);
   return registered;
 }
@@ -392,7 +406,10 @@ async function importFiles(paths) {
   if (!Array.isArray(paths) || paths.length > 512) throw new Error('Import at most 512 files at once.');
   const items = [];
   for (const filePath of paths) {
-    try { items.push(await registerMedia(filePath)); }
+    try {
+      const directory = typeof filePath === 'string' && path.isAbsolute(filePath) && (await fs.stat(filePath).catch(() => null))?.isDirectory();
+      items.push(directory ? await registerSequence(filePath) : await registerMedia(filePath));
+    }
     catch (error) { items.push({ name: path.basename(String(filePath)), path: filePath, error: error.message }); }
   }
   return items;
@@ -634,6 +651,15 @@ function setupIPC() {
   });
   handle('prism:import-paths', importFiles);
   handle('prism:media-thumbnails', mediaThumbnails);
+  handle('prism:import-sequence', async (target, fps) => {
+    let folder = typeof target === 'string' && target ? target : null;
+    if (!folder) {
+      const result = await dialog.showOpenDialog(editor, { title: 'Import image sequence (choose its folder)', properties: ['openDirectory'] });
+      if (result.canceled || !result.filePaths[0]) return null;
+      folder = result.filePaths[0];
+    }
+    return registerSequence(folder, sequenceFps(fps) || SEQUENCE_FPS);
+  });
   handle('prism:media-roots', browseRoots);
   handle('prism:media-directory', browseDirectory);
   handle('prism:media-choose-directory', chooseMediaDirectory);

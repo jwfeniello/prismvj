@@ -14,7 +14,7 @@
 .param-cog.animated{color:var(--accent);text-shadow:0 0 6px rgba(132,255,212,.6)}
 .field{position:relative}
 .field>.param-cog{position:absolute;right:0;top:50%;transform:translateY(-50%)}
-.field:has(>.param-cog) input[type=range]{width:calc(100% - 20px)}
+.field.has-cog input[type=range]{width:calc(100% - 20px)}
 .field.animated input[type=range]::-webkit-slider-thumb{background:var(--accent)}
 .effect-stack .effect-drop{min-height:28px;border:1px dashed transparent;padding:1px}
 .effect-stack .effect-drop.drag-over,.layer-head.drag-over{border-color:var(--accent);background:rgba(132,255,212,.06)}
@@ -61,7 +61,7 @@
 .shortcut-row input[type=number]{width:46px}
 .shortcut-row label{display:flex;align-items:center;font-size:10px;color:#a0a0a0}
 .row.wrap{flex-wrap:wrap}
-html[data-shortcut-edit] :is([data-param-path],[data-prop],[data-layer-prop],[data-action],[data-group-prop],[data-group-action],[data-fx-bypass],[data-clip],[data-column],[data-deck],#master-opacity,#master-volume,#crossfader,#global-speed,#bpm,#pause,#blackout,#bypass-all,#tap,#clear-all,#cross-a,#cross-b,#resync){outline:2px solid #3f8cff!important;outline-offset:-2px;box-shadow:inset 0 0 0 999px rgba(63,140,255,.12)}
+html[data-shortcut-edit] :is([data-param-path],[data-prop],[data-layer-prop],[data-action],[data-group-prop],[data-group-action],[data-fx-bypass],[data-clip],[data-column],[data-deck],#master-opacity,#master-volume,#crossfader,#global-speed,#bpm,#pause,#blackout,#bypass-all,#tap,#clear-all,#cross-a,#cross-b,#resync,#previous-column,#next-column){outline:2px solid #3f8cff!important;outline-offset:-2px;box-shadow:inset 0 0 0 999px rgba(63,140,255,.12)}
 html[data-shortcut-edit] .shortcut-selected{outline-color:#ffcf40!important;box-shadow:inset 0 0 0 999px rgba(255,207,64,.2)!important}
 html[data-shortcut-edit] .statusbar{background:#1d3d74}
 .output-overlay{position:fixed;inset:0;z-index:900;background:#161616}
@@ -112,4 +112,8 @@ html[data-shortcut-edit] .statusbar{background:#1d3d74}
 .submenu-arrow{margin-left:auto;color:#9a9a9a}
 .transport-section .transport-row>.anim-label{min-width:77px;text-align:right;padding-right:4px}
 .transport-section .transport-row{padding:1px 0}input[type=range].below-full::-webkit-slider-thumb{background:#ff4d4d}
-input[type=range].below-full{box-shadow:inset 0 0 0 1px rgba(255,77,77,.55)}
+input[type=range].below-full{box-shadow:inset 0 0 0 1px rgba(255,77,77,.55)}/* Panels are rebuilt often; containment keeps their layout from spilling
+   into the rest of the workspace (and vice versa). */
+.inspector-content,.browser-content{contain:content}
+.layer-bank{contain:layout paint style}.timecode-field{width:96px;font-family:Consolas,'Courier New',monospace;text-align:center}
+#timecode-status{font-family:Consolas,'Courier New',monospace;color:var(--accent)}

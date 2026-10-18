@@ -1,6 +1,7 @@
 // Advanced Output editor (Resolume-style screen setup): screens/slices list,
 // Input Selection and Output Transformation stages with direct manipulation,
 // a properties panel, presets, import/export and undo.
+import { evaluateExpression } from '../expression.js';
 import { normalizeOutputConfig, createScreen, createSlice, createPolygonSlice, createMask, duplicateSlice, shapePoints, rectCorners, boundsOf, identityWarpPoints, uid, OUTPUT_LIMITS } from './output-model.js';
 import { quadHomography, applyHomography, invertHomography, createWarpEvaluator, sliceOutputOutline, sliceInputOutline, pointInPolygon, polygonBounds, flattenPath, snapValue, isSimplePolygon } from './geometry.js';
 import { OutputMapper } from './mapper.js';
@@ -15,25 +16,7 @@ const rotate = (p, a) => ({ x: p.x * Math.cos(a) - p.y * Math.sin(a), y: p.x * M
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
 // Numeric fields accept arithmetic ("1920/3") or a trailing operation ("/3").
-export function evaluateExpression(text, current = 0) {
-  let s = String(text).trim();
-  if (/^[*/+]/.test(s)) s = `${current}${s}`;
-  if (!s || !/^[-+*/().\d\seE]+$/.test(s)) return NaN;
-  let i = 0;
-  const skip = () => { while (s[i] === ' ') i++; };
-  const atom = () => {
-    skip();
-    if (s[i] === '(') { i++; const v = sum(); skip(); if (s[i++] !== ')') throw new Error('paren'); return v; }
-    if (s[i] === '-') { i++; return -atom(); }
-    if (s[i] === '+') { i++; return atom(); }
-    const m = /^(\d+\.?\d*|\.\d+)(e[-+]?\d+)?/i.exec(s.slice(i));
-    if (!m) throw new Error('number');
-    i += m[0].length; return Number(m[0]);
-  };
-  const product = () => { let v = atom(); for (;;) { skip(); const op = s[i]; if (op !== '*' && op !== '/') return v; i++; const r = atom(); v = op === '*' ? v * r : v / r; } };
-  const sum = () => { let v = product(); for (;;) { skip(); const op = s[i]; if (op !== '+' && op !== '-') return v; i++; const r = product(); v = op === '+' ? v + r : v - r; } };
-  try { const v = sum(); skip(); return i === s.length && Number.isFinite(v) ? v : NaN; } catch { return NaN; }
-}
+export { evaluateExpression };
 
 const getPath = (object, path) => path.split('.').reduce((value, key) => value?.[key], object);
 const setPath = (object, path, value) => {
@@ -59,7 +42,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   let screenId = config.screens[0].id;
   let selected = new Set(config.screens[0].slices[0] ? [config.screens[0].slices[0].id] : []);
   let tab = 'input', mode = 'transform', snapping = true, zoom = 1, pan = { x: 0, y: 0 };
-  let drag = null, drawing = null, activePoint = null, spaceHeld = false, renaming = null, closed = false, raf = 0, menu = null;
+  let drag = null, drawing = null, activePoint = null, spaceHeld = false, renaming = null, closed = false, raf = 0, menu = null, listDrag = null;
   let compCanvas = compositionCanvas || null;
   const options = { testCard: false, identify: false, showFPS: false, showInfo: false, ...initialOptions };
   const undoStack = [], redoStack = [];
@@ -273,6 +256,43 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     const [screen] = config.screens.splice(index, 1); config.screens.splice(to, 0, screen);
     changed(true);
   }
+  // List drag and drop. Screens reorder among screens; a slice or mask lands before/after a
+  // row of its own kind (possibly on another screen), or at the top of a screen it is dropped on.
+  function reorder(source, target, after) {
+    if (source.kind === 'screen') {
+      const from = config.screens.findIndex(s => s.id === source.id);
+      const rest = config.screens.filter(s => s.id !== source.id), at = rest.findIndex(s => s.id === target.id);
+      if (target.kind !== 'screen' || from < 0 || at < 0 || at + (after ? 1 : 0) === from) return false;
+      checkpoint();
+      rest.splice(at + (after ? 1 : 0), 0, config.screens[from]);
+      config.screens = rest;
+      changed(true); return true;
+    }
+    const found = find(source.id);
+    if (!found) return false;
+    let screen, index;
+    if (target.kind === 'screen') { screen = config.screens.find(s => s.id === target.id); index = 0; }
+    else {
+      const other = find(target.id);
+      if (!other) return false;
+      screen = other.screen;
+      index = other.kind === found.kind ? other.index + (after ? 1 : 0) : found.kind === 'slice' ? 0 : screen.masks.length;
+    }
+    if (!screen) return false;
+    const key = found.kind === 'slice' ? 'slices' : 'masks', from = found.screen[key], to = screen[key];
+    if (from !== to) {
+      if (found.kind === 'slice' && from.length <= 1) { hint.textContent = 'A screen always keeps at least one slice.'; return false; }
+      if (to.length >= OUTPUT_LIMITS[key]) { hint.textContent = `A screen is limited to ${OUTPUT_LIMITS[key]} ${key}.`; return false; }
+    } else {
+      if (index > found.index) index--;
+      if (index === found.index) return false;
+    }
+    checkpoint();
+    from.splice(found.index, 1); to.splice(index, 0, found.item);
+    screenId = screen.id;
+    changed(true); return true;
+  }
+
   // Slices can move between screens, but a screen always keeps one slice.
   function moveToScreen(id, targetId) {
     const found = find(id), target = config.screens.find(s => s.id === targetId);
@@ -323,6 +343,14 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     slice.output.corners = rectCorners(slice.input.rect).map(p => ({ x: p.x * fx, y: p.y * fy }));
     const w = slice.output.warp;
     slice.output.warp = { mode: w.mode, cols: w.cols, rows: w.rows, points: identityWarpPoints(w.cols, w.rows) };
+  }
+  // toInput: output := input ("Match output to input"); otherwise input := output.
+  function matchSelection(toInput) {
+    const slices = selectedItems().filter(f => f.kind === 'slice');
+    if (!slices.length) return;
+    checkpoint();
+    for (const { item, screen } of slices) (toInput ? matchInputShape : matchOutputShape)(item, screen);
+    changed(true);
   }
   // Re-sample an existing warp onto a new grid so the current shape is kept.
   function resizeWarp(slice, cols, rows) {
@@ -398,6 +426,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     tab = next === 'output' ? 'output' : 'input';
     activePoint = null; drawing = null;
     syncToolbar();
+    if (selected.size > 1) renderProps();
   }
   function startDrawing() {
     drawing = { points: [] };
@@ -448,10 +477,15 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     if (tab === 'output') return [slice.type === 'polygon' ? slice.output.points : slice.output.corners];
     return slice.type === 'polygon' ? [slice.input.points, ...(slice.mask.enabled ? [slice.mask.points] : [])] : (slice.mask.enabled ? [slice.mask.points] : []);
   }
-  function applyAffine(found, snapshot, f0, f1) {
+  // Maps frame f0 onto frame f1 (scale in f0's rotated axes, then f1's rotation).
+  function affine(f0, f1) {
     const sx = f0.w > 1e-9 ? f1.w / f0.w : 1, sy = f0.h > 1e-9 ? f1.h / f0.h : 1;
     const linear = v => { const a = rotate(v, -f0.rot); return rotate({ x: a.x * sx, y: a.y * sy }, f1.rot); };
-    const map = p => { const d = linear({ x: p.x - f0.cx, y: p.y - f0.cy }); return { x: f1.cx + d.x, y: f1.cy + d.y }; };
+    return { linear, map: p => { const d = linear({ x: p.x - f0.cx, y: p.y - f0.cy }); return { x: f1.cx + d.x, y: f1.cy + d.y }; } };
+  }
+  // `group`: f0/f1 are the selection frame, so rect slices derive their own rect and rotation from the mapped axes.
+  function applyAffine(found, snapshot, f0, f1, group = false) {
+    const { linear, map } = affine(f0, f1);
     const live = pointSets(found), snap = pointSets(snapshot);
     live.forEach((points, s) => points.forEach((p, i) => {
       const q = map(snap[s][i]); p.x = q.x; p.y = q.y;
@@ -459,12 +493,34 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     }));
     if (found.kind === 'slice') {
       const slice = found.item;
-      if (tab === 'input' && slice.type !== 'polygon') {
+      if (tab === 'input' && slice.type !== 'polygon' && group) {
+        const r = snapshot.item.input.rect, deg = snapshot.item.input.rotation || 0, rot = deg * Math.PI / 180;
+        const c = map({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
+        const ex = linear(rotate({ x: r.width, y: 0 }, rot)), ey = linear(rotate({ x: 0, y: r.height }, rot));
+        const w = Math.max(1, Math.hypot(ex.x, ex.y)), h = Math.max(1, Math.hypot(ey.x, ey.y));
+        let turn = (Math.atan2(ex.y, ex.x) - rot) * 180 / Math.PI;
+        turn -= Math.round(turn / 360) * 360;
+        slice.input.rect = { x: c.x - w / 2, y: c.y - h / 2, width: w, height: h };
+        slice.input.rotation = round(deg + turn, 4) || 0;
+      } else if (tab === 'input' && slice.type !== 'polygon') {
         slice.input.rect = { x: f1.cx - f1.w / 2, y: f1.cy - f1.h / 2, width: Math.max(1, f1.w), height: Math.max(1, f1.h) };
         slice.input.rotation = round(f1.rot * 180 / Math.PI, 4);
       }
       if (slice.type === 'polygon') { slice.input.rect = boundsOf(slice.input.points); slice.output.corners = rectCorners(boundsOf(slice.output.points)); }
     }
+  }
+
+  // Multi-selection: the items transformable on the current stage and their shared bounding box.
+  const groupItems = () => selectedItems().filter(f => f.screen.id === currentScreen().id && (tab === 'output' || f.kind === 'slice'));
+  function groupFrame(items) {
+    const b = polygonBounds(items.flatMap(outlineOf));
+    return { cx: b.x + b.width / 2, cy: b.y + b.height / 2, w: b.width, h: b.height, rot: 0 };
+  }
+  function transformGroup(items, f0, f1) { for (const found of items) applyAffine(found, { ...found, item: clone(found.item) }, f0, f1, true); }
+  function transformDrag(f1) {
+    drag.current = f1;
+    if (drag.members) for (const m of drag.members) applyAffine(m.found, { ...m.found, item: m.snapshot }, drag.frame, f1, true);
+    else applyAffine(drag.found, { ...drag.found, item: drag.snapshot }, drag.frame, f1);
   }
 
   function snapTargets(v, excludeIds) {
@@ -558,12 +614,19 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     const r = 8 / v.scale;
     const handles = pointHandles();
     for (let i = handles.length - 1; i >= 0; i--) if (dist(handles[i], p) <= r * (handles[i].big ? 1.4 : 1)) return { type: 'point', handle: handles[i] };
-    const found = primary();
-    if (mode !== 'transform' || selected.size !== 1 || !found || found.screen.id !== currentScreen().id) return null;
-    if (tab === 'input' && found.kind === 'mask') return null;
-    const f = frameOf(found);
-    if (dist(rotateHandle(f, v.scale), p) <= r) return { type: 'rotate', frame: f };
-    for (let k = 0; k < 4; k++) if (dist(frameCorner(f, CORNER_SIGNS[k]), p) <= r) return { type: 'scale', frame: f, corner: k };
+    if (mode !== 'transform') return null;
+    let f, group = null;
+    if (selected.size > 1) {
+      group = groupItems();
+      if (!group.length) return null;
+      f = groupFrame(group);
+    } else {
+      const found = primary();
+      if (!found || found.screen.id !== currentScreen().id || (tab === 'input' && found.kind === 'mask')) return null;
+      f = frameOf(found);
+    }
+    if (dist(rotateHandle(f, v.scale), p) <= r) return { type: 'rotate', frame: f, group };
+    for (let k = 0; k < 4; k++) if (dist(frameCorner(f, CORNER_SIGNS[k]), p) <= r) return { type: 'scale', frame: f, corner: k, group };
     return null;
   }
   function stageItems() {
@@ -593,7 +656,8 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     if (hit) {
       const found = primary();
       if (hit.type === 'point') activePoint = hit.handle;
-      drag = { ...hit, start: p, found, snapshot: clone(found.item), moved: false, mirror: !event.altKey };
+      drag = { ...hit, start: p, found, snapshot: clone(found.item), moved: false, mirror: !event.altKey,
+        members: hit.group?.map(f => ({ found: f, snapshot: clone(f.item) })) };
       return;
     }
     const item = hitItem(p);
@@ -634,12 +698,12 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       let w = Math.max(1, d.x * sign[0]), h = Math.max(1, d.y * sign[1]);
       if (event.shiftKey && f.w > 0 && f.h > 0) { const s = Math.max(w / f.w, h / f.h); w = f.w * s; h = f.h * s; }
       const c = rotate({ x: sign[0] * w / 2, y: sign[1] * h / 2 }, f.rot);
-      applyAffine(drag.found, { ...drag.found, item: drag.snapshot }, f, { cx: fixed.x + c.x, cy: fixed.y + c.y, w, h, rot: f.rot });
+      transformDrag({ cx: fixed.x + c.x, cy: fixed.y + c.y, w, h, rot: f.rot });
     } else if (drag.type === 'rotate') {
       const f = drag.frame, a0 = Math.atan2(drag.start.y - f.cy, drag.start.x - f.cx), a = Math.atan2(p.y - f.cy, p.x - f.cx);
       let rot = f.rot + a - a0;
       if (event.shiftKey) rot = Math.round(rot / (Math.PI / 12)) * (Math.PI / 12);
-      applyAffine(drag.found, { ...drag.found, item: drag.snapshot }, f, { ...f, rot });
+      transformDrag({ ...f, rot });
     } else if (drag.type === 'point') {
       let q = p;
       if (useSnap && !drag.handle.handle) {
@@ -769,20 +833,21 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       ctx.fillText(found.item.name, label.x + 4, label.y + 3);
       ctx.globalAlpha = 1;
     }
+    const drawFrame = (f, handles, dashed) => {
+      const corners = [0, 1, 2, 3].map(k => frameCorner(f, CORNER_SIGNS[k]));
+      ctx.strokeStyle = '#84ffd4'; ctx.lineWidth = 1; ctx.setLineDash(dashed ? [4, 3] : []); path(corners); ctx.stroke(); ctx.setLineDash([]);
+      if (!handles) return;
+      const top = toStage(v, { x: (corners[0].x + corners[1].x) / 2, y: (corners[0].y + corners[1].y) / 2 }), rh = toStage(v, rotateHandle(f, s));
+      ctx.beginPath(); ctx.moveTo(top.x, top.y); ctx.lineTo(rh.x, rh.y); ctx.stroke();
+      ctx.fillStyle = '#84ffd4'; ctx.beginPath(); ctx.arc(rh.x, rh.y, 5, 0, Math.PI * 2); ctx.fill();
+      for (const c of corners) { const q = toStage(v, c); ctx.fillStyle = '#112e24'; ctx.fillRect(q.x - 5, q.y - 5, 10, 10); ctx.strokeStyle = '#84ffd4'; ctx.strokeRect(q.x - 5, q.y - 5, 10, 10); }
+    };
     const found = primary();
-    if (found && found.screen.id === screen.id && !(tab === 'input' && found.kind === 'mask')) {
-      if (mode === 'transform' && selected.size === 1) {
-        const f = frameOf(found), corners = [0, 1, 2, 3].map(k => frameCorner(f, CORNER_SIGNS[k]));
-        ctx.strokeStyle = '#84ffd4'; ctx.lineWidth = 1; path(corners); ctx.stroke();
-        const top = toStage(v, { x: (corners[0].x + corners[1].x) / 2, y: (corners[0].y + corners[1].y) / 2 }), rh = toStage(v, rotateHandle(f, s));
-        ctx.beginPath(); ctx.moveTo(top.x, top.y); ctx.lineTo(rh.x, rh.y); ctx.stroke();
-        ctx.fillStyle = '#84ffd4'; ctx.beginPath(); ctx.arc(rh.x, rh.y, 5, 0, Math.PI * 2); ctx.fill();
-        for (const c of corners) { const q = toStage(v, c); ctx.fillStyle = '#112e24'; ctx.fillRect(q.x - 5, q.y - 5, 10, 10); ctx.strokeStyle = '#84ffd4'; ctx.strokeRect(q.x - 5, q.y - 5, 10, 10); }
-      } else if (selected.size > 1) {
-        const b = polygonBounds(selectedItems().filter(x => x.screen.id === screen.id && (tab === 'output' || x.kind === 'slice')).flatMap(outlineOf));
-        ctx.setLineDash([4, 3]); ctx.strokeStyle = '#84ffd4'; ctx.strokeRect(v.ox + b.x * s, v.oy + b.y * s, b.width * s, b.height * s); ctx.setLineDash([]);
-      }
-    }
+    if (selected.size > 1) {
+      // The selection frame follows the gesture (it stays rotated while dragging the rotate handle).
+      const items = groupItems();
+      if (items.length) drawFrame(drag?.members && drag.current ? drag.current : groupFrame(items), mode === 'transform', true);
+    } else if (mode === 'transform' && found && found.screen.id === screen.id && !(tab === 'input' && found.kind === 'mask')) drawFrame(frameOf(found), true, false);
     for (const h of pointHandles()) {
       const q = toStage(v, h), active = activePoint && activePoint.kind === h.kind && activePoint.index === h.index && activePoint.handle === h.handle;
       if (h.handle) { const a = toStage(v, h.anchor); ctx.strokeStyle = '#c9a8ff'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(q.x, q.y); ctx.stroke(); }
@@ -837,6 +902,8 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     input.addEventListener('keydown', event => { event.stopPropagation(); if (event.key === 'Enter') finish(true); if (event.key === 'Escape') finish(false); });
     input.addEventListener('blur', () => finish(true));
     input.addEventListener('click', event => event.stopPropagation());
+    const row = nameNode.closest('.ao-row');
+    if (row) row.draggable = false; // text selection inside the field must not start a row drag
     nameNode.replaceWith(input); input.focus(); input.select();
   }
   function openMenu(x, y, entries) {
@@ -873,20 +940,52 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       { label: 'Duplicate', run: duplicateSelection }, { label: 'Delete', run: deleteSelection },
       { label: 'Move up', run: () => moveItem(found.item.id, -1) }, { label: 'Move down', run: () => moveItem(found.item.id, 1) },
       ...(slice ? ['-',
-        { label: 'Match output shape', run: act(() => matchOutputShape(slice, found.screen)) },
-        { label: 'Match input shape (reset output)', run: act(() => matchInputShape(slice, found.screen)) },
+        { label: selected.size > 1 ? 'Match input to output' : 'Match output shape', run: () => matchSelection(false) },
+        { label: selected.size > 1 ? 'Match output to input' : 'Match input shape (reset output)', run: () => matchSelection(true) },
         { label: 'Fill composition', disabled: slice.type === 'polygon', run: act(() => { slice.input.rect = { x: 0, y: 0, width: comp.compositionWidth, height: comp.compositionHeight }; slice.input.rotation = 0; }) },
         { label: 'Mirror across x-axis', run: act(() => mirror(slice, found.screen)) }] : []),
       ...config.screens.filter(s => s !== found.screen).map(s => ({ label: `Move to ${s.name}`, run: () => moveToScreen(found.item.id, s.id) })),
     ]);
   }
+  const DROP_CLASSES = ['ao-drop-before', 'ao-drop-after', 'ao-drop-into'];
+  const clearDropMarks = () => { for (const row of tree.querySelectorAll('.ao-drop-before,.ao-drop-after,.ao-drop-into,.ao-dragging')) row.classList.remove(...DROP_CLASSES, 'ao-dragging'); };
+  function dropPlace(event, kind, id) {
+    if (!listDrag || listDrag.id === id || (listDrag.kind === 'screen' && kind !== 'screen')) return null;
+    if (kind === 'screen' && listDrag.kind !== 'screen') return 'into';
+    const r = event.currentTarget.getBoundingClientRect();
+    return event.clientY > r.top + r.height / 2 ? 'after' : 'before';
+  }
+  // Drag-and-drop handlers for one list row (in addition to the up/down buttons).
+  const dragProps = (kind, id) => ({
+    draggable: true,
+    ondragstart: event => {
+      listDrag = { kind, id };
+      try { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', id); } catch { /* synthetic events may lack a data transfer */ }
+      event.currentTarget.classList.add('ao-dragging');
+    },
+    ondragover: event => {
+      const place = dropPlace(event, kind, id);
+      if (!place) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      if (!event.currentTarget.classList.contains(`ao-drop-${place}`)) { event.currentTarget.classList.remove(...DROP_CLASSES); event.currentTarget.classList.add(`ao-drop-${place}`); }
+    },
+    ondragleave: event => event.currentTarget.classList.remove(...DROP_CLASSES),
+    ondrop: event => {
+      const place = dropPlace(event, kind, id), source = listDrag;
+      event.preventDefault();
+      listDrag = null; clearDropMarks();
+      if (place) reorder(source, { kind, id }, place === 'after');
+    },
+    ondragend: () => { listDrag = null; clearDropMarks(); },
+  });
   function renderTree() {
     if (renaming) return;
     const rows = [];
     config.screens.forEach(screen => {
       const isCurrent = screen.id === currentScreen().id;
       const nameNode = el('span', { class: 'ao-name' }, screen.name, el('small', {}, deviceLabel(screen)));
-      rows.push(el('div', { class: `ao-row ao-screen-row${isCurrent ? ' ao-current' : ''}${isCurrent && !selected.size ? ' ao-selected' : ''}`, dataset: { screen: screen.id },
+      rows.push(el('div', { class: `ao-row ao-screen-row${isCurrent ? ' ao-current' : ''}${isCurrent && !selected.size ? ' ao-selected' : ''}`, dataset: { screen: screen.id }, ...dragProps('screen', screen.id),
         onclick: () => selectScreen(screen.id), oncontextmenu: event => screenMenu(event, screen), ondblclick: () => startRename(screen, nameNode) },
       el('input', { type: 'checkbox', checked: screen.enabled, title: 'Enable output', onclick: event => event.stopPropagation(), onchange: event => { checkpoint(); screen.enabled = event.target.checked; changed(true); } }),
       el('button', { class: 'ao-fold', title: screen.folded ? 'Unfold' : 'Fold', onclick: event => { event.stopPropagation(); screen.folded = !screen.folded; changed(true); } }, screen.folded ? '▸' : '▾'),
@@ -894,7 +993,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       if (screen.folded) return;
       const itemRow = (item, kind) => {
         const nameText = el('span', { class: 'ao-name' }, item.name);
-        return el('div', { class: `ao-row ${kind === 'mask' ? 'ao-mask-row' : 'ao-item-row'}${selected.has(item.id) ? ' ao-selected' : ''}`, dataset: { item: item.id },
+        return el('div', { class: `ao-row ${kind === 'mask' ? 'ao-mask-row' : 'ao-item-row'}${selected.has(item.id) ? ' ao-selected' : ''}`, dataset: { item: item.id }, ...dragProps(kind, item.id),
           onclick: event => select([item.id], { additive: event.shiftKey || event.ctrlKey || event.metaKey }),
           oncontextmenu: event => { const found = find(item.id); if (found) itemMenu(event, found); }, ondblclick: () => startRename(item, nameText) },
         el('input', { type: 'checkbox', checked: item.enabled, title: 'Enabled', onclick: event => event.stopPropagation(), onchange: event => { checkpoint(); item.enabled = event.target.checked; changed(true); } }),
@@ -1061,13 +1160,47 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     panels.push(section('Actions', el('div', { class: 'ao-actions' }, el('button', { onclick: duplicateSelection }, 'Duplicate'), el('button', { class: 'ao-danger', onclick: deleteSelection }, 'Delete'))));
     return panels;
   }
+  // Multi-selection: X/Y/W/H edit the selection's bounding box on the current stage;
+  // Rotate turns the whole selection around its centre by the typed angle.
+  function selectionPanel() {
+    const read = (f, key) => key === 'x' ? f.cx - f.w / 2 : key === 'y' ? f.cy - f.h / 2 : key === 'width' ? f.w : key === 'height' ? f.h : 0;
+    const boxInput = key => {
+      const input = el('input', { type: 'text', inputMode: 'decimal', dataset: { path: `selection.${key}` }, title: key === 'rotation' ? 'Rotate the selection around its centre (degrees)' : undefined });
+      const value = () => { const items = groupItems(); return items.length ? String(round(read(groupFrame(items), key), 2)) : ''; };
+      input.syncValue = () => { if (doc.activeElement !== input) input.value = value(); };
+      input.addEventListener('change', () => {
+        const items = groupItems();
+        if (!items.length) { input.syncValue(); return; }
+        const f0 = groupFrame(items), next = evaluateExpression(input.value, read(f0, key));
+        if (!Number.isFinite(next)) { input.syncValue(); return; }
+        const f1 = { ...f0 };
+        if (key === 'x') f1.cx = next + f0.w / 2;
+        else if (key === 'y') f1.cy = next + f0.h / 2;
+        else if (key === 'width') { f1.w = Math.max(1, next); f1.cx = f0.cx - f0.w / 2 + f1.w / 2; }
+        else if (key === 'height') { f1.h = Math.max(1, next); f1.cy = f0.cy - f0.h / 2 + f1.h / 2; }
+        else f1.rot = clamp(next, -36000, 36000) * Math.PI / 180;
+        checkpoint(); transformGroup(items, f0, f1); changed(false);
+        input.value = value();
+      });
+      blurOnEnter(input); input.syncValue();
+      return input;
+    };
+    const slices = selectedItems().filter(f => f.kind === 'slice').length;
+    return section(`Selection · ${selected.size} items · ${tab === 'input' ? 'Input' : 'Output'}`,
+      field('Position', el('div', { class: 'ao-pair' }, boxInput('x'), boxInput('y'))),
+      field('Size', el('div', { class: 'ao-pair' }, boxInput('width'), boxInput('height'))),
+      field('Rotate', boxInput('rotation')),
+      slices ? el('div', { class: 'ao-actions' },
+        el('button', { dataset: { action: 'match-output-to-input' }, title: 'Reset each selected slice\'s output to its input selection', onclick: () => matchSelection(true) }, 'Match output to input'),
+        el('button', { dataset: { action: 'match-input-to-output' }, title: 'Set each selected slice\'s input selection to its output shape', onclick: () => matchSelection(false) }, 'Match input to output')) : null);
+  }
   function renderProps() {
     const found = primary();
     if (!found) { props.replaceChildren(...screenPanels(currentScreen())); return; }
     const sameKind = () => selectedItems().filter(f => f.kind === found.kind).map(f => f.item);
     const nameInput = el('input', { type: 'text', value: found.item.name, maxLength: 128, onchange: event => { checkpoint(); found.item.name = event.target.value.trim().slice(0, 128) || found.item.name; changed(true); } });
     blurOnEnter(nameInput);
-    props.replaceChildren(...(found.kind === 'mask' ? maskPanels(found, sameKind, nameInput) : slicePanels(found, sameKind, nameInput)));
+    props.replaceChildren(...(selected.size > 1 ? [selectionPanel()] : []), ...(found.kind === 'mask' ? maskPanels(found, sameKind, nameInput) : slicePanels(found, sameKind, nameInput)));
   }
   function syncProps() { for (const node of props.querySelectorAll('[data-path]')) node.syncValue?.(); }
   function syncToolbar() {

@@ -58,7 +58,16 @@ The browser development view is useful for testing. Files imported there use tem
 - **Shortcuts:** Ctrl+Shift+K (keyboard) or Ctrl+Shift+M (MIDI), or the Control tab's Edit buttons for OSC and DMX. Click a highlighted control, then give the input. Modes: value, toggle, momentary, trigger, set and relative (encoders). MIDI feedback is sent to controllers, BPM can follow MIDI clock, and shortcut sets can be saved as presets.
 - **Advanced Output:** Output → *Advanced Output…* edits screens, slices, polygon slices, masks, perspective, grid and bezier warping, soft edges, colour correction, test card, identify and presets. Output windows now share the editor's process, so the composition goes to them GPU-to-GPU every frame instead of as 30 fps JPEG frames.
 - **DMX and OSC out:** the Control tab sends pixel-mapped fixtures over Art-Net or sACN, receives DMX for shortcuts, and can send OSC feedback for OSC shortcuts.
-- **Preferences:** audio output device, external FFT input device and MIDI clock sync.
+- **Preferences:** audio output device, external FFT input device, MIDI clock sync and the SMPTE input.
+- **Crossfader:** layers and groups on the A or B bus render into their bus first; the buses mix with a chosen blend mode and curve (Overlap keeps both at full strength in the middle, Linear is a classic mix, Smooth is equal power, Cut switches at the centre). The A/B buttons follow the Behaviour setting: Fade over 4 beats, Jump, Jump & Return, or Cut while held.
+- **Clip transport extras:** Random play mode has Interval and Distance (seconds or beats); Away has Relative pick-up; SMPTE transport follows incoming LTC timecode from an offset (Hold, Loop or Stop at the end). Choose the LTC input in Settings; the status bar shows the timecode.
+- **Image sequences:** right-click an empty slot → Import image sequence…, or drop a folder of numbered frames on a slot. It plays as one clip at 25 fps.
+- **Previewing effects:** double-click an effect in the browser to see it over the live composition in the Preview monitor.
+- **Shortcut target:** a layer or clip shortcut can control *This* item or whatever is *Selected*.
+- **Number fields:** type math such as `1920/3` or `/2`; ↑/↓ nudge, with Shift for ×10.
+- **Advanced Output:** slices can use a single layer or group as input; screens have a delay (0–100 ms); several selected slices scale and rotate together, and list items reorder by dragging.
+- **Video Router:** Input Opacity and Input Bypass follow the routed layer's fader and bypass/solo.
+- **Thumbnails** for videos and generators, previous/next column buttons beside the Composition label, and smoother editing: effects compile in the background, so adding one no longer drops frames.
 
 ## Keyboard
 
@@ -99,7 +108,7 @@ UI tests run a fixed production build. Desktop tests use an isolated temporary p
 
 ## Remaining work
 
-Still outstanding after the manual-parity pass: Advanced Output slices that use a layer or group as input show the composition (layer textures are not yet shared with output windows); screen delay is stored but not applied; multi-select scale/rotate in the output editor; SMPTE timecode, Ableton Link, NDI/Spout/Syphon, FFGL/VST plugins, and native DXV/HAP decoding.
+Still outstanding: features that need native code a browser engine cannot provide — Ableton Link, NDI, Spout/Syphon, FFGL video plugins, VST audio plugins, Denon StageLinQ, and native (non-converted) DXV/HAP GPU decoding. DXV, HAP and ProRes MOVs still play through the FFmpeg-prepared copies.
 
 The [newer manual coverage](docs/NEW-MANUAL-COVERAGE.md), [full requirements](docs/REQUIREMENTS.md), and [acceptance plan](docs/ACCEPTANCE.md) preserve the complete manual scope. Significant remaining items include hierarchical groups, advanced output slices/warping/masks/edge blending, complete effect coverage, unresolved blend compatibility, audio effect hosting, multi-parameter dashboards and parameter animation/FFT control, camera capture, extended MIDI/OSC feedback, DMX/Art-Net and SMPTE, native GPU DXV decoding and legacy content/plugin compatibility, original project import, and sustained hardware/device testing.
 

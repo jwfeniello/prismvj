@@ -33,6 +33,9 @@ async function page() {
     const { LiveEngine } = await import('/engine.js');
     window.errors = [];
     window.engine = new LiveEngine(document.querySelector('canvas'), { onError: error => errors.push(error) });
+    // Programs compile asynchronously; finish them so each render is exact.
+    const render = engine.render.bind(engine);
+    engine.render = (...args) => { render(...args); if (engine.flushPrograms()) render(...args); };
     window.project = () => ({ id: 'p', width: 96, height: 54, speed: 1, bpm: 120, masterOpacity: 1, masterVolume: 0, crossfader: 0.5, layers: [], groups: [], effects: [] });
     window.layer = (id, extra = {}) => ({ id, opacity: 1, volume: 0, blend: 'normal', group: 'none', effects: [], ...extra });
     window.clip = (id, color, extra = {}) => ({ id, name: id, kind: 'source', source: 'solid', color, params: {}, duration: 8, opacity: 1, volume: 0, useAudio: false, speed: 1, direction: 1, scale: 1, effects: [], ...extra });
@@ -199,5 +202,27 @@ test('generators keep animating across the clip loop point instead of jumping ba
   assert.ok(result.differs, 'the wrapped frame must not show the restarted pattern');
   assert.ok(Math.abs(result.paused - 5.1) < 1e-6, 'a paused clip holds its generator');
   assert.ok(Math.abs(result.reversed - 4.6) < 1e-6, `reverse runs the clock backwards: ${result.reversed}`);
+  await tab.close();
+});
+test('crossfader buses mix A and B with the chosen curve and sit at the first bused layer', options, async () => {
+  const tab = await page();
+  const result = await tab.evaluate(() => {
+    const p = project();
+    const under = layer('under'), a = layer('a', { group: 'A' }), b = layer('b', { group: 'B' }), over = layer('over', { opacity: 0 });
+    p.layers = [under, a, b, over];
+    const frames = [frame(under, clip('u', '#00ff00')), frame(a, clip('ca', '#ff0000')), frame(b, clip('cb', '#0000ff')), frame(over, clip('o', '#ffffff'))];
+    const at = (crossfader, curve, blend = 'normal') => { Object.assign(p, { crossfader, crossfaderCurve: curve, crossfaderBlend: blend }); engine.render(p, frames, 1); return pixel(); };
+    return {
+      left: at(0, 'overlap'), right: at(1, 'overlap'), overlapMiddle: at(0.5, 'overlap'),
+      linearMiddle: at(0.5, 'linear'), cutLeftOfCentre: at(0.4, 'cut'), screenMiddle: at(0.5, 'overlap', 'screen'), errors,
+    };
+  });
+  assert.ok(near(result.left, [255, 0, 0, 255]), `A only ${result.left}`);
+  assert.ok(near(result.right, [0, 0, 255, 255]), `B only ${result.right}`);
+  assert.ok(near(result.overlapMiddle, [0, 0, 255, 255]), 'overlap keeps both buses at full strength');
+  assert.ok(near(result.linearMiddle, [128, 0, 128, 255], 3), `linear crossfade ${result.linearMiddle}`);
+  assert.ok(near(result.cutLeftOfCentre, [255, 0, 0, 255]), 'cut switches at the centre');
+  assert.ok(near(result.screenMiddle, [255, 0, 255, 255]), `screen blend mixes buses ${result.screenMiddle}`);
+  assert.deepEqual(result.errors, []);
   await tab.close();
 });

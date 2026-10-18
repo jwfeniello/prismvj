@@ -32,6 +32,7 @@ uniform vec3 uCurve;
 uniform vec3 uColor;
 uniform vec3 uGain;
 uniform int uFlags;
+uniform int uSourceFlags;
 out vec4 outColor;
 float ramp(float x) {
   x = clamp(x, 0.0, 1.0);
@@ -40,7 +41,9 @@ float ramp(float x) {
 }
 float edge(float d, float width) { return width <= 0.0 ? 1.0 : ramp(d / width); }
 void main() {
-  vec4 c = texture(uSource, vUv);
+  // Raw pixel sources keep readPixels' bottom-up rows (flag 1) and may be straight alpha (flag 2).
+  vec4 c = texture(uSource, (uSourceFlags & 1) != 0 ? vec2(vUv.x, 1.0 - vUv.y) : vUv);
+  if ((uSourceFlags & 2) != 0) c.rgb *= c.a;
   if (any(lessThan(vUv, vec2(0.0))) || any(greaterThan(vUv, vec2(1.0)))) c = vec4(0.0);
   vec3 rgb = c.a > 0.0 ? c.rgb / c.a : vec3(0.0);
   rgb = clamp(((rgb - 0.5) * (1.0 + uColor.y) + 0.5 + uColor.x) * (1.0 + uGain), 0.0, 1.0);
@@ -91,6 +94,9 @@ void main() {
 }`;
 
 const SOURCE_SIZE = source => [source.videoWidth || source.naturalWidth || source.displayWidth || source.width || 0, source.videoHeight || source.naturalHeight || source.displayHeight || source.height || 0];
+// { width, height, data: Uint8Array|Uint8ClampedArray RGBA rows bottom-up, premultiplied? } (ImageData stays a TexImageSource).
+const isRawSource = source => ArrayBuffer.isView(source?.data) && !(typeof ImageData === 'function' && source instanceof ImageData);
+const MAX_DELAY_SLOTS = 8;
 const IDENTIFY_COLORS = ['#ff5a5a', '#4fc3ff', '#84ffd4', '#ffd84f', '#c58cff', '#ff9a4f', '#5affa0', '#ff7ad1'];
 const createCanvas = (w, h) => {
   if (typeof OffscreenCanvas === 'function') return new OffscreenCanvas(w, h);
@@ -108,7 +114,10 @@ export class OutputMapper {
     this.lost = false;
     this.disposed = false;
     this.fps = 0;
-    this.stats = { slices: 0, uploads: 0 };
+    // allocations: texture storage (re)definitions for raw sources and delay slots; copies: delay-ring frame copies.
+    this.stats = { slices: 0, uploads: 0, allocations: 0, copies: 0 };
+    this._frameTime = 1 / 60;
+    this._lastTime = null;
     this._errors = new Set();
     this._lastRender = 0;
     this._onLost = event => {
@@ -180,6 +189,7 @@ export class OutputMapper {
     this.sliceProgram = this._program(SLICE_VS, SLICE_FS);
     this.screenProgram = this._program(SCREEN_VS, SCREEN_FS);
     this.emptyVao = gl.createVertexArray();
+    this.copyFbo = gl.createFramebuffer();
     this.white = this._texture();
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
     this.maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
@@ -187,29 +197,48 @@ export class OutputMapper {
     this.maskTexture = null; this._maskKey = null; this._maskScreen = null;
     this.cardTexture = null; this._cardKey = null; this._cardScreen = null;
     this.overlayTexture = null; this._overlayKey = null; this._overlayTime = 0; this._overlayVisible = false;
-    for (const entry of this.sources.values()) { entry.texture = null; entry.frame = -1; }
+    this._resetSources();
     gl.disable(gl.DEPTH_TEST);
+  }
+
+  _resetSources() {
+    for (const entry of this.sources.values()) { entry.texture = null; entry.frame = -1; entry.texWidth = 0; entry.texHeight = 0; entry.ring = null; entry.dirty = true; }
   }
 
   // Drop GL handles after context loss (they are invalid and must not be deleted).
   _forget() {
     this.entries.clear();
-    for (const entry of this.sources.values()) { entry.texture = null; entry.frame = -1; }
+    this._resetSources();
+    this.copyFbo = null;
     this.scene = null; this.maskTexture = null; this.cardTexture = null; this.overlayTexture = null;
     this._maskScreen = null; this._cardScreen = null; this._overlayKey = null;
   }
 
+  // source: any TexImageSource (uploaded every render), or raw pixels
+  // { width, height, data: Uint8Array|Uint8ClampedArray, premultiplied = true } with RGBA rows
+  // bottom-up as gl.readPixels returns them. Raw pixels upload once per setSource call (pass
+  // the same object again after refilling its buffer); same-size updates reuse the texture.
   setSource(id, source) {
-    const entry = this.sources.get(id);
     if (!source) { this.removeSource(id); return; }
-    if (entry) { entry.source = source; entry.frame = -1; }
-    else this.sources.set(id, { source, texture: null, frame: -1, width: 0, height: 0 });
+    let entry = this.sources.get(id);
+    if (!entry) { entry = { source, texture: null, view: null, frame: -1, width: 0, height: 0, texWidth: 0, texHeight: 0, ring: null }; this.sources.set(id, entry); }
+    const raw = isRawSource(source);
+    entry.source = source; entry.frame = -1; entry.dirty = true;
+    entry.raw = raw; entry.flags = raw ? (source.premultiplied === false ? 3 : 1) : 0;
   }
 
   removeSource(id) {
     const entry = this.sources.get(id);
+    if (entry) this._dropRing(entry);
     if (entry?.texture && !this.lost) this.gl.deleteTexture(entry.texture);
     this.sources.delete(id);
+  }
+
+  // Number of GPU frame copies currently held for screen delay.
+  get ringTextures() {
+    let count = 0;
+    for (const entry of this.sources.values()) count += entry.ring?.slots.length || 0;
+    return count;
   }
 
   // Call after mutating a slice object in place (identity-based cache).
@@ -221,20 +250,95 @@ export class OutputMapper {
     if (this.canvas.height !== h) this.canvas.height = h;
   }
 
-  _source(id) {
+  // Uploads a source once per frame; `entry.view` is the texture to sample (a delayed copy when delay > 0).
+  _source(id, delay = 0, time = 0) {
     const entry = this.sources.get(id);
     if (!entry?.source) return null;
     if (entry.frame === this.frame) return entry.width ? entry : null;
     entry.frame = this.frame;
-    const [width, height] = SOURCE_SIZE(entry.source);
-    entry.width = width; entry.height = height;
-    if (!width || !height) return null;
-    try {
-      entry.texture ||= this._texture();
-      this._upload(entry.texture, entry.source, false);
-      this.stats.uploads++;
-    } catch (error) { entry.width = 0; this._error(`source:${id}`, `Output source ${id} could not be uploaded: ${error.message}`); return null; }
+    let fresh = false;
+    if (entry.raw) {
+      if (entry.dirty || !entry.texture) { if (!this._uploadRaw(id, entry)) return null; fresh = true; }
+      if (!entry.width) return null;
+    } else {
+      const [width, height] = SOURCE_SIZE(entry.source);
+      entry.width = width; entry.height = height;
+      if (!width || !height) return null;
+      try {
+        entry.texture ||= this._texture();
+        this._upload(entry.texture, entry.source, false);
+        entry.texWidth = 0; entry.texHeight = 0;
+        this.stats.uploads++; fresh = true;
+      } catch (error) { entry.width = 0; this._error(`source:${id}`, `Output source ${id} could not be uploaded: ${error.message}`); return null; }
+    }
+    entry.view = delay > 0 ? this._delayed(entry, delay, time, fresh) : entry.texture;
     return entry;
+  }
+
+  _uploadRaw(id, entry) {
+    const gl = this.gl, { width, height, data } = entry.source;
+    entry.dirty = false;
+    const valid = Number.isInteger(width) && Number.isInteger(height) && width > 0 && height > 0 && width <= this.maxSize && height <= this.maxSize
+      && (data instanceof Uint8Array || data instanceof Uint8ClampedArray) && data.length >= width * height * 4;
+    if (!valid) { entry.width = 0; this._error(`source:${id}`, `Output source ${id} has invalid pixel data (expected ${width}×${height} RGBA bytes).`); return false; }
+    try {
+      if (!entry.texture) entry.texture = this._texture(); else gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+      // Rows stay bottom-up and alpha is handled in the shader, so the browser never copies the buffer.
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      if (entry.texWidth === width && entry.texHeight === height) gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, data);
+      else {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        entry.texWidth = width; entry.texHeight = height; this.stats.allocations++;
+      }
+      entry.width = width; entry.height = height;
+      this.stats.uploads++;
+      return true;
+    } catch (error) { entry.width = 0; this._error(`source:${id}`, `Output source ${id} could not be uploaded: ${error.message}`); return false; }
+  }
+
+  // Screen delay: a small GPU ring of recent source frames stamped with options.time;
+  // the frame closest to time - delay is sampled.
+  _delayed(entry, delayMs, time, fresh) {
+    const gl = this.gl, delay = delayMs / 1000;
+    let ring = entry.ring;
+    if (ring && (ring.width !== entry.width || ring.height !== entry.height || time < ring.newest)) { this._dropRing(entry); ring = null; }
+    if (!ring) ring = entry.ring = { width: entry.width, height: entry.height, slots: [], newest: -Infinity };
+    const needed = Math.ceil(delay / this._frameTime - 1e-6) + 1, capacity = Math.min(MAX_DELAY_SLOTS, Math.max(2, needed));
+    const oldest = () => ring.slots.reduce((a, b) => (b.time < a.time ? b : a));
+    while (ring.slots.length > capacity) { const slot = oldest(); ring.slots.splice(ring.slots.indexOf(slot), 1); if (!this.lost) gl.deleteTexture(slot.texture); }
+    // At high frame rates the capped ring samples frames further apart so 100 ms stays reachable.
+    const spacing = needed > MAX_DELAY_SLOTS ? delay / (MAX_DELAY_SLOTS - 1) * 0.999 : 0;
+    if (!ring.slots.length || (fresh && time - ring.newest >= spacing)) {
+      let slot;
+      if (ring.slots.length < capacity) {
+        slot = { texture: this._texture(), time };
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, ring.width, ring.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        ring.slots.push(slot); this.stats.allocations++;
+      } else slot = oldest();
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.copyFbo);
+      gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, entry.texture, 0);
+      gl.bindTexture(gl.TEXTURE_2D, slot.texture);
+      gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, ring.width, ring.height);
+      gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      slot.time = time; ring.newest = time;
+      this.stats.copies++;
+    }
+    const target = time - delay;
+    let best = ring.slots[0];
+    for (const slot of ring.slots) {
+      const d = Math.abs(slot.time - target), bd = Math.abs(best.time - target);
+      if (d < bd || (d === bd && slot.time < best.time)) best = slot;
+    }
+    return best.texture;
+  }
+
+  _dropRing(entry) {
+    if (!entry.ring) return;
+    if (!this.lost && !this.gl.isContextLost()) for (const slot of entry.ring.slots) this.gl.deleteTexture(slot.texture);
+    entry.ring = null;
   }
 
   _sceneTarget(width, height) {
@@ -385,7 +489,7 @@ export class OutputMapper {
     return this._renderer;
   }
 
-  // options: { testCard, identify, identifyColor, showFPS, showInfo, label, time (seconds) }
+  // options: { testCard, identify, identifyColor, showFPS, showInfo, label, time (seconds; also the screen-delay clock) }
   render(screen, options = {}) {
     if (this.disposed || this.lost) return { drawn: 0 };
     const gl = this.gl;
@@ -395,16 +499,24 @@ export class OutputMapper {
     if (this._lastRender) { const dt = now - this._lastRender; if (dt > 0) this.fps = this.fps ? this.fps * 0.9 + (1000 / dt) * 0.1 : 1000 / dt; }
     this._lastRender = now;
     const time = Number.isFinite(options.time) ? options.time : now / 1000;
+    if (this._lastTime !== null) { const dt = time - this._lastTime; if (dt > 0 && dt < 1) this._frameTime = this._frameTime * 0.8 + dt * 0.2; }
+    this._lastTime = time;
     const width = Math.min(this.maxSize, screen?.device?.width || this.canvas.width), height = Math.min(this.maxSize, screen?.device?.height || this.canvas.height);
+    const delay = screen && screen.enabled !== false ? Math.min(100, Math.max(0, Number(screen.delay) || 0)) : 0;
+    if (!delay) for (const entry of this.sources.values()) if (entry.ring) this._dropRing(entry);
     let drawn = 0;
     try {
+      const active = screen?.enabled !== false && !options.testCard ? screen?.slices || [] : [];
+      let solo = false;
+      for (const slice of active) if (slice.solo && slice.enabled && !slice.bypass) { solo = true; break; }
+      // Resolve (upload / delay) every visible source before the scene target is bound.
+      for (const slice of active) if (slice.enabled && !slice.bypass && (!solo || slice.solo)) this._source(slice.input.source, delay, time);
       const scene = this._sceneTarget(width, height);
       gl.bindFramebuffer(gl.FRAMEBUFFER, scene.framebuffer);
       gl.viewport(0, 0, width, height);
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      const active = screen?.enabled !== false && !options.testCard ? screen?.slices || [] : [];
-      if (active.length) drawn = this._drawSlices(active, width, height);
+      if (active.length) drawn = this._drawSlices(active, width, height, solo);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
       gl.disable(gl.BLEND);
@@ -434,10 +546,8 @@ export class OutputMapper {
     return { drawn };
   }
 
-  _drawSlices(slices, width, height) {
+  _drawSlices(slices, width, height, solo) {
     const gl = this.gl, p = this.sliceProgram, u = p.uniforms;
-    let solo = false;
-    for (const slice of slices) if (slice.solo && slice.enabled && !slice.bypass) { solo = true; break; }
     gl.useProgram(p.program);
     gl.enable(gl.BLEND);
     gl.uniform1i(u.uSource, 0); gl.uniform1i(u.uMask, 1);
@@ -460,7 +570,8 @@ export class OutputMapper {
         entry.clipKey = clipKey;
       }
       const maskTexture = this._sliceMask(entry, slice);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, source.texture);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, source.view);
+      gl.uniform1i(u.uSourceFlags, source.flags);
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTexture || this.white);
       gl.uniformMatrix3fv(u.uMatrix, false, entry.clip);
       gl.uniform2f(u.uSourceSize, source.width, source.height);
@@ -484,6 +595,7 @@ export class OutputMapper {
   _evict() {
     if (this.frame % 60) return;
     for (const [id, entry] of this.entries) if (this.frame - entry.used > 120) { this._releaseEntry(entry); this.entries.delete(id); }
+    for (const entry of this.sources.values()) if (entry.ring && this.frame - entry.frame > 120) this._dropRing(entry);
   }
 
   readPixel(x, y) {
@@ -500,7 +612,8 @@ export class OutputMapper {
     if (!this.lost && !this.gl.isContextLost()) {
       const gl = this.gl;
       for (const entry of this.entries.values()) this._releaseEntry(entry);
-      for (const entry of this.sources.values()) if (entry.texture) gl.deleteTexture(entry.texture);
+      for (const entry of this.sources.values()) { this._dropRing(entry); if (entry.texture) gl.deleteTexture(entry.texture); }
+      if (this.copyFbo) gl.deleteFramebuffer(this.copyFbo);
       for (const texture of [this.white, this.maskTexture, this.cardTexture, this.overlayTexture, this.scene?.texture]) if (texture) gl.deleteTexture(texture);
       if (this.scene) gl.deleteFramebuffer(this.scene.framebuffer);
       gl.deleteVertexArray(this.emptyVao);

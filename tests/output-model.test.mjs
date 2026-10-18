@@ -117,3 +117,11 @@ test('duplicate creates a deep copy with a new id', () => {
   assert.equal(slice.input.rect.x, 0);
   assert.ok(['layer:abc', 'group:g1', 'screen:s-1'].every(source => createSlice({ input: { source } }).input.source === source));
 });
+
+test('screen delay is stored in milliseconds and clamped to 0-100', () => {
+  assert.equal(createScreen({}, comp).delay, 0);
+  assert.equal(createScreen({ delay: 40 }, comp).delay, 40);
+  assert.equal(createScreen({ delay: 250 }, comp).delay, 100);
+  assert.equal(normalizeOutputConfig({ version: 1, screens: [{ delay: -5 }] }, comp).screens[0].delay, 0);
+  assert.equal(normalizeOutputConfig({ version: 1, screens: [{ delay: 'x' }] }, comp).screens[0].delay, 0);
+});

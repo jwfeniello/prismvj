@@ -1,6 +1,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { sourceFile } from './src-server.mjs';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { chromium } from '@playwright/test';
@@ -20,6 +21,8 @@ before(async () => {
     if (existsSync(url)) files.set(`/output/${name}`, await readFile(url));
   }
   server = createServer((request, response) => {
+    const source = sourceFile(request.url);
+    if (source && !files.has(request.url)) { response.setHeader('Content-Type', source.type); response.end(source.body); return; }
     const file = files.get(request.url);
     response.setHeader('Content-Type', request.url.endsWith('.js') ? 'text/javascript' : request.url.endsWith('.css') ? 'text/css' : 'text/html');
     response.end(file || '<!doctype html><body style="margin:0;background:#000"><canvas id="out" width="160" height="90"></canvas></body>');
@@ -348,6 +351,212 @@ test('advanced output editor: add slice, drag handles, numeric math, undo, prese
   assert.equal(result.reopenedSlices, 2);
   assert.equal(result.closedAfterButton, 1);
   assert.equal(result.hostEmpty, true);
+  assert.deepEqual(result.pageErrors, []);
+  await page.close();
+});
+
+test('raw bottom-up RGBA pixel sources render exactly like the canvas source and reuse their texture', { skip: !browserAvailable }, async () => {
+  const page = await setup();
+  const result = await page.evaluate(() => {
+    // readPixels order: the first row in memory is the bottom row of the image.
+    const bottomUp = (data, w, h) => { const out = new Uint8Array(w * h * 4); for (let y = 0; y < h; y++) out.set(data.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4); return out; };
+    const raw = { width: 160, height: 90, data: bottomUp(srcData, 160, 90) };
+    mapper.setSource('layer:raw', raw);
+    const compare = slice => {
+      renderAndRead(screenWith([{ ...slice, input: { ...slice.input, source: 'composition' } }]));
+      const expected = last.slice();
+      renderAndRead(screenWith([{ ...slice, input: { ...slice.input, source: 'layer:raw' } }]));
+      let max = 0;
+      for (let i = 0; i < expected.length; i++) max = Math.max(max, Math.abs(expected[i] - last[i]));
+      return max;
+    };
+    const diffs = [
+      compare({}),
+      compare({ input: { rect: { x: 10, y: 5, width: 60, height: 40 }, flipV: true } }),
+      compare({ input: { rect: { x: 40, y: 20, width: 80, height: 50 }, rotation: 30 } }),
+      compare({ output: { corners: [{ x: 20, y: 10 }, { x: 150, y: 0 }, { x: 130, y: 85 }, { x: 5, y: 70 }] } }),
+    ];
+    const top = (renderAndRead(screenWith([{ input: { source: 'layer:raw' } }])), at(3, 2));
+    const entry = mapper.sources.get('layer:raw'), texture = entry.texture, allocations = mapper.stats.allocations;
+    const uploads = mapper.stats.uploads;
+    renderAndRead(screenWith([{ input: { source: 'layer:raw' } }]));
+    const idleUploads = mapper.stats.uploads - uploads;
+    raw.data.fill(255);
+    mapper.setSource('layer:raw', raw);
+    renderAndRead(screenWith([{ input: { source: 'layer:raw' } }]));
+    const refilled = at(40, 45);
+    mapper.setSource('layer:raw', { width: 160, height: 90, data: new Uint8ClampedArray(160 * 90 * 4).fill(64) });
+    renderAndRead(screenWith([{ input: { source: 'layer:raw' } }]));
+    const replaced = at(10, 10);
+    const reused = mapper.sources.get('layer:raw').texture === texture && mapper.stats.allocations === allocations;
+    const fill = (rgba, premultiplied) => { const data = new Uint8Array(160 * 90 * 4); for (let i = 0; i < data.length; i += 4) data.set(rgba, i); return { width: 160, height: 90, data, premultiplied }; };
+    mapper.setSource('layer:straight', fill([255, 0, 0, 128], false));
+    renderAndRead(screenWith([{ input: { source: 'layer:straight' } }]));
+    const straight = at(80, 45);
+    mapper.setSource('layer:premul', fill([128, 0, 0, 128]));
+    renderAndRead(screenWith([{ input: { source: 'layer:premul' } }]));
+    const premul = at(80, 45);
+    mapper.setSource('layer:bad', { width: 10, height: 10, data: new Uint8Array(12) });
+    renderAndRead(screenWith([{ input: { source: 'layer:bad' } }]));
+    return { diffs, top, expectTop: srcPixel(3, 2), idleUploads, refilled, replaced, reused, straight, premul, errors };
+  });
+  assert.deepEqual(result.diffs, [0, 0, 0, 0], 'raw pixels line up exactly with the canvas source');
+  near(result.top, result.expectTop, 0, 'top-left of the raw source is the top-left of the image');
+  assert.equal(result.idleUploads, 0, 'raw sources upload only after setSource');
+  near(result.refilled, [255, 255, 255], 0, 'refilled buffer');
+  near(result.replaced, [64, 64, 64], 0, 'replaced buffer');
+  assert.equal(result.reused, true, 'same-size updates reuse the texture without reallocating');
+  near(result.straight, [128, 0, 0], 1, 'straight alpha is premultiplied in the shader');
+  near(result.premul, [128, 0, 0], 1, 'premultiplied by default');
+  assert.equal(result.errors.length, 1, 'invalid pixel data is reported once');
+  assert.match(result.errors[0], /invalid pixel data/);
+  await page.close();
+});
+
+test('screen delay shows the frame from delay ms ago and keeps zero delay copy-free', { skip: !browserAvailable }, async () => {
+  const page = await setup();
+  const result = await page.evaluate(() => {
+    const solid = (colour, w = 160, h = 90) => { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'); g.fillStyle = colour; g.fillRect(0, 0, w, h); return c; };
+    const red = solid('#ff0000'), green = solid('#00ff00');
+    const zeroScreen = screenWith([{ input: { source: 'layer:live' } }]);
+    const delayed = screenWith([{ input: { source: 'layer:live' } }], { delay: 50 });
+    // Zero delay: no ring, no copies, the newest frame shows immediately.
+    mapper.setSource('layer:live', red);
+    renderAndRead(zeroScreen, { time: 0 });
+    mapper.setSource('layer:live', green);
+    renderAndRead(zeroScreen, { time: 1 / 60 });
+    const zero = { pixel: at(80, 45).slice(0, 3), ring: mapper.ringTextures, copies: mapper.stats.copies };
+    const frames = [];
+    for (let k = 0; k <= 40; k++) {
+      mapper.setSource('layer:live', k < 30 ? red : green);
+      renderAndRead(delayed, { time: 1 + k / 60 });
+      frames.push(at(80, 45).slice(0, 3));
+    }
+    const ring = mapper.ringTextures;
+    mapper.setSource('layer:live', solid('#0000ff', 80, 45));
+    renderAndRead(delayed, { time: 1 + 41 / 60 });
+    const resized = { ring: mapper.ringTextures, width: mapper.sources.get('layer:live').ring.width };
+    const copies = mapper.stats.copies;
+    mapper.setSource('layer:live', red);
+    renderAndRead(zeroScreen, { time: 2 });
+    renderAndRead(zeroScreen, { time: 2 + 1 / 60 });
+    return { zero, frames, ring, resized, afterZero: { ring: mapper.ringTextures, copies: mapper.stats.copies - copies, pixel: at(80, 45).slice(0, 3) }, errors };
+  });
+  assert.deepEqual(result.zero, { pixel: [0, 255, 0], ring: 0, copies: 0 });
+  // 50 ms at 60 fps = 3 frames: the switch at frame 30 appears at frame 33.
+  for (let k = 0; k < 33; k++) assert.deepEqual(result.frames[k], [255, 0, 0], `frame ${k} still shows the older source`);
+  for (let k = 33; k <= 40; k++) assert.deepEqual(result.frames[k], [0, 255, 0], `frame ${k} shows the delayed switch`);
+  assert.ok(result.ring >= 4 && result.ring <= 8, `ring holds ${result.ring} frames`);
+  assert.deepEqual(result.resized, { ring: 1, width: 80 }, 'a source size change restarts the ring');
+  assert.deepEqual(result.afterZero, { ring: 0, copies: 0, pixel: [255, 0, 0] }, 'delay 0 frees the ring and copies nothing');
+  assert.deepEqual(result.errors, []);
+  await page.close();
+});
+
+test('advanced output editor: multi-select scale/rotate, selection fields, match pair and list drag reordering', { skip: !browserAvailable }, async () => {
+  const page = await setup();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const result = await page.evaluate(async () => {
+    const { openAdvancedOutput } = await import('/output/editor.js');
+    const pageErrors = [];
+    window.addEventListener('error', event => pageErrors.push(event.message));
+    const host = document.createElement('div');
+    host.style.cssText = 'position:fixed;inset:0;z-index:5';
+    document.body.append(host);
+    const screen = createScreen({ id: 'scr1', slices: [{ id: 'a', name: 'A', input: { rect: { x: 10, y: 10, width: 40, height: 20 } } }, { id: 'b', name: 'B', input: { rect: { x: 60, y: 30, width: 40, height: 40 } } }] }, ctx);
+    const api = openAdvancedOutput({ host, config: { version: 1, screens: [screen] }, compositionCanvas: src, compositionSize: { width: 160, height: 90 }, storage: null });
+    const root = host.querySelector('#ao-root');
+    for (let i = 0; i < 100 && getComputedStyle(root).display !== 'grid'; i++) await new Promise(resolve => setTimeout(resolve, 20));
+    const overlay = host.querySelector('#ao-stage-overlay');
+    const pointer = (type, x, y, extra = {}) => {
+      const p = api.contentToClient(x, y);
+      overlay.dispatchEvent(new PointerEvent(type, { clientX: p.x, clientY: p.y, button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 1, bubbles: true, ...extra }));
+    };
+    const dragContent = (from, to, extra) => { pointer('pointerdown', ...from, extra); pointer('pointermove', (from[0] + to[0]) / 2, (from[1] + to[1]) / 2, extra); pointer('pointermove', ...to, extra); pointer('pointerup', ...to, extra); };
+    const undo = () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+    const slice = id => api.getConfig().screens.flatMap(s => s.slices).find(s => s.id === id);
+    const inputs = () => ['a', 'b'].map(id => ({ ...slice(id).input.rect, rotation: slice(id).input.rotation }));
+    const corners = () => ['a', 'b'].map(id => slice(id).output.corners);
+    const setField = (path, value) => { const input = host.querySelector(`[data-path="${path}"]`); input.value = value; input.dispatchEvent(new Event('change', { bubbles: true })); };
+    const scale = api.contentToClient(1, 0).x - api.contentToClient(0, 0).x;
+    const original = inputs();
+
+    api.select(['a', 'b']);
+    dragContent([100, 70], [145, 70]);
+    const scaled = inputs();
+    undo();
+    const afterScaleUndo = inputs();
+    dragContent([55, 10 - 26 / scale], [105, 40], { shiftKey: true });
+    const rotated = inputs();
+    undo();
+    const afterRotateUndo = inputs();
+    setField('selection.rotation', '90');
+    const numericRotated = inputs();
+    undo();
+
+    api.setTab('output');
+    const originalCorners = corners();
+    dragContent([100, 70], [145, 70]);
+    const scaledCorners = corners();
+    host.querySelector('[data-action="match-input-to-output"]').click();
+    const matched = inputs();
+    undo(); undo();
+    const cornersAfterUndo = corners(), inputsAfterUndo = inputs();
+    setField('selection.width', '180');
+    const widened = corners();
+    undo();
+    host.querySelector('[data-action="match-output-to-input"]').click();
+    const matchedOutput = corners();
+    undo();
+
+    api.setTab('input');
+    const order = () => api.getConfig().screens.map(s => s.slices.map(x => x.id));
+    const row = id => host.querySelector(`[data-item="${id}"]`), screenRow = id => host.querySelector(`[data-screen="${id}"]`);
+    const dnd = (from, to, after = false) => {
+      const dataTransfer = new DataTransfer(), r = to.getBoundingClientRect(), clientY = after ? r.bottom - 2 : r.top + 2;
+      from.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer }));
+      to.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, clientY, dataTransfer }));
+      to.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, clientY, dataTransfer }));
+      from.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer }));
+    };
+    dnd(row('a'), row('b'), true);
+    const dragged = order();
+    undo();
+    const draggedUndo = order();
+    host.querySelector('[data-action="add-screen"]').click();
+    const screens0 = api.getConfig().screens.map(s => s.id);
+    dnd(screenRow(screens0[1]), screenRow(screens0[0]));
+    const screens1 = api.getConfig().screens.map(s => s.id);
+    dnd(row('b'), screenRow(screens0[1]));
+    const movedAcross = order();
+    dnd(row('a'), screenRow(screens0[1]));
+    const lastKept = order();
+    api.close();
+    return { scale, original, scaled, afterScaleUndo, rotated, afterRotateUndo, numericRotated, originalCorners, scaledCorners, matched, cornersAfterUndo, inputsAfterUndo,
+      widened, matchedOutput, dragged, draggedUndo, screens0, screens1, movedAcross, lastKept, pageErrors };
+  });
+  const close = (actual, expected, label) => {
+    const flat = value => JSON.stringify(value, (key, v) => typeof v === 'number' ? Math.round(v * 100) / 100 + 0 : v);
+    assert.equal(flat(actual), flat(expected), label);
+  };
+  const quad = (x, y, w, h) => [{ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }];
+  close(result.scaled, [{ x: 10, y: 10, width: 60, height: 20, rotation: 0 }, { x: 85, y: 30, width: 60, height: 40, rotation: 0 }], 'selection scales around its bounding box');
+  close(result.afterScaleUndo, result.original, 'one undo restores the scale gesture');
+  close(result.rotated, [{ x: 55, y: 5, width: 40, height: 20, rotation: 90 }, { x: 25, y: 45, width: 40, height: 40, rotation: 90 }], 'shift-rotation snaps to 90 degrees around the selection centre');
+  close(result.afterRotateUndo, result.original, 'one undo restores the rotate gesture');
+  close(result.numericRotated, result.rotated, 'numeric rotation matches the rotate handle');
+  close(result.scaledCorners, [quad(10, 10, 60, 20), quad(85, 30, 60, 40)], 'output tab scales output corners');
+  close(result.matched, [{ x: 10, y: 10, width: 60, height: 20, rotation: 0 }, { x: 85, y: 30, width: 60, height: 40, rotation: 0 }], 'match input to output');
+  close(result.cornersAfterUndo, result.originalCorners, 'undo restores the output corners');
+  close(result.inputsAfterUndo, result.original, 'undo restores the inputs');
+  close(result.widened, [quad(10, 10, 80, 20), quad(110, 30, 80, 40)], 'selection width field scales from the left edge');
+  close(result.matchedOutput, result.originalCorners, 'match output to input');
+  assert.deepEqual(result.dragged, [['b', 'a']]);
+  assert.deepEqual(result.draggedUndo, [['a', 'b']]);
+  assert.deepEqual(result.screens1, [result.screens0[1], result.screens0[0]], 'screens reorder by dragging');
+  assert.equal(result.movedAcross[0][0], 'b', 'a slice dropped on a screen moves to its top');
+  assert.deepEqual(result.movedAcross[1], ['a']);
+  assert.deepEqual(result.lastKept, result.movedAcross, 'the last slice of a screen stays');
   assert.deepEqual(result.pageErrors, []);
   await page.close();
 });

@@ -2,9 +2,9 @@ import './style.css';
 import './ui/ui.css';
 import './fx/builtins.js';
 import { createProject, createLayer, createClip, validateProject, serializeProject, Transport, LIMITS } from './model.js';
-import { listEffects, listAudioEffects, listSources, effectDefinition, audioEffectDefinition, sourceDefinition, registerEffect, registerSource } from './fx/registry.js';
+import { listEffects, listAudioEffects, listSources, effectDefinition, audioEffectDefinition, sourceDefinition, registerEffect, registerSource, compositionFeed } from './fx/registry.js';
 import { defaultParams } from './fx/shader-template.js';
-import { parseISF } from './fx/isf.js';
+
 import { Animator, BPM_SPEEDS } from './animation.js';
 import { applyAnimations } from './automation.js';
 import { PROPERTY_PARAMS, resolvePath, readOwner } from './params.js';
@@ -13,8 +13,10 @@ import { animationMenuItems, decorateAnimations, updateAnimationStrips, inOutBar
 import { ShortcutManager } from './ui/shortcuts.js';
 import { registerProjectExtension } from './model.js';
 import { normalizeOutputConfig, screenFromComposition } from './output/output-model.js';
-import { openAdvancedOutput } from './output/editor.js';
-import { OutputWindows } from './output/windows.js';
+import { evaluateExpression } from './expression.js';
+import { OutputWindows, routedSources } from './output/windows.js';
+import { Thumbnailer } from './thumbnails.js';
+import { TimecodeInput, clipTimeFromTimecode, parseTimecode, formatTimecode, timecodeToSeconds } from './smpte.js';
 import { normalizeDmxConfig, sampleFixtures, fixtureSampleRect } from './dmx.js';
 
 // Advanced Output and DMX settings are saved with the composition.
@@ -34,6 +36,7 @@ const $ = (selector, parent = document) => parent.querySelector(selector);
 const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clipThumbnail = clip => {
+  if (clip?.thumbnail) return `<img src="${clip.thumbnail}" alt="" loading="lazy">`;
   if (!clip?.url) return '';
   const mov = clip.kind === 'video' && /\.mov$/i.test(clip.path || '') && /^prism-media:/i.test(clip.url);
   if (clip.kind !== 'image' && !mov) return '';
@@ -76,32 +79,20 @@ const animationContext={getProject:()=>project,animator,spectrum:source=>spectru
   changed:(structural,{keepPanels=false}={})=>{changed(structural?true:'coalesce');if(structural&&!keepPanels)renderInspector();}};
 let animatedCount=0,lastAnimationRefresh=0,lastFeedback=0,lastFrameTime=0,effectSearch='',sourceSearch='',selectedGroupId=null,refreshQueued=false;
 const shortcutHolds=new Map();
-let shortcuts,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
+let timecode=null,lastTimecodeLabel='';
+let shortcuts,thumbnailer=null,lastColumn=-1,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
 const oscSent=new Map();
 let lastPaint=0,paintFrames=0,paintStart=0,lastActive='';
 const layerPlayheads=new Map(),clipPlayheads=new Map(),queuedSlots=new Map();
 let inspectorPlayhead=null,inspectorTime=null;
 const snapshot = () => JSON.stringify(validateProject(project));
 
-if (new URLSearchParams(location.search).has('output')) {
-  document.body.innerHTML = '<canvas id="external-output" style="display:block;width:100vw;height:100vh;object-fit:contain;background:black"></canvas>';
-  const canvas = $('#external-output'), ctx = canvas.getContext('2d');
-  let decoding = false;
-  desktop?.onOutputFrame(async bytes => {
-    if (decoding) return;
-    decoding = true;
-    try { const bitmap = await createImageBitmap(new Blob([bytes], {type:'image/jpeg'})); if(canvas.width!==bitmap.width||canvas.height!==bitmap.height){canvas.width=bitmap.width;canvas.height=bitmap.height;} ctx.drawImage(bitmap,0,0); bitmap.close(); } finally { decoding=false; }
-  });
-  window.addEventListener('keydown', e => { if(e.code==='Escape') desktop?.closeOutput(); });
-} else {
-  initialize();
-}
 
 function initialize() {
   $('#app').innerHTML = `
     <header class="topbar"><div class="brand">Prism Live</div><input type="text" class="project-title" id="project-name" aria-label="Composition name" value="${esc(project.name)}"><span class="pill" id="save-state">LOCAL SESSION</span><div class="spacer"></div><button id="new-project">New</button><button id="open-project">Open</button><button id="save-project">Save</button><div class="divider"></div><button id="record">● Record</button><button id="output" class="primary">Output</button><button id="preferences" title="Preferences">Settings</button><button id="help" title="Keyboard shortcuts">?</button></header>
     <div class="toolbar"><label>BPM</label><input id="bpm" class="tempo" type="number" min="20" max="300" step=".1" value="${project.bpm}" aria-label="Tempo"><button id="tap" class="icon-btn">Tap</button><button id="resync" class="icon-btn" title="Resync beat clock">↻</button><div class="divider"></div><label>Quantize</label><select id="quantize" aria-label="Trigger quantization"><option value="0">Immediate</option><option value=".25">¼ beat</option><option value="1">1 beat</option><option value="4">1 bar</option><option value="8">2 bars</option></select><div class="divider"></div><button data-global-direction="backward" class="icon-btn" title="Reverse all active clips; right-click to pin">◀</button><button data-global-direction="forward" class="icon-btn" title="Forward all active clips; right-click to pin">▶</button><button data-global-direction="random" class="icon-btn" title="Random playback; right-click to pin">R</button><button id="pause" class="icon-btn" title="Pause composition; right-click to pin paused clip launches">Ⅱ Pause</button><label>Speed</label><input id="global-speed" aria-label="Global speed" type="range" min=".1" max="4" step=".01" value="1"><output id="speed-value">1.00×</output><div class="spacer"></div><button id="bypass-all" class="icon-btn">Bypass all</button><button id="clear-all" class="icon-btn">Clear all</button><button id="blackout" class="icon-btn">Blackout</button></div>
-    <section class="workspace"><div class="layer-label row"><span class="muted">Composition</span><div class="spacer"></div><button id="insert-layer" class="icon-btn" title="Insert layer below selected">↧</button><button id="add-layer" class="icon-btn" title="Add layer">+</button></div><div id="column-viewport"><div id="column-heads" class="column-heads"></div></div><div id="layer-bank" class="layer-bank"></div></section>
+    <section class="workspace"><div class="layer-label row"><span class="muted">Composition</span><button id="previous-column" class="icon-btn" title="Trigger previous column" aria-label="Trigger previous column">◀</button><button id="next-column" class="icon-btn" title="Trigger next column" aria-label="Trigger next column">▶</button><div class="spacer"></div><button id="insert-layer" class="icon-btn" title="Insert layer below selected">↧</button><button id="add-layer" class="icon-btn" title="Add layer">+</button></div><div id="column-viewport"><div id="column-heads" class="column-heads"></div></div><div id="layer-bank" class="layer-bank"></div></section>
     <nav class="deckbar"><div class="crossfade"><button id="cross-a" title="Fade to A">A</button><input id="crossfader" type="range" min="0" max="1" step=".001" value=".5" aria-label="Crossfader"><button id="cross-b" title="Fade to B">B</button></div><div id="decks" class="row"></div><button id="add-deck" class="icon-btn" title="Add deck">+</button><button id="deck-actions" class="icon-btn" title="Edit selected deck">Deck…</button><button id="column-actions" class="icon-btn" title="Edit columns">Columns…</button><span class="spacer"></span><button id="copy-clip" class="icon-btn" title="Copy selected clip (Ctrl+C)">Copy</button><button id="cut-clip" class="icon-btn" title="Cut selected clip (Ctrl+X)">Cut</button><button id="paste-clip" class="icon-btn" title="Paste into selected slot (Ctrl+V)">Paste</button></nav>
     <div class="layout-splitter horizontal" data-layout-splitter="workspace" role="separator" aria-label="Resize top and bottom sections" aria-orientation="horizontal" tabindex="0"></div>
     <main class="bottom"><section class="monitor-panel"><div class="panel-title"><span id="monitor-label">Composition Monitor</span><span id="frame-count" class="muted">60 FPS</span></div><div class="monitor-wrap"><canvas id="output-canvas" width="1280" height="720"></canvas></div><div class="monitor-caption"><span id="live-label">Composition</span><span id="resolution">1280 × 720</span></div><div class="layout-splitter horizontal" data-layout-splitter="monitors" role="separator" aria-label="Resize composition and preview monitors" aria-orientation="horizontal" tabindex="0"></div><div class="panel-title preview-title"><span>Preview Monitor</span><button id="preview-toggle" title="Preview selected clip">Preview selected</button></div><div id="preview-wrap" class="monitor-wrap preview-wrap"><span class="preview-empty">Click a clip name to preview</span></div><div class="monitor-caption"><span id="preview-label">Preview · No clip selected</span></div><div class="monitor-footer"><label>Video</label><input id="master-opacity" type="range" min="0" max="1" step=".01" value="1" aria-label="Master video"><label>Audio</label><input id="master-volume" type="range" min="0" max="1" step=".01" value="1" aria-label="Master audio"><span id="audio-meter">—</span></div></section>
@@ -111,21 +102,30 @@ function initialize() {
     <section class="inspector-panel clip-panel"><div class="transport-tabs"><button data-inspector="clip" class="active">Clip</button></div><div data-inspector-panel="clip" class="inspector-content"></div></section>
     <div class="layout-splitter vertical" data-layout-splitter="panel-2" role="separator" aria-label="Resize clip and browser panels" aria-orientation="vertical" tabindex="0"></div>
     <section class="browser-panel"><div class="browser-tabs"><button data-browser="files">Files</button><button data-browser="effects">Effects</button><button data-browser="sources" class="active">Sources</button><button data-browser="controls">Control</button></div><div id="browser" class="browser-content"></div></section></main>
-    <footer class="statusbar"><span class="status-dot"></span><span id="status-text">Ready</span><span class="spacer"></span><span id="memory-status"></span><span id="beat-status">BEAT 1.1</span><span>PRISM LIVE 0.1</span></footer>`;
+    <footer class="statusbar"><span class="status-dot"></span><span id="status-text">Ready</span><span class="spacer"></span><span id="timecode-status" hidden></span><span id="memory-status"></span><span id="beat-status">BEAT 1.1</span><span>PRISM LIVE 0.1</span></footer>`;
   $('.deckbar').after($('[data-layout-splitter="workspace"]'),$('.toolbar'));
   installResizableLayout($('#app'));
   inspectorHosts.push(...$$('[data-inspector-panel]'));
   const snapshotButton=document.createElement('button');snapshotButton.id='snapshot-output';snapshotButton.textContent='Snapshot';snapshotButton.title='Save the current output as PNG';$('#record').before(snapshotButton);
   engine = new LiveEngine($('#output-canvas'), {onError: message => toast(message, true)});
-  outputs=new OutputWindows({source:$('#output-canvas'),desktop,onError:message=>toast(message,true),onClosed:()=>{outputOpen=outputs.active;$('#output').classList.toggle('active',outputOpen);}});
+  prewarmCatalog();
+  // A thumbnail is cached presentation, not an edit: patch the slot image in place.
+  thumbnailer=new Thumbnailer({onThumbnail:(clip,thumbnail)=>{
+    if(!findClip(clip.id))return;
+    clip.thumbnail=thumbnail;
+    for(const art of $$(`[data-clip="${CSS.escape(clip.id)}"] .clip-art`)){const image=art.querySelector('img')||art.insertBefore(document.createElement('img'),art.firstChild);image.alt='';image.src=thumbnail;}
+  }});
+  requestThumbnails();
+  outputs=new OutputWindows({source:$('#output-canvas'),desktop,engine,onError:message=>toast(message,true),onClosed:()=>{outputOpen=outputs.active;$('#output').classList.toggle('active',outputOpen);}});
   desktop?.onDMXInput?.(({universe,data})=>shortcuts.handleDmx(universe,data));
   engine.captureProvider={screen:async params=>{if(desktop?.selectCaptureSource)await desktop.selectCaptureSource(params.device||'');return navigator.mediaDevices.getDisplayMedia({video:true,audio:false});}};
-  shortcuts=new ShortcutManager({getProject:()=>project,toast,runAction,targetFor,actionState,
+  shortcuts=new ShortcutManager({getProject:()=>project,toast,runAction,targetFor,actionState,retarget,
     changed:(structural)=>{changed(structural);if(structural&&browserTab==='controls')renderBrowser();else if(!structural)scheduleRefresh();},
     onEditChange:()=>{if(browserTab==='controls')renderBrowser();},onDevicesChange:()=>{if(browserTab==='controls')renderBrowser();},
     onRawMidi:data=>midiMessage({data}),onClockBPM:bpm=>{project.bpm=bpm;if(document.activeElement!==$('#bpm'))$('#bpm').value=bpm;},onClockStart:()=>transport.resync(now())});
   shortcuts.clock.enabled=preferences.midiClockSync;
   if(preferences.midiClockSync)shortcuts.enableMidi().catch(()=>{});
+  if(preferences.smpteInputDevice)startTimecode();
   if(preferences.audioInputDevice)engine.setExternalAudioInput(preferences.audioInputDevice).catch(error=>toast(`External audio input unavailable: ${error.message}`,true));
   fileBrowser=new FilesBrowser({desktop,onImport:item=>item?placeMedia(item,currentLayer()):importFiles(),onPreview:item=>startPreview(createClip(item.kind,item)),onRelink:relinkAll,onError:message=>toast(message,true)});
   bindStatic();
@@ -200,13 +200,14 @@ function applyPreferences(){
 }
 function preferencesDialog(){
   const labels={clipPanelFollowsTrigger:'Clip panel follows triggered clips',showAudioControls:'Show audio controls',showLayerTransport:'Show transport in each layer',showTransitions:'Show transition controls in each layer',midiClockSync:'Sync BPM to incoming MIDI clock'};
-  const deviceSelect=(key,label)=>`<label class="select-field"><span>${label}</span><select data-device-preference="${key}"><option value="">${key==='audioInputDevice'?'None':'System default'}</option>${preferences[key]?`<option value="${esc(preferences[key])}" selected>Saved device</option>`:''}</select></label>`;
+  const deviceSelect=(key,label)=>`<label class="select-field"><span>${label}</span><select data-device-preference="${key}"><option value="">${key==='audioOutputDevice'?'System default':'None'}</option>${preferences[key]?`<option value="${esc(preferences[key])}" selected>Saved device</option>`:''}</select></label>`;
   const dialog=showDialog('Preferences',Object.entries(labels).map(([key,label])=>`<label class="preference-option"><input data-preference="${key}" type="checkbox" ${preferences[key]?'checked':''}>${label}</label>`).join('')
     +`<h3 style="margin-top:12px">Audio</h3>${deviceSelect('audioOutputDevice','Audio output')}${deviceSelect('audioInputDevice','External FFT input')}<p class="browser-note">The external input drives parameters set to Audio Analysis › external (a DJ feed, band or microphone).</p>`
+    +`<h3 style="margin-top:12px">SMPTE timecode (LTC)</h3>${deviceSelect('smpteInputDevice','LTC input')}<label class="select-field"><span>Channel</span><select data-number-preference="smpteChannel">${Array.from({length:8},(_,index)=>`<option value="${index}" ${preferences.smpteChannel===index?'selected':''}>${index+1}</option>`).join('')}</select></label><label class="select-field"><span>Frame rate</span><select data-text-preference="smpteFps">${['auto','23.976','24','25','29.97','30'].map(value=>`<option value="${value}" ${preferences.smpteFps===value?'selected':''}>${value==='auto'?'Detect':value+' fps'}</option>`).join('')}</select></label><p class="browser-note">Clips set to SMPTE transport follow this timecode from their offset.</p>`
     +'<p class="browser-note">These settings apply to this computer and survive reopening Prism Live.</p>',[['Cancel','cancel'],['Save settings','save']]);
   navigator.mediaDevices?.enumerateDevices?.().then(devices=>{
     for(const select of $$('[data-device-preference]',dialog)){
-      const kind=select.dataset.devicePreference==='audioInputDevice'?'audioinput':'audiooutput',saved=preferences[select.dataset.devicePreference];
+      const kind=select.dataset.devicePreference==='audioOutputDevice'?'audiooutput':'audioinput',saved=preferences[select.dataset.devicePreference];
       select.innerHTML=`<option value="">${kind==='audioinput'?'None':'System default'}</option>`+devices.filter(device=>device.kind===kind&&device.deviceId!=='default').map((device,index)=>`<option value="${esc(device.deviceId)}" ${device.deviceId===saved?'selected':''}>${esc(device.label||`${kind==='audioinput'?'Input':'Output'} ${index+1}`)}</option>`).join('');
     }
   }).catch(()=>{});
@@ -214,10 +215,11 @@ function preferencesDialog(){
     if(dialog.returnValue!=='save')return;
     try{
       const previous=preferences;
-      preferences=writePreferences({...preferences,...Object.fromEntries($$('[data-preference]',dialog).map(input=>[input.dataset.preference,input.checked])),...Object.fromEntries($$('[data-device-preference]',dialog).map(select=>[select.dataset.devicePreference,select.value]))});
+      preferences=writePreferences({...preferences,...Object.fromEntries($$('[data-preference]',dialog).map(input=>[input.dataset.preference,input.checked])),...Object.fromEntries($$('[data-device-preference]',dialog).map(select=>[select.dataset.devicePreference,select.value])),...Object.fromEntries($$('[data-number-preference]',dialog).map(select=>[select.dataset.numberPreference,Number(select.value)])),...Object.fromEntries($$('[data-text-preference]',dialog).map(select=>[select.dataset.textPreference,select.value]))});
       applyPreferences();renderAll();
       shortcuts.clock.enabled=preferences.midiClockSync;if(preferences.midiClockSync)shortcuts.enableMidi().catch(error=>toast(`MIDI unavailable: ${error.message}`,true));
       if(previous.audioInputDevice!==preferences.audioInputDevice)await engine.setExternalAudioInput(preferences.audioInputDevice||null);
+      if(previous.smpteInputDevice!==preferences.smpteInputDevice||previous.smpteChannel!==preferences.smpteChannel||previous.smpteFps!==preferences.smpteFps)await startTimecode();
       if(previous.audioOutputDevice!==preferences.audioOutputDevice&&engine.audioContext?.setSinkId)await engine.audioContext.setSinkId(preferences.audioOutputDevice||'');
     }catch(error){toast('Settings could not be fully applied: '+error.message,true);}
   });
@@ -275,17 +277,20 @@ function playDuration(clip){return generated(clip)?clip.duration:(clip.outPoint-
 function clipTransportHTML(clip){
   const bpm=clip.beatSync,mode=clip.random?'random':clip.loop;
   const radios=(attribute,items,active)=>`<div class="radio-group" role="radiogroup">${items.map(([value,icon,label])=>`<button ${attribute}="${value}" class="${active(value)?'active':''}" title="${label}" aria-label="${label}" aria-pressed="${active(value)}">${icon}</button>`).join('')}</div>`;
-  return `<div class="section transport-section"><div class="row transport-head"><h3 class="grow">Transport <span class="muted">· ${esc(clip.kind)}</span></h3><select id="transport-mode" aria-label="Transport mode"><option value="timeline" ${bpm?'':'selected'}>Timeline</option><option value="bpm" ${bpm?'selected':''}>BPM Sync</option></select></div>
+  return `<div class="section transport-section"><div class="row transport-head"><h3 class="grow">Transport <span class="muted">· ${esc(clip.kind)}</span></h3><select id="transport-mode" aria-label="Transport mode"><option value="timeline" ${!bpm&&!clip.smpte?'selected':''}>Timeline</option><option value="bpm" ${bpm&&!clip.smpte?'selected':''}>BPM Sync</option><option value="smpte" ${clip.smpte?'selected':''}>SMPTE</option></select></div>
     <input id="timeline" class="timeline" type="range" min="0" max="1" step=".001" value="0" aria-label="Clip playhead">${inOutBarHTML('id="clip-inout"',clip.inPoint,clip.outPoint)}
     <div class="time-labels"><span id="clip-time" title="Click to switch between time and time remaining" role="button" tabindex="0">00:00.00</span><span>${bpm?`${clip.beats} beats`:`${playDuration(clip).toFixed(2)} s`}</span></div>
     <div class="transport-row">${radios('data-direction',[[-1,'◀','Play backward'],[0,'Ⅱ','Pause'],[1,'▶','Play forward']],value=>value===0?clip.paused:clip.direction===value&&!clip.paused)}${radios('data-playmode',PLAYMODES,value=>value===mode)}<span class="grow"></span><button id="retrigger" title="Restart clip (piano clips play while held)" aria-label="Restart clip">↻</button></div>
     ${bpm?`<div class="transport-row"><label class="anim-label">Speed</label><div class="radio-group speed-steps">${BPM_SPEEDS.map(value=>`<button data-bpm-speed="${value}" class="${(clip.bpmSpeed??1)===value?'active':''}">${speedLabel(value)}</button>`).join('')}</div></div><div class="transport-row"><label class="anim-label">Beats</label><div class="beat-field"><button data-clip-beats="half" title="Divide by 2">÷2</button><button data-clip-beats="minus" title="One beat less">−</button><input id="clip-beats" type="number" min=".03125" max="4096" step="any" value="${clip.beats}" aria-label="Clip beats"><button data-clip-beats="plus" title="One beat more">+</button><button data-clip-beats="double" title="Multiply by 2">×2</button></div></div>`
       :`${range('Speed','speed',clip.speed,0,4)}<div class="transport-row"><label class="anim-label">Duration</label><div class="beat-field"><input id="clip-duration" type="number" min=".01" max="86400" step="any" value="${playDuration(clip).toFixed(2)}" aria-label="Duration in seconds"><span class="unit">s</span></div></div>`}
-    <div class="transport-row"><label class="anim-label" title="What happens when you trigger this clip again after playing something else">Away</label>${radios('data-away',[['restart','Restart','Play from the start'],['continue','Pick-up','Continue where it was']],value=>clip.trigger===value)}</div>`;
+    ${clip.smpte?`<div class="transport-row"><label class="anim-label" title="Timecode at which this clip's first frame plays">Offset</label><input id="smpte-offset" class="timecode-field" value="${esc(formatTimecode(clip.smpteOffset,timecodeFps(),false))}" aria-label="SMPTE offset" spellcheck="false"><label class="anim-label" title="After the clip's end">End</label><select id="smpte-end" aria-label="After the end">${[['hold','Hold'],['loop','Loop'],['stop','Stop']].map(([value,label])=>`<option value="${value}" ${clip.smpteEnd===value?'selected':''}>${label}</option>`).join('')}</select></div><small class="muted">${timecode?'Follows the SMPTE input once triggered.':'Choose an SMPTE input in Settings.'}</small>`:''}
+    ${mode==='random'?`<div class="transport-row"><label class="anim-label" title="How often the playhead jumps">Interval</label><div class="beat-field"><input id="random-interval" type="number" min=".01" max="86400" step="any" value="${clip.randomInterval??''}" placeholder="auto" aria-label="Random interval"><span class="unit">${bpm?'beats':'s'}</span></div><label class="anim-label" title="How far each jump may go">Distance</label><div class="beat-field"><input id="random-distance" type="number" min="0" max="86400" step="any" value="${clip.randomDistance??''}" placeholder="all" aria-label="Random distance"><span class="unit">${bpm?'beats':'s'}</span></div></div>`:''}
+    <div class="transport-row"><label class="anim-label" title="What happens when you trigger this clip again after playing something else">Away</label>${radios('data-away',[['restart','Restart','Play from the start'],['continue','Pick-up','Continue where it was'],['relative','Relative','Start at the relative position of the clip that was playing']],value=>clip.trigger===value)}</div>`;
 }
 function bindClipTransport(clip,$){
   const bpmBeats=()=>2**Math.max(-2,Math.min(10,Math.round(Math.log2(Math.max(0.01,playDuration(clip))*project.bpm/60))));
   $('#transport-mode').onchange=event=>{
+    clip.smpte=event.target.value==='smpte';
     clip.beatSync=event.target.value==='bpm';
     // Resolume guesses beats to the nearest power of two and keeps speed on the grid.
     if(clip.beatSync)clip.beats=bpmBeats();
@@ -298,6 +303,9 @@ function bindClipTransport(clip,$){
   $('#clip-beats')?.addEventListener('change',event=>{clip.beats=Math.max(.03125,Math.min(4096,Number(event.target.value)||16));changed();renderInspector();});
   // Duration sets how long in→out lasts at speed 1, independent of the Speed slider.
   $('#clip-duration')?.addEventListener('change',event=>{const seconds=Math.max(.01,Math.min(86400,Number(event.target.value)||1));if(generated(clip))clip.duration=seconds;else clip.stretch=(clip.outPoint-clip.inPoint)*clip.duration/seconds;changed();renderInspector();});
+  $('#smpte-offset')?.addEventListener('change',event=>{const parsed=parseTimecode(event.target.value,timecodeFps(),event.target.value.includes(';'));if(parsed){clip.smpteOffset=timecodeToSeconds(parsed);changed();}else toast('Use a timecode like 01:00:00:00.',true);renderInspector('clip');});
+  $('#smpte-end')?.addEventListener('change',event=>{clip.smpteEnd=event.target.value;changed();});
+  for(const [selector,key] of [['#random-interval','randomInterval'],['#random-distance','randomDistance']])$(selector)?.addEventListener('change',event=>{const value=event.target.value.trim();clip[key]=value===''?null:Math.max(key==='randomInterval'?.01:0,Math.min(86400,Number(value)||0));changed();});
   for(const button of $$('[data-away]'))button.onclick=()=>{clip.trigger=button.dataset.away;changed();renderInspector();};
   const time=$('#clip-time');if(time){time.onclick=()=>{showRemaining=!showRemaining;};time.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();showRemaining=!showRemaining;}};}
   bindInOutBar($('#clip-inout'),()=>[clip.inPoint,clip.outPoint],(lo,hi,done)=>{clip.inPoint=lo;clip.outPoint=hi;changed(done?true:'coalesce');if(done)renderInspector();});
@@ -315,7 +323,10 @@ function addEffect(target,data,alt=false){
   if(!audio){effect.opacity=alt?0:1;effect.blend='normal';}
   const preset=data.preset!==undefined?readPresets()[`${audio?'audio:':''}${data.type}`]?.[data.preset]:null;
   if(preset)applyPreset(effect,preset);
-  list.push(effect);changed();renderInspector();if(browserTab==='effects')renderBrowser();
+  list.push(effect);changed();
+  // Only the panel showing this target changes.
+  const panel=target===inspectorTarget('clip')?'clip':target===inspectorTarget(contextTab)?'context':null;
+  renderInspector(panel);
   return effect;
 }
 function stepLayerClip(layer,step){
@@ -329,10 +340,53 @@ function addPropertyCogs(host,scope,target){
     const key=range.dataset.prop;if(!keys.has(key))continue;
     const field=range.closest('.field'),path=`${base}/${key}`;
     if(field.querySelector('.param-cog'))continue;
-    field.insertAdjacentHTML('beforeend',cogButton(path,target,key));
+    field.insertAdjacentHTML('beforeend',cogButton(path,target,key));field.classList.add('has-cog');
     for(const input of $$('[data-prop],[data-number]',field))input.dataset.animateOwner=path;
     field.classList.toggle('animated',!!target.animations?.[key]);
   }
+}
+// Compile shaders in the background so first use never stalls a frame:
+// what the composition uses first, then the whole catalog.
+function prewarmCatalog(){
+  const used=new Set();
+  for(const owner of [project,...(project.groups||[]),...project.layers,...project.layers.flatMap(layer=>Object.values(layer.clips).flat()).filter(Boolean)])for(const effect of owner.effects||[])used.add(effect.type);
+  engine.prewarm([...used].map(effectDefinition).filter(Boolean),{priority:true});
+  engine.prewarm(listEffects().filter(definition=>!definition.legacy));
+  engine.prewarm(listSources().filter(definition=>definition.glsl),{kind:'source'});
+}
+// Ask for thumbnails of clips that lack one (MOVs and stills have their own).
+function requestThumbnails(){
+  for(const layer of project.layers)for(const clip of Object.values(layer.clips).flat())
+    if(clip&&!clip.thumbnail&&(clip.kind==='source'&&sourceDefinition(clip.source)?.glsl||(clip.kind==='video'&&!/\.mov$/i.test(clip.path||''))))thumbnailer?.request(clip);
+}
+// SMPTE (LTC) input: clips in SMPTE transport follow the incoming timecode
+// from their offset. They still need to be triggered (manual p. 205).
+async function startTimecode(){
+  timecode?.stop();timecode=null;
+  if(!preferences.smpteInputDevice)return updateTimecodeStatus();
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:{exact:preferences.smpteInputDevice},echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    const input=new TimecodeInput(engine.audioContext,{fps:preferences.smpteFps==='auto'?'auto':Number(preferences.smpteFps)});
+    await input.start(stream,{channel:preferences.smpteChannel});
+    timecode=input;
+  }catch(error){toast(`SMPTE input unavailable: ${error.message}`,true);}
+  updateTimecodeStatus();
+}
+function timecodeFps(){return timecode?.state.fps||(preferences.smpteFps==='auto'?25:Number(preferences.smpteFps));}
+function followTimecode(frames){
+  const state=timecode.state;
+  if(!state.locked)return;
+  for(const frame of frames){
+    if(!frame.clip.smpte||frame.transitionIncoming===false)continue;
+    const position=clipTimeFromTimecode({timecodeSeconds:state.seconds,clipOffsetSeconds:frame.clip.smpteOffset,clipDuration:frame.clip.duration,inPoint:frame.clip.inPoint,outPoint:frame.clip.outPoint,mode:frame.clip.smpteEnd});
+    if(position!==null&&Math.abs(position-frame.position)*frame.clip.duration>0.04)transport.seek(frame.layer.id,position);
+  }
+}
+function updateTimecodeStatus(){
+  const label=!timecode?'':timecode.state.locked?`TC ${timecode.state.timecode}`:'TC —';
+  if(label===lastTimecodeLabel)return;
+  lastTimecodeLabel=label;
+  const status=$('#timecode-status');if(status){status.textContent=label;status.hidden=!label;}
 }
 function spectrumFor(source){return engine.spectrum(source,source==='clip'?selectedClipId:source==='layer'?selectedLayerId:source==='group'?currentGroup()?.id:null);}
 // Like Resolume's M slider, video faders turn red below 100% so a faded
@@ -381,7 +435,12 @@ function renderLayers(){
       }
       slot.onclick=e=>{const destination=selectedLayerId;if(!clip||e.shiftKey)selectClip(layer,clip,index,e.shiftKey);if(clip&&!e.shiftKey&&!transport.isPiano(clip))trigger(layer,clip,()=>true,{selectedLayerId:destination});};
       $('.clip-name',slot)?.addEventListener('click',event=>{event.stopPropagation();selectClip(layer,clip,index,event.shiftKey);if(!event.shiftKey)startPreview(clip);});
-      slot.oncontextmenu=e=>{e.preventDefault();selectClip(layer,clip,index);};
+      slot.oncontextmenu=e=>{
+        e.preventDefault();
+        if(clip)return selectClip(layer,clip,index);
+        selectClip(layer,null,index);
+        showMenu(e,[['Import media…',()=>importFiles(layer,index)],['Import image sequence…',()=>importSequence(layer,index),!desktop?.importSequence],['-'],...['solid','gradient','text-animator'].filter(sourceDefinition).map(source=>[`Add ${sourceDefinition(source).name}`,()=>addSource(source,layer,index)])]);
+      };
       slot.ondblclick=()=>{if(!clip)importFiles(layer,index);};
       slot.onpointerdown=e=>{if(e.button===0&&!e.shiftKey&&!e.target.closest('.clip-name')&&clip&&transport.isPiano(clip)){const inputId=id(),held={layerId:layer.id,clipId:clip.id,inputId};heldPointers.set(e.pointerId,held);trigger(layer,clip,()=>heldPointers.get(e.pointerId)===held,{selectedLayerId,inputId});}};
       slot.ondragstart=e=>{if(clip)e.dataTransfer.setData('application/prism-clip',JSON.stringify({layerId:layer.id,clipId:clip.id}));};
@@ -634,16 +693,22 @@ function inspectorQueries(host,prefix){
   return {$:(selector,parent=host)=>selector==='#inspector'?host:parent.querySelector(selectorFor(selector)),$$:(selector,parent=host)=>[...parent.querySelectorAll(selectorFor(selector))]};
 }
 function activateInspector(scope){inspectorTab=scope;renderInspector();}
-function renderInspector(){
+// Rebuild the inspector panels. `only` ('context' or 'clip') rebuilds just
+// that panel when the active panel has not changed. Scroll positions are read
+// before and written after all DOM changes, so layout runs once, not per panel.
+function renderInspector(only=null){
   effectScope=inspectorTab;
   if(inspectorTab!=='clip')contextTab=inspectorTab;
   for(const button of $$('[data-inspector]'))button.classList.toggle('active',button.dataset.inspector===contextTab||button.dataset.inspector==='clip');
-  for(const [scope,name] of [[contextTab,'context'],['clip','clip']]){
-    const host=$('[data-inspector-panel="'+name+'"]'),scroll=host.scrollTop,active=scope===inspectorTab;
+  const panels=[[contextTab,'context'],['clip','clip']].filter(([,name])=>!only||only===name)
+    .map(([scope,name])=>{const host=$('[data-inspector-panel="'+name+'"]');return {scope,host,scroll:host.scrollTop};});
+  for(const {scope,host} of panels){
+    const active=scope===inspectorTab;
     host.id=active?'inspector':'secondary-inspector';host.dataset.active=String(active);host.dataset.scope=scope;
     host.onpointerdown=()=>{effectScope=scope;if(browserTab==='effects')renderBrowser();};
-    renderInspectorPanel(scope,host,active?'':'secondary-');host.scrollTop=scroll;
+    renderInspectorPanel(scope,host,active?'':'secondary-');
   }
+  for(const {host,scroll} of panels)if(scroll)host.scrollTop=scroll;
   const clipPanel=$('[data-inspector-panel="clip"]');
   inspectorPlayhead=$('.timeline',clipPanel);
   inspectorTime=$('.time-labels span',clipPanel);
@@ -652,14 +717,14 @@ function decorateInspector(host,scope){
   const sections=[...host.querySelectorAll(':scope > .section')];
   const titled=name=>sections.find(section=>section.querySelector('h3')?.textContent.startsWith(name));
   const makeSection=(title,before)=>{const section=document.createElement('div');section.className='section';const heading=document.createElement('h3');heading.textContent=title;section.append(heading);host.insertBefore(section,before);return section;};
-  const moveField=(key,section)=>{const field=host.querySelector('[data-prop="'+key+'"]')?.closest('.field');if(field)section.append(field);};
+  const moveField=(key,section)=>{const field=host.querySelector('[data-prop="'+key+'"]')?.closest('.field, .select-field');if(field)section.append(field);};
   if(scope==='composition'){
     const settings=titled('Composition settings');
     if(settings){
       const main=makeSection('Composition',settings);moveField('av',main);
       const audio=makeSection('Audio',settings);audio.classList.add('audio-section');moveField('masterVolume',audio);moveField('pan',audio);
       const video=makeSection('Video',settings);moveField('masterOpacity',video);
-      const crossfader=makeSection('CrossFader',settings);moveField('crossfader',crossfader);
+      const crossfader=makeSection('CrossFader',settings);for(const key of ['crossfader','crossfaderBlend','crossfaderCurve','crossfaderBehaviour'])moveField(key,crossfader);
       host.append(settings);
     }
   }
@@ -714,9 +779,9 @@ function renderInspectorPanel(inspectorTab,host,prefix){
   html+=transformFields(target,project,inspectorTab)+renderExtras(target,inspectorTab)+effectStackHTML(target)+(target.kind==='effect'?'':effectStackHTML(target,{audio:true}));host.innerHTML=html.replace(/\b(id|for)="([^"]+)"/g,(_,attribute,value)=>attribute+'="'+prefix+value+'"');bindExtras(target,inspectorTab,host,prefix);
   const targets=inspectorTargets(target,inspectorTab);
   const setProperty=(key,value,input)=>{
-    if(input.type==='range'||input.type==='number'){
+    if(input.type==='range'||input.type==='number'||input.dataset.number!==undefined){
       if(value===''||!Number.isFinite(Number(value)))return;
-      value=Math.max(Number(input.min),Math.min(Number(input.max),Number(value)));
+      value=Math.max(Number(input.getAttribute('min')),Math.min(Number(input.getAttribute('max')),Number(value)));
     }
     if(input.dataset.unit==='pixels')value/=input.dataset.prop==='x'||input.dataset.number==='x'?project.width:project.height;
     for(const item of targets){let next=value;if(key==='inPoint')next=Math.min(next,item.outPoint-.001);if(key==='outPoint')next=Math.max(next,item.inPoint+.001);item[key]=next;syncDashboard(item,inspectorTab,key);}
@@ -785,7 +850,7 @@ function renderInspectorPanel(inspectorTab,host,prefix){
 function grouped(definitions,query){
   const groups=new Map();
   for(const definition of definitions){
-    if(definition.legacy&&definition.kind!=='canvas'&&!['plasma','grid','rings','noise','solid'].includes(definition.id))continue;
+    if(definition.hidden||(definition.legacy&&definition.kind!=='canvas'&&!['plasma','grid','rings','noise','solid'].includes(definition.id)))continue;
     if(query&&!`${definition.name} ${definition.category} ${definition.id}`.toLowerCase().includes(query))continue;
     if(!groups.has(definition.category))groups.set(definition.category,[]);
     groups.get(definition.category).push(definition);
@@ -819,8 +884,9 @@ function sourcesBrowserHTML(){
 }
 async function importISFTexts(files){
   let added=0;const problems=[];
+  const {parseISF}=await import('./fx/isf.js');
   for(const file of files){
-    try{const {definition,kind,warnings}=parseISF(file.text,{fileName:file.name});(kind==='source'?registerSource:registerEffect)(definition);added++;if(warnings.length)problems.push(`${file.name}: ${warnings[0]}`);}
+    try{const {definition,kind,warnings}=parseISF(file.text,{fileName:file.name});(kind==='source'?registerSource:registerEffect)(definition);engine.prewarm([definition],{kind:kind==='source'?'source':'effect'});added++;if(warnings.length)problems.push(`${file.name}: ${warnings[0]}`);}
     catch(error){problems.push(`${file.name}: ${error.message}`);}
   }
   renderBrowser();
@@ -842,11 +908,12 @@ function renderBrowser(){
   if(browserTab==='files'){fileBrowser.render($('#browser'));return;}else fileBrowser.detach();
   if(browserTab==='controls')$('#browser').innerHTML=shortcuts.panelHTML()+controlExtrasHTML()+`<div class="section"><h3>Performance controls</h3><p class="browser-note">Number keys 1–0 trigger the selected layer; Shift triggers a column. Q–I trigger the top layer; A–K the middle; Z–comma the bottom. Space pauses. Escape clears blackout.</p><button id="enable-midi">${midiAccess?'MIDI connected':'Enable MIDI input'}</button><p id="midi-status" class="browser-note">${midiAccess?[...midiAccess.inputs.values()].map(x=>esc(x.name)).join(', ')||'No MIDI inputs detected':'Connect a controller, then enable MIDI.'}</p></div><div class="section"><h3>MIDI learn</h3><select id="learn-target"><option value="crossfader">Crossfader</option><option value="masterOpacity">Master video</option><option value="masterVolume">Master audio</option>${project.layers.map((l,i)=>`<option value="layer:${l.id}:opacity">${esc(l.name)} video</option>`).join('')}${Array.from({length:project.columns||8},(_,i)=>`<option value="column:${i}">Column ${i+1}</option>`).join('')}</select><button id="midi-learn" class="icon-btn">Learn</button><div id="mappings">${project.mappings.map((m,i)=>`<div class="mapping"><small class="grow">${esc(m.target)} ← ${m.type} ${m.number}</small><button data-unmap="${i}" class="icon-btn">×</button></div>`).join('')}</div></div>${desktop?.startOSC?'<div class="section"><h3>OSC input</h3><div class="row"><input id="osc-port" aria-label="OSC port" type="number" min="1024" max="65535" value="7000" style="width:80px"><button id="osc-start">Start OSC</button><button id="osc-stop">Stop</button></div><p class="browser-note">Local UDP input. /composition/video/fadeout/values, /layer1/audio/pan/values, /layer1/clip1/connect, /layer1/video/opacity/values.</p></div>':''}`;
   const sourceExtra=item=>({params:item.dataset.sourceParams?JSON.parse(item.dataset.sourceParams):undefined,name:item.dataset.sourceName});
-  for(const item of $$('[data-source]')){item.onclick=()=>addSource(item.dataset.source,currentLayer(),undefined,sourceExtra(item));item.ondragstart=e=>{e.dataTransfer.setData('application/prism-source',item.dataset.source);e.dataTransfer.setData('application/prism-source-extra',JSON.stringify(sourceExtra(item)));};}
+  for(const item of $$('[data-source]')){item.onpointerenter=()=>{const definition=sourceDefinition(item.dataset.source);if(definition?.glsl)engine.prewarm([definition],{kind:'source',priority:true});};item.onclick=()=>addSource(item.dataset.source,currentLayer(),undefined,sourceExtra(item));item.ondragstart=e=>{e.dataTransfer.setData('application/prism-source',item.dataset.source);e.dataTransfer.setData('application/prism-source-extra',JSON.stringify(sourceExtra(item)));};}
   for(const item of $$('[data-add-effect]')){
     const data={type:item.dataset.addEffect,kind:item.dataset.effectKind||'video',...(item.dataset.preset!==undefined?{preset:Number(item.dataset.preset)}:{})};
-    item.onclick=event=>{addEffect(inspectorTarget(effectScope),data,event.altKey);activateInspector(effectScope);};
+    item.onclick=event=>{if(inspectorTab!==effectScope){inspectorTab=effectScope;renderInspector();}addEffect(inspectorTarget(effectScope),data,event.altKey);};
     item.ondragstart=event=>{event.dataTransfer.setData('application/prism-effect',JSON.stringify(data));event.dataTransfer.effectAllowed='copy';};
+    if(data.kind==='video'){item.onpointerenter=()=>engine.prewarm([effectDefinition(data.type)],{priority:true});item.ondblclick=()=>previewEffect(data);}
   }
   const search=$('#effect-search')||$('#source-search');
   if(search){search.oninput=()=>{if(search.id==='effect-search')effectSearch=search.value;else sourceSearch=search.value;const position=search.selectionStart;renderBrowser();const next=$('#'+search.id);next.focus();next.setSelectionRange(position,position);};}
@@ -877,10 +944,11 @@ function bindStatic(){
   $('#clear-all').onclick=()=>{triggerRequests.clear();for(const l of project.layers)transport.stop(l.id);renderLayers();};
   $('#resync').onclick=()=>transport.resync?.(now());
   $('#tap').onclick=()=>{const t=now();if(t-(tapTimes.at(-1)||0)>2)tapTimes=[];tapTimes.push(t);if(tapTimes.length>6)tapTimes.shift();if(tapTimes.length>1){project.bpm=Math.max(20,Math.min(300,60*(tapTimes.length-1)/(t-tapTimes[0])));$('#bpm').value=project.bpm.toFixed(1);changed();}};
-  $('#cross-a').onclick=()=>fadeCrossfader(0);$('#cross-b').onclick=()=>fadeCrossfader(1);
+  for(const [selector,side] of [['#cross-a','A'],['#cross-b','B']]){const button=$(selector);button.onpointerdown=event=>{if(event.button===0)crossfaderButton(side,true);};button.onpointerup=button.onpointerleave=()=>crossfaderButton(side,false);button.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();crossfaderButton(side,true);}};button.onkeyup=event=>{if(event.key==='Enter'||event.key===' ')crossfaderButton(side,false);};}
   $('#layer-bank').onscroll=e=>{$('#column-viewport').scrollLeft=e.target.scrollLeft;};
   for(const b of $$('[data-inspector]'))b.onclick=()=>{inspectorTab=b.dataset.inspector;renderInspector();if(browserTab==='effects')renderBrowser();};
   for(const b of $$('[data-browser]'))b.onclick=()=>{browserTab=b.dataset.browser;renderBrowser();};
+  $('#previous-column').onclick=()=>stepColumn(-1);$('#next-column').onclick=()=>stepColumn(1);
   $('#add-layer').onclick=()=>editComposition(()=>{selectedLayerId=composition.addLayer(project).id;});
   $('#insert-layer').onclick=()=>editComposition(()=>{selectedLayerId=composition.addLayer(project,undefined,project.layers.indexOf(currentLayer())).id;});
   $('#add-deck').onclick=()=>editComposition(()=>{project.selectedDeckId=composition.addDeck(project).id;});
@@ -897,6 +965,25 @@ function bindStatic(){
   window.addEventListener('blur',()=>{pendingDashboardDrag=null;for(const [key,value] of heldKeys){releaseHeld(value);heldKeys.delete(key);}for(const value of heldPointers.values())releaseHeld(value);heldPointers.clear();});
   window.addEventListener('dragover',e=>e.preventDefault());window.addEventListener('drop',e=>e.preventDefault());
   document.addEventListener('pointerdown',()=>engine.audioContext?.resume().catch(()=>{}));
+  // Number fields accept math ("1920/3", "/2") and ↑/↓ nudges, like
+  // Resolume's Dingetje (manual p. 132). Runs before the field's own handler.
+  const numberField=target=>target instanceof HTMLInputElement&&target.dataset.number!==undefined;
+  document.addEventListener('change',event=>{
+    if(!numberField(event.target))return;
+    const input=event.target,value=evaluateExpression(input.value,Number(input.defaultValue)||0);
+    if(Number.isFinite(value))input.value=String(Number(value.toFixed(6)));
+  },true);
+  document.addEventListener('keydown',event=>{
+    if(!numberField(event.target))return;
+    const input=event.target;
+    if(event.key==='Enter'){event.preventDefault();input.blur();return;}
+    if(event.key!=='ArrowUp'&&event.key!=='ArrowDown')return;
+    event.preventDefault();
+    const step=(Number(input.getAttribute('step'))||0.01)*(event.shiftKey?10:1)*(event.key==='ArrowUp'?1:-1);
+    const current=evaluateExpression(input.value,0);
+    input.value=String(Number(((Number.isFinite(current)?current:0)+step).toFixed(6)));
+    input.dispatchEvent(new Event('change',{bubbles:true}));
+  },true);
   // Parameter cogwheels open the animation menu (manual p. 141).
   document.addEventListener('click',event=>{
     const cog=event.target.closest('[data-animate-path]');
@@ -928,6 +1015,7 @@ function targetFor(element){
   if(el.dataset.clip)return `action/clip/${el.dataset.clip}/trigger`;
   if(el.dataset.column!==undefined)return `action/column/${el.dataset.column}`;
   if(el.dataset.deck)return `action/deck/${el.dataset.deck}`;
+  if(el.id==='previous-column'||el.id==='next-column')return `action/composition/${el.id==='next-column'?'next':'previous'}-column`;
   return {'master-opacity':'composition/masterOpacity','master-volume':'composition/masterVolume',crossfader:'composition/crossfader','global-speed':'composition/speed',bpm:'composition/bpm',pause:'composition/paused',blackout:'composition/blackout','bypass-all':'composition/bypass',tap:'action/composition/tap','clear-all':'action/composition/clear','cross-a':'action/composition/fade-a','cross-b':'action/composition/fade-b',resync:'action/composition/resync'}[el.id]||null;
 }
 function runAction(path,pressed,inputId=id()){
@@ -944,7 +1032,14 @@ function runAction(path,pressed,inputId=id()){
   if(kind==='layer'){const layer=project.layers.find(item=>item.id===a);if(!layer)return;if(b==='clear'){triggerRequests.delete(layer.id);transport.stop(layer.id);}else if(b==='next')stepLayerClip(layer,1);else if(b==='previous')stepLayerClip(layer,-1);renderLayers();}
   else if(kind==='group'&&b==='clear'){for(const layer of project.layers)if(layer.groupId===a){triggerRequests.delete(layer.id);transport.stop(layer.id);}renderLayers();}
   else if(kind==='deck'&&project.decks.some(deck=>deck.id===a)){project.selectedDeckId=a;changed();renderDecks();renderLayers();}
-  else if(kind==='composition'){if(a==='tap')$('#tap').click();else if(a==='clear')$('#clear-all').click();else if(a==='fade-a')fadeCrossfader(0);else if(a==='fade-b')fadeCrossfader(1);else if(a==='resync')transport.resync(now());}
+  else if(kind==='composition'){if(a==='tap')$('#tap').click();else if(a==='clear')$('#clear-all').click();else if(a==='fade-a')crossfaderButton('A',true),crossfaderButton('A',false);else if(a==='fade-b')crossfaderButton('B',true),crossfaderButton('B',false);else if(a==='resync')transport.resync(now());else if(a==='next-column')stepColumn(1);else if(a==='previous-column')stepColumn(-1);}
+}
+// Map a shortcut path onto the selected layer/clip/group (Shortcut Target "Selected").
+function retarget(path){
+  const parts=path.split('/'),scope=parts[0]==='action'?parts[1]:parts[0],at=parts[0]==='action'?2:1;
+  const id=scope==='layer'?selectedLayerId:scope==='clip'?selectedClipId:scope==='group'?currentGroup()?.id:null;
+  if(!id)return null;
+  parts[at]=id;return parts.join('/');
 }
 function actionState(path){const [,kind,a]=path.split('/');if(kind==='clip')return project.layers.some(layer=>layer.activeClipId===a);if(kind==='deck')return project.selectedDeckId===a;return false;}
 function releaseHeld(held){for(const voice of held.clips||[held])transport.release(voice.layerId,voice.clipId,{inputId:voice.inputId});}
@@ -966,7 +1061,8 @@ async function trigger(layer,clip,stillHeld=()=>true,options={}){
   finally{if(triggerRequests.get(key)===request)triggerRequests.delete(key);}
 }
 
-async function triggerColumn(index,{inputId,stillHeld=()=>true,held,groupId}={}){const items=project.layers.filter(layer=>groupId?layer.groupId===groupId:!groupOfLayer(layer)?.ignoreColumn).map(layer=>({layer,clip:clipList(layer)[index],request:id()})).filter(item=>item.clip&&!item.layer.ignoreColumn&&!item.clip.ignoreColumn&&!findClip(item.layer.activeClipId)?.clip.ignoreColumn);if(held)held.clips=items.map(item=>({layerId:item.layer.id,clipId:item.clip.id,inputId}));for(const item of items)triggerRequests.set(item.layer.id,item.request);const results=await Promise.allSettled(items.map(item=>engine.prepare(item.clip)));const time=now();for(let i=0;i<items.length;i++){const item=items[i];if(results[i].status==='rejected'){toast(`Cannot play ${item.clip.name}: ${results[i].reason.message}`,true);continue;}if(triggerRequests.get(item.layer.id)===item.request&&findClip(item.clip.id)&&(!transport.isPiano(item.clip)||stillHeld()))transport.trigger(item.layer.id,item.clip.id,time,{target:'own',inputId});}engine.audioContext?.resume().catch(()=>{});renderLayers();return items.map(item=>({layerId:item.layer.id,clipId:item.clip.id,inputId}));}
+function stepColumn(step){const count=project.columns||8;triggerColumn(((lastColumn<0?(step>0?-1:count):lastColumn)+step+count)%count);}
+async function triggerColumn(index,{inputId,stillHeld=()=>true,held,groupId}={}){if(!groupId)lastColumn=index;const items=project.layers.filter(layer=>groupId?layer.groupId===groupId:!groupOfLayer(layer)?.ignoreColumn).map(layer=>({layer,clip:clipList(layer)[index],request:id()})).filter(item=>item.clip&&!item.layer.ignoreColumn&&!item.clip.ignoreColumn&&!findClip(item.layer.activeClipId)?.clip.ignoreColumn);if(held)held.clips=items.map(item=>({layerId:item.layer.id,clipId:item.clip.id,inputId}));for(const item of items)triggerRequests.set(item.layer.id,item.request);const results=await Promise.allSettled(items.map(item=>engine.prepare(item.clip)));const time=now();for(let i=0;i<items.length;i++){const item=items[i];if(results[i].status==='rejected'){toast(`Cannot play ${item.clip.name}: ${results[i].reason.message}`,true);continue;}if(triggerRequests.get(item.layer.id)===item.request&&findClip(item.clip.id)&&(!transport.isPiano(item.clip)||stillHeld()))transport.trigger(item.layer.id,item.clip.id,time,{target:'own',inputId});}engine.audioContext?.resume().catch(()=>{});renderLayers();return items.map(item=>({layerId:item.layer.id,clipId:item.clip.id,inputId}));}
 function addSource(source,layer=currentLayer(),index,extra={}){
   if(layer.locked)return toast(`${layer.name} is locked. Unlock it in the layer panel to change its content.`);
   const deckId=project.selectedDeckId;
@@ -978,11 +1074,16 @@ function addSource(source,layer=currentLayer(),index,extra={}){
   const clip=source==='effect-clip'?createClip('effect',{name:extra.name||'Effect clip'}):createClip('source',{name:extra.name||definition?.name||source,source,params:extra.params});
   const slots=storedClipList(layer,deckId),previous=slots[index];
   if(previous){if(previous.id===layer.activeClipId)transport.stop(layer.id);engine.remove(previous.id);}
-  slots[index]=clip;selectClip(layer,clip,index);changed();renderAll();
+  slots[index]=clip;selectClip(layer,clip,index);changed();renderAll();requestThumbnails();
 }
 async function importFiles(layer=currentLayer(),index){
   if(desktop){try{const files=await desktop.importMedia();for(const file of files||[]){await placeMedia(file,layer,index);if(index!==undefined)index++;}}catch(e){toast(e.message,true);}return;}
   const input=document.createElement('input');input.type='file';input.accept='video/*,audio/*,image/*';input.multiple=true;input.onchange=()=>importFileList([...input.files],layer,index);input.click();
+}
+// Image sequences (manual p. 65): a folder of numbered stills plays as a clip.
+async function importSequence(layer=currentLayer(),index){
+  if(!desktop?.importSequence)return toast('Image sequences need the Windows app.');
+  try{const item=await desktop.importSequence();if(item)await placeMedia(item,layer,index);}catch(error){toast(`Image sequence import failed: ${error.message}`,true);}
 }
 async function importFileList(files,layer,index){for(const file of files){let item;if(desktop?.getPathForFile){const path=desktop.getPathForFile(file);[item]=await desktop.importPaths([path]);}else{const url=URL.createObjectURL(file);objectURLs.add(url);item={name:file.name,url,path:'',kind:file.type.startsWith('audio/')?'audio':file.type.startsWith('image/')?'image':kindFor(file.name)};}await placeMedia(item,layer,index);if(index!==undefined)index++;}}
 function kindFor(name){return /\.(png|jpe?g|gif|bmp|webp|avif|svg)$/i.test(name)?'image':/\.(wav|mp3|ogg|flac|m4a|aac|aiff?)$/i.test(name)?'audio':'video';}
@@ -1005,7 +1106,7 @@ async function placeMedia(item,layer,index){
     slots[index]=clip;
     if(!mediaLibrary.some(m=>m.path===item.path&&m.url===item.url))mediaLibrary.push(item);
     if(project.selectedDeckId===deckId)selectClip(layer,clip,index);
-    changed();renderAll();toast(`Imported ${clip.name}`);return clip;
+    changed();renderAll();requestThumbnails();toast(`Imported ${clip.name}`);return clip;
   }catch(e){engine.remove(clip.id);toast(`Cannot import ${item.name}: ${e.message}`,true);return null;}
 }
 
@@ -1085,7 +1186,7 @@ function loadProject(data){
   for(const owner of [project,...project.layers])if(owner.mask)engine.removeMask(owner.mask.id);
   for(const layer of project.layers)for(const clip of Object.values(layer.clips).flat())if(clip)engine.remove(clip.id);
   project=valid;transport=new Transport(project);selectedLayerId=project.layers.at(-1).id;selectedClipId=null;undoStack=[];redoStack=[];lastHistory=snapshot();dirty=false;
-  engine.resize(project.width,project.height);transport.tick(now());
+  engine.resize(project.width,project.height);transport.tick(now());prewarmCatalog();requestThumbnails();
   for(const clipId of new Set(project.layers.map(layer=>layer.activeClipId).filter(Boolean))){const clip=findClip(clipId)?.clip;if(clip)engine.prepare(clip).catch(error=>toast(error.message,true));}
   renderAll();$('#save-state').textContent='LOADED';toast(`Loaded ${project.name}`);
 }
@@ -1113,9 +1214,11 @@ async function captureSnapshot(kind){
       const time=now();currentPreview.project.width=project.width;currentPreview.project.height=project.height;currentPreview.project.bpm=project.bpm;
       const frames=currentPreview.transport.tick(time).map(frame=>({...frame,clip:{...frame.clip,opacity:1,volume:0}}));
       currentPreview.engine.render(currentPreview.project,frames,time);
+      if(currentPreview.engine.flushPrograms())currentPreview.engine.render(currentPreview.project,frames,time);
       capturedEngine=currentPreview.engine;
     }else if(kind==='output'){
-      const time=now();engine.render(project,transport.tick(time),time);
+      const time=now(),frames=transport.tick(time);engine.render(project,frames,time,{beat:transport.beat});
+      if(engine.flushPrograms())engine.render(project,frames,time,{beat:transport.beat});
     }else throw new Error('Unknown snapshot type.');
     const blob=await capturedEngine.capturePNG({transparent:kind==='clip'});
     const filename=`Prism-${kind}-${new Date().toISOString().replace(/[:.]/g,'-')}.png`;
@@ -1196,7 +1299,9 @@ async function openOutput(){
     outputOpen=opened>0||!!desktop?.openOutput;$('#output').classList.toggle('active',outputOpen);
   });
 }
-function openOutputEditor(){
+async function openOutputEditor(){
+  if(outputEditor)return;
+  const {openAdvancedOutput}=await import('./output/editor.js');
   if(outputEditor)return;
   const host=document.createElement('div');host.className='output-overlay';document.body.append(host);
   const config=project.advancedOutput||normalizeOutputConfig(null,{compositionWidth:project.width,compositionHeight:project.height});
@@ -1205,8 +1310,9 @@ function openOutputEditor(){
     displays:displaysCache.map(item=>({id:String(item.id),label:item.label,width:item.width,height:item.height})),
     layers:project.layers.map(layer=>({id:layer.id,name:layer.name})),groups:(project.groups||[]).map(group=>({id:group.id,name:group.name})),
     outputOptions:outputs.options,onOutputOptions:options=>outputs.setOptions(options),
-    onChange:next=>{project.advancedOutput=next;changed();if(outputs.active)outputs.sync(next,{displays:displaysCache});},
-    onClose:done});
+    onChange:next=>{project.advancedOutput=next;changed();if(outputs.active)outputs.sync(next,{displays:displaysCache});else engine.setReadbacks(routedSources(next).map(source=>source.replace(/^(layer|group):/,'')));},
+    onClose:()=>{if(!outputs.active)engine.setReadbacks([]);done();}});
+  engine.setReadbacks(routedSources(config).map(source=>source.replace(/^(layer|group):/,'')));
   const escape=event=>{if(event.key==='Escape'&&!event.defaultPrevented&&outputEditor&&!$('dialog[open]')){document.removeEventListener('keydown',escape);done();}};
   document.addEventListener('keydown',escape);
 }
@@ -1303,6 +1409,17 @@ function startPreview(clip){
   preview={canvas,engine:previewEngine,clip,project:previewProject,transport:new Transport(previewProject),ready:previewEngine.prepare(clip)};
   preview.ready.catch(error=>toast(error.message,true));$('#preview-label').textContent='Preview · '+clip.name;$('#preview-toggle').classList.add('active');
 }
+// Double-clicking an effect previews it over the live composition.
+function previewEffect(data){
+  const definition=effectDefinition(data.type);
+  if(!definition)return;
+  if(!sourceDefinition('composition-feed'))registerSource(compositionFeed($('#output-canvas')));
+  const effect={id:id(),type:data.type,enabled:true,opacity:1,blend:'normal',params:defaultParams(definition),animations:{}};
+  const preset=data.preset!==undefined?readPresets()[data.type]?.[data.preset]:null;
+  if(preset)applyPreset(effect,preset);
+  startPreview(createClip('source',{name:`${definition.name} on composition`,source:'composition-feed',effects:[effect]}));
+  $('#preview-label').textContent=`Preview · ${definition.name} over the composition (drag it onto a panel to use it)`;
+}
 function togglePreview(){
   if(preview)return stopPreview();const clip=currentClip();if(!clip)return toast('Select a clip to preview.');startPreview(clip);
 }
@@ -1311,12 +1428,13 @@ function frame(timestamp){
   const t=timestamp/1000;
   try{const frames=transport.tick(t);const dt=lastFrameTime?Math.min(1,Math.max(0,t-lastFrameTime)):0;lastFrameTime=t;
     animatedCount=applyAnimations(project,frames,animator,{dt:project.paused?0:dt,beat:transport.beat,spectrum:(source,owner)=>engine.spectrum(source,owner)});
+    if(timecode)followTimecode(frames);
     engine.render(project,frames,t,{beat:transport.beat});
     if(animatedCount&&t-lastAnimationRefresh>1/30){lastAnimationRefresh=t;refreshControls();}
     for(const host of inspectorHosts)if(host.animationStrips?.length)updateAnimationStrips(host,animationContext);
     if(shortcuts&&t-lastFeedback>.05){lastFeedback=t;shortcuts.syncFeedback();}
     outputs?.present(t);
-    if(outputEditor&&t-(outputEditor.lastUpdate||0)>1/30){outputEditor.lastUpdate=t;outputEditor.update?.($('#output-canvas'));}
+    if(outputEditor&&t-(outputEditor.lastUpdate||0)>1/30){outputEditor.lastUpdate=t;outputEditor.update?.($('#output-canvas'),new Map(routedSources(project.advancedOutput).map(source=>[source,engine.readback(source.replace(/^(layer|group):/,''))]).filter(([,frame])=>frame)));}
     if(dmxActive&&project.dmx?.enabled&&t-lastDmx>1/Math.max(1,project.dmx.rate||44)){lastDmx=t;sendDmxFrame();}
     if(preferences.oscOutEnabled&&desktop?.sendOSC&&t-lastOscOut>.05){lastOscOut=t;sendOSCFeedback();}if(preview){preview.project.bpm=project.bpm;preview.project.width=project.width;preview.project.height=project.height;preview.engine.render(preview.project,preview.transport.tick(t).map(f=>({...f,clip:{...f.clip,opacity:1,volume:0}})),t);}
     const active=project.layers.map(l=>l.activeClipId).join(',');if(active!==lastActive)renderLayers();
@@ -1330,14 +1448,27 @@ function frame(timestamp){
         if(inspectorTime)inspectorTime.textContent=showRemaining?`-${formatTime(Math.max(0,(f.clip.outPoint-f.position)*f.clip.duration))}`:formatTime(f.time);
       }
     }
-    paintFrames++;if(t-lastPaint>.1){lastPaint=t;for(const layer of project.layers){const queued=transport.getState(layer.id)?.pendingClipId;for(const slot of queuedSlots.get(layer.id)||[])slot.classList.toggle('queued',slot.dataset.clip===queued);}const beat=transport.beat??t*project.bpm/60;$('#beat-status').textContent=`BEAT ${Math.floor(beat/4)%999+1}.${Math.floor(beat%4)+1}`;if(recorder?.state==='recording')$('#record').textContent='■ '+formatTime(t-recordingStarted);}
+    paintFrames++;if(t-lastPaint>.1){lastPaint=t;if(timecode)updateTimecodeStatus();for(const layer of project.layers){const queued=transport.getState(layer.id)?.pendingClipId;for(const slot of queuedSlots.get(layer.id)||[])slot.classList.toggle('queued',slot.dataset.clip===queued);}const beat=transport.beat??t*project.bpm/60;$('#beat-status').textContent=`BEAT ${Math.floor(beat/4)%999+1}.${Math.floor(beat%4)+1}`;if(recorder?.state==='recording')$('#record').textContent='■ '+formatTime(t-recordingStarted);}
     if(t-paintStart>1){$('#frame-count').textContent=`${Math.round(paintFrames/(t-paintStart))} FPS`;paintFrames=0;paintStart=t;const stats=engine.getStats?.();if(stats?.audioRms!==undefined)$('#audio-meter').textContent=stats.audioRms>0?Math.round(20*Math.log10(stats.audioRms))+' dB':'silent';$('#memory-status').textContent=stats?.mediaCount!==undefined?`${stats.mediaCount} media loaded`:'';}
     if(outputOpen&&!outputs?.active&&!sendingFrame&&t-lastOutputFrame>1/30){sendingFrame=true;lastOutputFrame=t;$('#output-canvas').toBlob(async blob=>{try{if(blob)await desktop.sendOutputFrame(await blob.arrayBuffer());}finally{sendingFrame=false;}},'image/jpeg',.9);}
   }catch(e){if(!frame.lastError||t-frame.lastError>5){frame.lastError=t;toast(`Render error: ${e.message}`,true);}}
   requestAnimationFrame(frame);
 }
 function formatTime(seconds){return `${String(Math.floor(seconds/60)).padStart(2,'0')}:${(seconds%60).toFixed(2).padStart(5,'0')}`;}
-let fadeToken=0;function fadeCrossfader(to){const token=++fadeToken,start=now(),from=project.crossfader;function step(){if(token!==fadeToken)return;const a=Math.min(1,(now()-start)/2);project.crossfader=from+(to-from)*a;$('#crossfader').value=project.crossfader;if(a<1)requestAnimationFrame(step);else changed();}step();}
+let fadeToken=0,crossReturn=null,crossHeld=null;
+function setCrossfader(value){fadeToken++;project.crossfader=value;$('#crossfader').value=value;changed('coalesce');}
+function fadeCrossfader(to,seconds=2){const token=++fadeToken,start=now(),from=project.crossfader;function step(){if(token!==fadeToken)return;const a=Math.min(1,(now()-start)/seconds);project.crossfader=from+(to-from)*a;$('#crossfader').value=project.crossfader;if(a<1)requestAnimationFrame(step);else changed();}step();}
+// A/B buttons follow the composition's Crossfader Behaviour (manual p. 49).
+function crossfaderButton(side,down){
+  const target=side==='A'?0:1,mode=project.crossfaderBehaviour||'fade';
+  if(!down){if(mode==='cut'&&crossHeld===side&&crossReturn!==null){setCrossfader(crossReturn);crossReturn=null;}crossHeld=null;return;}
+  if(crossHeld===side)return;
+  crossHeld=side;
+  if(mode==='fade')fadeCrossfader(target,4*60/Math.max(20,project.bpm||120));
+  else if(mode==='jump')setCrossfader(target);
+  else if(mode==='jump-return'){if(Math.abs(project.crossfader-target)<1e-6&&crossReturn!==null){setCrossfader(crossReturn);crossReturn=null;}else{crossReturn=project.crossfader;setCrossfader(target);}}
+  else{crossReturn=project.crossfader;setCrossfader(target);}
+}
 
 function keyDown(e){
   if(e.ctrlKey&&e.shiftKey&&(e.code==='KeyK'||e.code==='KeyM')&&!$('dialog[open]')){
@@ -1414,3 +1545,18 @@ window.prismOutputProbe=()=>{
   outputs.present(t);
   return {composition:center,outputs:[...outputs.windows.values()].map(entry=>entry.mapper.readPixel(Math.floor(entry.canvas.width/2),Math.floor(entry.canvas.height/2)))};
 };
+
+// Start last, so every module-level binding above is initialized first.
+if (new URLSearchParams(location.search).has('output')) {
+  document.body.innerHTML = '<canvas id="external-output" style="display:block;width:100vw;height:100vh;object-fit:contain;background:black"></canvas>';
+  const canvas = $('#external-output'), ctx = canvas.getContext('2d');
+  let decoding = false;
+  desktop?.onOutputFrame(async bytes => {
+    if (decoding) return;
+    decoding = true;
+    try { const bitmap = await createImageBitmap(new Blob([bytes], {type:'image/jpeg'})); if(canvas.width!==bitmap.width||canvas.height!==bitmap.height){canvas.width=bitmap.width;canvas.height=bitmap.height;} ctx.drawImage(bitmap,0,0); bitmap.close(); } finally { decoding=false; }
+  });
+  window.addEventListener('keydown', e => { if(e.code==='Escape') desktop?.closeOutput(); });
+} else {
+  initialize();
+}

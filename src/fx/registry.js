@@ -70,3 +70,9 @@ export const SPECIAL_SOURCES = Object.freeze([
   ] },
 ]);
 for (const definition of SPECIAL_SOURCES) registerSource(definition);
+
+// Not listed in the browser: the live composition as a canvas, used to
+// preview an effect over what is playing (manual p. 80, double-click).
+export function compositionFeed(canvas) {
+  return { id: 'composition-feed', name: 'Composition', category: 'Hidden', kind: 'canvas', hidden: true, params: [], create: () => ({ render: () => canvas, dispose() {} }) };
+}

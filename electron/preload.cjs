@@ -22,6 +22,7 @@ function subscribe(channel, callback) {
 contextBridge.exposeInMainWorld('desktop', {
   importMedia: () => ipcRenderer.invoke('prism:import'),
   importPaths: paths => ipcRenderer.invoke('prism:import-paths', paths),
+  importSequence: (folder, fps) => ipcRenderer.invoke('prism:import-sequence', folder, fps),
   mediaThumbnails: paths => ipcRenderer.invoke('prism:media-thumbnails', paths),
   onMediaProgress: callback => subscribe('prism:media-progress', callback),
   browseRoots: () => ipcRenderer.invoke('prism:media-roots'),

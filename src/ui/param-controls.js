@@ -25,7 +25,7 @@ export function paramControlHTML(param, value, path, owner, key = param.key) {
   if (param.type === 'text') return `<div class="param-row param-text"><label>${label}</label><textarea ${data} rows="${param.multiline === false ? 1 : 2}" maxlength="${param.maxLength || 4096}">${esc(v)}</textarea></div>`;
   if (param.type === 'point') return `<div class="param-row param-point"><label>${label}</label>${['X', 'Y'].map((axis, index) => `<input type="range" ${data} data-axis="${index}" min="${param.min ?? 0}" max="${param.max ?? 1}" step="0.001" value="${v[index]}" aria-label="${label} ${axis}">`).join('')}${cog}</div>`;
   const step = param.step ?? (param.type === 'int' ? 1 : (param.max - param.min) / 1000);
-  return `<div class="param-row"><label title="Double-click the slider to reset">${label}</label><input type="range" ${data} min="${param.min}" max="${param.max}" step="${step}" value="${v}"><input type="number" class="number-value" ${data} data-number min="${param.min}" max="${param.max}" step="${step}" value="${Number(v).toFixed(decimals(param))}" aria-label="${label} value">${cog}</div>`;
+  return `<div class="param-row"><label title="Double-click the slider to reset">${label}</label><input type="range" ${data} min="${param.min}" max="${param.max}" step="${step}" value="${v}"><input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" class="number-value" ${data} data-number min="${param.min}" max="${param.max}" step="${step}" value="${Number(v).toFixed(decimals(param))}" aria-label="${label} value">${cog}</div>`;
 }
 
 // Read a control's value in the parameter's own type.

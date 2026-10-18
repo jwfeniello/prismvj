@@ -3,6 +3,7 @@ import { GifPlayback, isGifAsset } from './gif-playback.js';
 import { buildEffectShader, buildSourceShader, bindParams, uniformNames, effectPasses } from './fx/shader-template.js';
 import { effectDefinition, sourceDefinition } from './fx/registry.js';
 import { AudioEffectChain } from './audio-fx.js';
+import { crossfadeGain } from './model.js';
 
 const reverseMediaURL = clip => clip?.kind === 'video' && /\.mov$/i.test(clip.path || '')
   && /^prism-media:/i.test(clip.url || '') ? `${clip.url}${clip.url.includes('?') ? '&' : '?'}reverse=1` : null;
@@ -135,6 +136,15 @@ void main() {
   frag = vec4(pixel.rgb,uOpaque ? 1.0 : pixel.a);
 }`;
 
+// RGB channel switches for generated sources (inputs are premultiplied).
+const CHANNELS = `#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 frag;
+uniform sampler2D uImage;
+uniform vec3 uChannels;
+void main() { vec4 c = texture(uImage, uv); frag = vec4(c.rgb * uChannels, c.a); }`;
+
 const MASK = `#version 300 es
 precision highp float;
 in vec2 uv;
@@ -155,7 +165,8 @@ const EFFECTS = { invert: 1, grayscale: 2, brightness: 3, contrast: 4, saturatio
 const SOURCES = { plasma: 1, grid: 2, rings: 3, noise: 4, solid: 5 };
 const clamp = (v, low = 0, high = 1) => Math.min(high, Math.max(low, Number.isFinite(Number(v)) ? Number(v) : low));
 const number = (v, fallback = 0) => Number.isFinite(Number(v)) ? Number(v) : fallback;
-const groupGain = (group, fader) => group === 'A' || group === 'a' ? Math.min(1, (1-fader)*2) : group === 'B' || group === 'b' ? Math.min(1, fader*2) : 1;
+const busOf = value => value === 'A' || value === 'a' ? 'A' : value === 'B' || value === 'b' ? 'B' : null;
+const groupGain = (group, fader, curve = 'overlap') => crossfadeGain(busOf(group), fader, curve);
 // Older projects and direct callers store a single `amount` instead of params.
 const effectParams = effect => effect.params || (effect.amount !== undefined ? { amount: effect.amount } : {});
 // Capture devices and screen capture behave like video media without a file.
@@ -197,11 +208,13 @@ export class LiveEngine {
     // Lazily compiled catalog programs, per-instance feedback buffers, canvas
     // sources (Text Animator) and cached layer outputs for routers/outputs.
     this.fxPrograms = new Map();
+    this.prewarmQueue = [];
     this.feedback = new Map();
     this.canvasSources = new Map();
     this.generatorClocks = new Map();
     this.layerCache = new Map();
     this.cacheRequests = new Set();
+    this.readbacks = new Map();
     this.analysers = new Map();
     this.spectra = new Map();
     this.audioBands = [0, 0, 0, 0];
@@ -233,6 +246,9 @@ export class LiveEngine {
       this.lastFinished = null;
       this.programs = [];
       this.fxPrograms.clear();
+      this.prewarmQueue = [];
+      this.busTargets = null;
+      for (const entry of this.readbacks.values()) { entry.buffer = entry.fence = null; entry.data = null; }
       this.feedback.clear();
       this.layerCache.clear();
       for (const source of this.canvasSources.values()) source.texture = null;
@@ -345,7 +361,7 @@ export class LiveEngine {
       bus = { gain, panner, input: gain, level: 1, pan: 0 };
       this.audioGroups.set(group.id, bus);
     }
-    const level = group.bypass ? 0 : clamp(group.volume ?? 1)*groupGain(group.crossfader, clamp(project?.crossfader ?? 0.5));
+    const level = group.bypass ? 0 : clamp(group.volume ?? 1)*groupGain(group.crossfader, clamp(project?.crossfader ?? 0.5), project?.crossfaderCurve);
     if (bus.level !== level) { bus.gain.gain.setTargetAtTime(level, this._audioContext.currentTime, 0.012); bus.level = level; }
     const pan = clamp(group.pan ?? 0, -1, 1);
     if (bus.pan !== pan) { bus.panner.pan.setTargetAtTime(pan, this._audioContext.currentTime, 0.012); bus.pan = pan; }
@@ -410,6 +426,8 @@ export class LiveEngine {
     this.compositeProgram = this._program(COMPOSITE_FRAGMENT, ['uBase', 'uTop', 'uBlend', 'uOpacity', 'uTime', 'uResolution', 'uTransition']);
     this.copyProgram = this._program(COPY, ['uImage', 'uOpacity', 'uOpaque']);
     this.maskProgram = this._program(MASK, ['uImage', 'uMask', 'uAlpha', 'uInvert', 'uLuma']);
+    this.channelsProgram = this._program(CHANNELS, ['uImage', 'uChannels']);
+    this.parallelCompile = gl.getExtension('KHR_parallel_shader_compile');
     this.vao = gl.createVertexArray();
     gl.bindVertexArray(this.vao);
     gl.disable(gl.DEPTH_TEST);
@@ -764,7 +782,18 @@ export class LiveEngine {
     this._builtins(u, number(time));
     bindParams(gl, u, definition, this._sourceParams(clip, definition));
     this._draw();
-    return this._fullFrame(this.targets[0]);
+    return this._channels(clip, this._fullFrame(this.targets[0]));
+  }
+
+  _channels(clip, input) {
+    if (clip.red !== false && clip.green !== false && clip.blue !== false) return input;
+    const target = this._scratch(input), gl = this.gl, u = this._use(this.channelsProgram);
+    this._bind(target);
+    this._sample(input.texture, u.uImage);
+    gl.uniform3f(u.uChannels, clip.red === false ? 0 : 1, clip.green === false ? 0 : 1, clip.blue === false ? 0 : 1);
+    this._draw();
+    this._copySize(input, target);
+    return target;
   }
 
   _canvasSource(clip, definition, time) {
@@ -797,11 +826,17 @@ export class LiveEngine {
 
   // Video Router (manual p. 79): the composition below this layer, or a
   // cached layer/group output requested earlier in the frame.
+  // Input Opacity / Input Bypass (manual p. 80) act as a post-fader switch:
+  // when on, the router follows the source layer's opacity and bypass/solo.
   _routerSource(clip) {
     const input = typeof clip.params?.input === 'string' ? clip.params.input : 'below';
-    const routed = input === 'below' ? this.routerBase : this.layerCache.get(input.replace(/^(layer|group):/, ''));
+    const id = input.replace(/^(layer|group):/, '');
+    const routed = input === 'below' ? this.routerBase : this.layerCache.get(id);
     if (!routed) return null;
-    this._copy(routed, this.targets[0]);
+    const source = input === 'below' ? null : this.renderProject?.layers.find(layer => layer.id === id) || this.renderProject?.groups?.find(group => group.id === id);
+    if (source && clip.params?.inputBypass !== false && (source.bypass || this.layerVisible?.(source) === false)) return null;
+    const opacity = source && clip.params?.inputOpacity !== false ? clamp(source.opacity ?? 1)*clamp(source.av ?? 1) : 1;
+    this._copy(routed, this.targets[0], opacity);
     return this._fullFrame(this.targets[0]);
   }
 
@@ -887,15 +922,104 @@ export class LiveEngine {
 
   _scratch(...exclude) { return this.scratchTargets.find(target => !exclude.includes(target)); }
 
+  // Catalog programs compile asynchronously when the GPU supports
+  // KHR_parallel_shader_compile: link status is only queried once the driver
+  // reports completion, so adding an effect never blocks a frame. Until then
+  // the effect passes its input through.
   _catalogProgram(key, build, definition) {
     let entry = this.fxPrograms.get(key);
     if (entry?.definition !== definition) {
-      if (entry?.shader) { this.gl.deleteProgram(entry.shader.program); this.programs = this.programs.filter(program => program !== entry.shader.program); }
-      try { entry = { definition, shader: this._program(build(), uniformNames(definition)) }; }
-      catch (error) { entry = { definition, shader: null }; this._error(`program-${key}`, `${definition.name || definition.id} could not compile: ${error.message}`); }
+      this._deleteCatalogProgram(entry);
+      entry = this._startProgram(key, build, definition);
       this.fxPrograms.set(key, entry);
     }
+    if (entry.pending && !this._finishProgram(key, entry)) return null;
     return entry.shader;
+  }
+
+  _deleteCatalogProgram(entry) {
+    if (!entry || this.lost) return;
+    const gl = this.gl;
+    if (entry.pending) { gl.deleteProgram(entry.pending.program); for (const shader of entry.pending.shaders) gl.deleteShader(shader); }
+    if (entry.shader) { gl.deleteProgram(entry.shader.program); this.programs = this.programs.filter(program => program !== entry.shader.program); }
+  }
+
+  _startProgram(key, build, definition) {
+    const gl = this.gl, program = gl.createProgram(), shaders = [];
+    try {
+      for (const [type, code] of [[gl.VERTEX_SHADER, VERTEX], [gl.FRAGMENT_SHADER, build()]]) {
+        const shader = gl.createShader(type);
+        shaders.push(shader);
+        gl.shaderSource(shader, code);
+        gl.compileShader(shader);
+        gl.attachShader(program, shader);
+      }
+      gl.linkProgram(program);
+      return { definition, shader: null, pending: { program, shaders, names: uniformNames(definition) } };
+    } catch (error) {
+      gl.deleteProgram(program); for (const shader of shaders) gl.deleteShader(shader);
+      this._error(`program-${key}`, `${definition.name || definition.id} could not compile: ${error.message}`);
+      return { definition, shader: null, pending: null };
+    }
+  }
+
+  // Returns true once the program is usable (or has failed for good).
+  _finishProgram(key, entry) {
+    const gl = this.gl, { program, shaders, names } = entry.pending;
+    if (this.parallelCompile && !gl.getProgramParameter(program, this.parallelCompile.COMPLETION_STATUS_KHR)) return false;
+    entry.pending = null;
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      const log = shaders.map(shader => gl.getShaderInfoLog(shader)).filter(Boolean).join(' ') || gl.getProgramInfoLog(program);
+      gl.deleteProgram(program); for (const shader of shaders) gl.deleteShader(shader);
+      this._error(`program-${key}`, `${entry.definition.name || entry.definition.id} could not compile: ${log}`);
+      return true;
+    }
+    for (const shader of shaders) { gl.detachShader(program, shader); gl.deleteShader(shader); }
+    entry.shader = { program, uniforms: Object.fromEntries(names.map(name => [name, gl.getUniformLocation(program, name)])) };
+    this.programs.push(program);
+    return true;
+  }
+
+  hasPendingPrograms() { for (const entry of this.fxPrograms.values()) if (entry.pending) return true; return false; }
+
+  // Finish every pending compile now (blocking). Returns true when any
+  // program became ready, i.e. a re-render would differ. Used for snapshots.
+  flushPrograms() {
+    if (this.lost) return false;
+    let finished = false;
+    const parallel = this.parallelCompile;
+    this.parallelCompile = null;
+    try { for (const [key, entry] of this.fxPrograms) if (entry.pending) { this._finishProgram(key, entry); finished = true; } }
+    finally { this.parallelCompile = parallel; }
+    return finished;
+  }
+
+  // Queue catalog definitions for background compilation (a few per frame),
+  // so the first use of an effect or generator is instant.
+  // kind: 'effect' or 'source'. Without parallel compilation, prewarming
+  // would itself stall frames, so it is skipped.
+  prewarm(definitions, { kind = 'effect', priority = false } = {}) {
+    if (!this.parallelCompile || this.lost) return;
+    for (const definition of definitions) {
+      if (!definition?.glsl && !definition?.passes) continue;
+      const keys = kind === 'source'
+        ? [[`src:${definition.id}`, () => buildSourceShader(definition)]]
+        : effectPasses(definition).map((_, pass) => [`fx:${definition.id}:${pass}`, () => buildEffectShader(definition, pass)]);
+      for (const [key, build] of keys) {
+        if (this.fxPrograms.get(key)?.definition === definition || this.prewarmQueue.some(job => job.key === key)) continue;
+        const job = { key, build, definition };
+        if (priority) this.prewarmQueue.unshift(job); else this.prewarmQueue.push(job);
+      }
+    }
+  }
+
+  _runPrewarm(limit = 2) {
+    for (let started = 0; started < limit && this.prewarmQueue.length;) {
+      const { key, build, definition } = this.prewarmQueue.shift();
+      if (this.fxPrograms.get(key)?.definition === definition) continue;
+      this.fxPrograms.set(key, this._startProgram(key, build, definition));
+      started++;
+    }
   }
 
   _builtins(u, now) {
@@ -959,7 +1083,61 @@ export class LiveEngine {
 
   layerTexture(id) { return this.layerCache.get(id) || null; }
 
+  // Asynchronous readback of cached layer/group outputs for other windows
+  // (Advanced Output slices). readPixels goes into a pixel-pack buffer with a
+  // fence; data is copied out a frame or two later, so the GPU never stalls.
+  setReadbacks(ids) {
+    const wanted = new Set(ids);
+    for (const [id, entry] of this.readbacks) if (!wanted.has(id)) { this._freeReadback(entry); this.readbacks.delete(id); }
+    for (const id of wanted) if (!this.readbacks.has(id)) this.readbacks.set(id, { id, buffer: null, fence: null, data: null, frame: null, version: 0 });
+    this.cacheRequests = new Set([...this.cacheRequests].filter(id => !this.readbackIds?.has(id)).concat([...wanted]));
+    this.readbackIds = wanted;
+  }
+
+  readback(id) { return this.readbacks.get(id)?.frame || null; }
+  readbackVersion(id) { return this.readbacks.get(id)?.version || 0; }
+
+  _freeReadback(entry) {
+    if (this.lost) return;
+    if (entry.fence) this.gl.deleteSync(entry.fence);
+    if (entry.buffer) this.gl.deleteBuffer(entry.buffer);
+    entry.fence = entry.buffer = null;
+  }
+
+  _runReadbacks() {
+    if (!this.readbacks.size) return;
+    const gl = this.gl;
+    for (const entry of this.readbacks.values()) {
+      if (entry.fence) {
+        const status = gl.clientWaitSync(entry.fence, 0, 0);
+        if (status !== gl.ALREADY_SIGNALED && status !== gl.CONDITION_SATISFIED) continue;
+        gl.deleteSync(entry.fence); entry.fence = null;
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, entry.buffer);
+        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, entry.data);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        entry.frame = { width: entry.width, height: entry.height, data: entry.data, premultiplied: true };
+        entry.version++;
+      }
+      const target = this.layerCache.get(entry.id);
+      if (!target || target.used !== this.frameIndex) continue;
+      const width = this.canvas.width, height = this.canvas.height, size = width*height*4;
+      if (!entry.buffer || entry.data?.length !== size) {
+        if (!entry.buffer) entry.buffer = gl.createBuffer();
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, entry.buffer);
+        gl.bufferData(gl.PIXEL_PACK_BUFFER, size, gl.STREAM_READ);
+        entry.data = new Uint8Array(size); entry.width = width; entry.height = height;
+      } else gl.bindBuffer(gl.PIXEL_PACK_BUFFER, entry.buffer);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      entry.fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+  }
+
   _clearCaches() {
+    for (const target of this.busTargets?.list || []) this._freeTarget(target);
+    this.busTargets = null;
     for (const target of [...this.feedback.values(), ...this.layerCache.values()]) this._freeTarget(target);
     this.feedback.clear();
     this.layerCache.clear();
@@ -1135,6 +1313,7 @@ export class LiveEngine {
     this.stats.frames++;
     this.stats.activeClips = frames.length;
     this.stats.mediaCount = this.media.size;
+    this.renderProject = project;
     const groups = new Map((project.groups || []).map(group => [group.id, group]));
     const groupOf = layer => layer.groupId ? groups.get(layer.groupId) || null : null;
     const hasSolo = project.layers.some(layer => layer.solo) || [...groups.values()].some(group => group.solo);
@@ -1142,6 +1321,7 @@ export class LiveEngine {
       const group = groupOf(layer);
       return !project.bypass && !layer.bypass && !group?.bypass && (!hasSolo || layer.solo || !!group?.solo);
     };
+    this.layerVisible = item => item.clips ? visible(item) : !item.bypass && (!hasSolo || !!item.solo);
     const active = new Set();
     this.protectedMedia = new Set();
     for (const owner of [project, ...groups.values(), ...project.layers, ...frames.map(frame => frame.clip).filter(Boolean)]) {
@@ -1158,7 +1338,7 @@ export class LiveEngine {
       if (!frame.clip || !frame.layer) continue;
       const { clip, layer } = frame;
       const audible = visible(layer);
-      const fader = groupGain(layer.group, clamp(project.crossfader ?? 0.5));
+      const fader = groupGain(layer.group, clamp(project.crossfader ?? 0.5), project.crossfaderCurve);
       const gain = audible && clip.useAudio !== false ? number(clip.volume, 1)*number(layer.volume, 1)*clamp(layer.av ?? 1)*number(frame.weight, 1)*fader : 0;
       const voiceId = frame.sourceLayerId && frame.sourceLayerId !== layer.id ? frame.voiceId : clip.id;
       const mediaId = voiceMediaId(clip.id, voiceId);
@@ -1253,58 +1433,112 @@ export class LiveEngine {
       const input = frame.clip.kind === 'source' && sourceDefinition(frame.clip.source)?.kind === 'router' ? frame.clip.params?.input : null;
       if (typeof input === 'string' && input !== 'below') cached.add(input.replace(/^(layer|group):/, ''));
     }
-    const crossfader = clamp(project.crossfader ?? 0.5);
+    const crossfader = clamp(project.crossfader ?? 0.5), curve = project.crossfaderCurve || 'overlap';
     let composition = this.targets[3];
     this._bind(composition, true);
-    const layers = project.layers;
+    // Units: single ungrouped layers or whole groups, bottom to top.
+    const layers = project.layers, units = [];
     for (let index = 0; index < layers.length;) {
       const group = groupOf(layers[index]);
-      if (!group) {
-        this.routerBase = composition;
-        const processed = this._renderLayer(layers[index], byLayer, now);
-        if (processed) {
-          const next = composition === this.targets[3] ? this.targets[4] : this.targets[3];
-          composition = this._mixLayer(composition, processed, next, layers[index], crossfader, now);
-          if (cached.has(layers[index].id)) this._cacheOutput(layers[index].id, processed);
-        }
-        index++;
-        continue;
-      }
-      // Groups render their layers on transparent black, then mix as one layer.
+      if (!group) { units.push({ layers: [layers[index]], bus: busOf(layers[index].group) }); index++; continue; }
       let end = index;
       while (end < layers.length && layers[end].groupId === group.id) end++;
-      let accumulated = this.targets[6], drawn = false;
-      this._bind(accumulated, true);
-      for (let item = index; item < end; item++) {
-        this.routerBase = accumulated;
-        const processed = this._renderLayer(layers[item], byLayer, now);
-        if (!processed) continue;
-        const next = accumulated === this.targets[6] ? this.targets[7] : this.targets[6];
-        accumulated = this._mixLayer(accumulated, processed, next, layers[item], crossfader, now);
-        if (cached.has(layers[item].id)) this._cacheOutput(layers[item].id, processed);
-        drawn = true;
-      }
-      if (drawn) {
-        const processed = this._process(accumulated, group, now, 'layer');
-        if (cached.has(group.id)) this._cacheOutput(group.id, processed);
-        const next = composition === this.targets[3] ? this.targets[4] : this.targets[3];
-        this._composite(composition, processed, next, group.blend, clamp(group.opacity ?? 1)*groupGain(group.crossfader, crossfader), now);
-        composition = next;
-      }
+      units.push({ group, layers: layers.slice(index, end), bus: busOf(group.crossfader) });
       index = end;
     }
-    this.routerBase = null;
+    const pair = [this.targets[3], this.targets[4]];
+    let busesDone = false;
+    for (const unit of units) {
+      if (!unit.bus) { composition = this._renderUnit(unit, composition, pair, byLayer, cached, now); continue; }
+      if (busesDone) continue;
+      // Crossfader (manual p. 48): every bused layer/group renders into its
+      // A or B bus first; the mixed buses then sit at the first bused unit.
+      busesDone = true;
+      const mixed = this._renderBuses(units.filter(item => item.bus), project, crossfader, curve, byLayer, cached, now);
+      if (mixed) {
+        const next = composition === pair[0] ? pair[1] : pair[0];
+        this._composite(composition, mixed, next, 'normal', 1, now);
+        composition = next;
+      }
+    }    this.routerBase = null;
     const finished = this._process(composition, project, now, 'composition');
     this.lastFinished = finished;
     this._copy(finished, null, project.blackout || project.bypass ? 0 : clamp(project.masterOpacity ?? 1)*clamp(project.av ?? 1), true);
     this._pruneTargets();
     this._pruneCanvasSources();
+    this._runPrewarm();
+    this._runReadbacks();
     this.stats.frameMs = performance.now()-started;
   }
 
+  // Render one unit (a layer, or a group's layers on transparent black mixed
+  // as one layer) onto `base`, ping-ponging between the two targets of `pair`.
+  _renderUnit(unit, base, pair, byLayer, cached, now) {
+    const swap = current => current === pair[0] ? pair[1] : pair[0];
+    if (!unit.group) {
+      const layer = unit.layers[0];
+      this.routerBase = base;
+      const processed = this._renderLayer(layer, byLayer, now);
+      if (!processed) return base;
+      if (cached.has(layer.id)) this._cacheOutput(layer.id, processed);
+      return this._mixLayer(base, processed, swap(base), layer, now);
+    }
+    let accumulated = this.targets[6], drawn = false;
+    this._bind(accumulated, true);
+    for (const layer of unit.layers) {
+      this.routerBase = accumulated;
+      const processed = this._renderLayer(layer, byLayer, now);
+      if (!processed) continue;
+      accumulated = this._mixLayer(accumulated, processed, accumulated === this.targets[6] ? this.targets[7] : this.targets[6], layer, now);
+      if (cached.has(layer.id)) this._cacheOutput(layer.id, processed);
+      drawn = true;
+    }
+    if (!drawn) return base;
+    const processed = this._process(accumulated, unit.group, now, 'layer');
+    if (cached.has(unit.group.id)) this._cacheOutput(unit.group.id, processed);
+    const next = swap(base);
+    this._composite(base, processed, next, unit.group.blend, clamp(unit.group.opacity ?? 1), now);
+    return next;
+  }
+
+  _busTargets() {
+    const width = this.canvas.width, height = this.canvas.height;
+    if (this.busTargets?.width !== width || this.busTargets?.height !== height) {
+      for (const target of this.busTargets?.list || []) this._freeTarget(target);
+      const list = Array.from({ length: 4 }, () => this._allocTarget(width, height));
+      this.busTargets = { width, height, list, a: [list[0], list[1]], b: [list[2], list[3]] };
+    }
+    return this.busTargets;
+  }
+
+  _renderBuses(units, project, crossfader, curve, byLayer, cached, now) {
+    const targets = this._busTargets();
+    let a = targets.a[0], b = targets.b[0];
+    this._bind(a, true); this._bind(b, true);
+    let drawn = false;
+    for (const unit of units) {
+      if (unit.bus === 'A') { const next = this._renderUnit(unit, a, targets.a, byLayer, cached, now); drawn ||= next !== a; a = next; }
+      else { const next = this._renderUnit(unit, b, targets.b, byLayer, cached, now); drawn ||= next !== b; b = next; }
+    }
+    if (!drawn) return null;
+    const blend = normalizeBlend(project.crossfaderBlend);
+    if (curve === 'linear' && blend === 'normal') {
+      // A classic video-mixer crossfade.
+      const mixed = a === targets.a[0] ? targets.a[1] : targets.a[0];
+      this._composite(a, b, mixed, 'normal', crossfader, now, true);
+      return mixed;
+    }
+    const scaled = this._scratch();
+    this._copy(a, scaled, crossfadeGain('A', crossfader, curve));
+    const mixed = a === targets.a[0] ? targets.a[1] : targets.a[0];
+    this._composite(scaled, b, mixed, blend, crossfadeGain('B', crossfader, curve), now);
+    this._copySize(scaled, mixed);
+    return mixed;
+  }
+
   // Mix a processed layer into `base`, honouring the layer's mask mode.
-  _mixLayer(base, processed, next, layer, crossfader, now) {
-    const opacity = clamp(layer.opacity ?? 1)*clamp(layer.av ?? 1)*groupGain(layer.group, crossfader);
+  _mixLayer(base, processed, next, layer, now) {
+    const opacity = clamp(layer.opacity ?? 1)*clamp(layer.av ?? 1);
     if (layer.maskMode && layer.maskMode !== 'none') {
       // Mask layer (manual p. 39): its luminance or alpha cuts the layers below.
       const masked = opacity < 1 ? this._scratch(processed) : next;

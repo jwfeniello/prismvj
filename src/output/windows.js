@@ -4,12 +4,18 @@
 // OutputMapper (slices, warping, masks, soft edges) with no encoding step.
 import { OutputMapper } from './mapper.js';
 
+// Slice inputs that name a single layer or group ('layer:<id>', 'group:<id>').
+export function routedSources(config) {
+  return [...new Set((config?.screens || []).flatMap(screen => (screen.slices || []).map(slice => slice.input?.source)).filter(source => /^(layer|group):/.test(source || '')))];
+}
+
 const frameName = screen => `prism-output-${String(screen.id).toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40) || 'screen'}`;
 
 export class OutputWindows {
   // options: { source: HTMLCanvasElement, desktop, onError(message), onClosed(screenId) }
-  constructor({ source, desktop, onError = () => {}, onClosed = () => {} }) {
+  constructor({ source, desktop, engine = null, onError = () => {}, onClosed = () => {} }) {
     this.source = source;
+    this.engine = engine;
     this.desktop = desktop;
     this.onError = onError;
     this.onClosed = onClosed;
@@ -26,6 +32,8 @@ export class OutputWindows {
   // Open, move or close windows so they match the enabled screens of `config`.
   sync(config, { displays = [] } = {}) {
     this.config = config;
+    // Slices fed by a single layer or group need that output read back.
+    this.engine?.setReadbacks(routedSources(config).map(source => source.replace(/^(layer|group):/, '')));
     const wanted = (config?.screens || []).filter(screen => screen.enabled !== false && (screen.device?.type === 'display' || !this.desktop));
     for (const id of [...this.windows.keys()]) if (!wanted.some(screen => screen.id === id)) this.close(id);
     for (const screen of wanted) {
@@ -89,11 +97,16 @@ export class OutputWindows {
       const screen = entry.screen, width = screen.device?.width || entry.canvas.width, height = screen.device?.height || entry.canvas.height;
       if (entry.canvas.width !== width || entry.canvas.height !== height) { entry.canvas.width = width; entry.canvas.height = height; entry.mapper.resize?.(width, height); }
       entry.mapper.setSource('composition', this.source);
-      // Layer/group inputs live in the editor's GPU context; until they are
-      // shared, those slices show the composition.
+      // Layer/group inputs arrive as asynchronous pixel readbacks from the
+      // editor's engine; each new frame is uploaded once.
+      entry.versions ||= new Map();
       for (const slice of screen.slices || []) {
         const source = slice.input?.source;
-        if (source && source !== 'composition') entry.mapper.setSource(source, this.source);
+        if (!source || source === 'composition' || !/^(layer|group):/.test(source)) continue;
+        const id = source.replace(/^(layer|group):/, ''), version = this.engine?.readbackVersion(id) || 0;
+        if (entry.versions.get(source) === version) continue;
+        const frame = this.engine?.readback(id);
+        if (frame) { entry.mapper.setSource(source, frame); entry.versions.set(source, version); }
       }
       try { entry.mapper.render(screen, { ...this.options, label: screen.name, time }); }
       catch (error) { this.onError(`Output ${screen.name}: ${error.message}`); }

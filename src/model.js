@@ -9,6 +9,9 @@ export const LIMITS = Object.freeze({ layers: 32, decks: 32, columns: 64, clips:
 // 'effect' clips carry only effects and act as adjustment layers (manual p. 85).
 const KINDS = ['video', 'audio', 'image', 'source', 'effect'];
 const SHORTCUT_SOURCES = ['key', 'midi', 'osc', 'dmx'];
+// Crossfader (manual pp. 47–49): how A/B buses mix and what the A/B buttons do.
+export const CROSSFADER_CURVES = ['overlap', 'linear', 'smooth', 'cut'];
+export const CROSSFADER_BEHAVIOURS = ['fade', 'jump', 'jump-return', 'cut'];
 const SHORTCUT_MODES = ['toggle', 'momentary', 'trigger', 'value', 'relative', 'set'];
 const DIRECTIONS = ['forward', 'backward', 'pause', 'random'];
 const TARGETS = ['own', 'selected', 'free'];
@@ -122,7 +125,15 @@ export function createClip(kind = 'source', options = {}) {
     beatSync: bool(input.beatSync), beats: number(input.beats, 16, 0.03125, 4096), beatLoop: choice(input.beatLoop, BEAT_LOOPS, 0), paused: bool(input.paused),
     inPoint, outPoint, opacity: number(input.opacity, 1, 0, 1), volume: number(input.volume, 1, 0, 4), pan: number(input.pan, 0, -1, 1),
     scale: number(input.scale, 1, 0, 20), x: number(input.x, 0, -64, 64), y: number(input.y, 0, -64, 64),
-    rotation: number(input.rotation, 0, -36000, 36000), trigger: choice(input.trigger, ['restart', 'continue', 'piano'], 'restart'),
+    rotation: number(input.rotation, 0, -36000, 36000), trigger: choice(input.trigger, ['restart', 'continue', 'relative', 'piano'], 'restart'),
+    // Random play mode (manual p. 61): jump every Interval by up to Distance,
+    // in seconds or beats. Unset keeps the original continuous random scrub.
+    // SMPTE transport (Arena, manual p. 60): the clip follows incoming LTC from its offset.
+    sequenceFps: typeof input.sequenceFps === 'number' && input.sequenceFps > 0 && input.sequenceFps <= 240 ? input.sequenceFps : null,
+    smpte: bool(input.smpte), smpteOffset: number(input.smpteOffset, 0, 0, 86400), smpteEnd: choice(input.smpteEnd, ['hold', 'loop', 'stop'], 'hold'),
+    randomInterval: input.randomInterval == null ? null : number(input.randomInterval, 1, 0.01, 86400),
+    randomDistance: input.randomDistance == null ? null : number(input.randomDistance, 1, 0, 86400),
+    thumbnail: typeof input.thumbnail === 'string' && input.thumbnail.length <= 131072 && /^data:image\/(jpeg|png|webp);base64,[a-zA-Z0-9+/=]+$/.test(input.thumbnail) ? input.thumbnail : '',
     ...transform3D(input), triggerStyle: choice(input.triggerStyle, ['inherit', 'normal', 'piano'], 'inherit'), clipTarget: choice(input.clipTarget, ['inherit', ...TARGETS], 'inherit'),
     quantize: input.quantize === null || input.quantize === undefined ? null : number(input.quantize, 0, 0, 128),
     autoPilot: choice(input.autoPilot, ['inherit', ...AUTO], 'inherit'), ignoreColumn: bool(input.ignoreColumn),
@@ -163,7 +174,9 @@ function shortcuts(value) {
         type: choice(input.type, ['note', 'cc', 'pitch'], 'cc'), channel: Math.round(number(input.channel, 0, 0, 15)), number: Math.round(number(input.number, 0, 0, 127)),
         device: string(input.device, '', 128), address: string(input.address, '', 256), universe: Math.round(number(input.universe, 0, 0, 32767)), dmxChannel: Math.round(number(input.dmxChannel, 1, 1, 512)) },
       min: number(item.min, 0, 0, 1), max: number(item.max, 1, 0, 1), invert: bool(item.invert), feedback: bool(item.feedback, true),
-      value: number(item.value, 1, 0, 1), group: string(item.group, '', 64), enabled: bool(item.enabled, true) };
+      value: number(item.value, 1, 0, 1), group: string(item.group, '', 64), enabled: bool(item.enabled, true),
+      // 'selected' retargets the shortcut to whatever layer/clip is selected (manual p. 152).
+      targetMode: choice(item.targetMode, ['fixed', 'selected'], 'fixed') };
   });
 }
 
@@ -302,7 +315,8 @@ export function validateProject(input) {
     bpm: number(input.bpm, 120, 20, 999), masterOpacity: number(input.masterOpacity, 1, 0, 1), masterVolume: number(input.masterVolume, 1, 0, 4),
     pan: number(input.pan, 0, -1, 1), scale: number(input.scale, 1, 0, 20), x: number(input.x, 0, -64, 64), y: number(input.y, 0, -64, 64),
     rotation: number(input.rotation, 0, -36000, 36000),
-    crossfader: number(input.crossfader, 0.5, 0, 1), speed: number(input.speed, 1, 0, 16), paused: bool(input.paused), blackout: bool(input.blackout), bypass: bool(input.bypass),
+    crossfader: number(input.crossfader, 0.5, 0, 1), crossfaderBlend: normalizeBlend(input.crossfaderBlend), crossfaderCurve: choice(input.crossfaderCurve, CROSSFADER_CURVES, 'overlap'),
+    crossfaderBehaviour: choice(input.crossfaderBehaviour, CROSSFADER_BEHAVIOURS, 'fade'), speed: number(input.speed, 1, 0, 16), paused: bool(input.paused), blackout: bool(input.blackout), bypass: bool(input.bypass),
     quantize: number(input.quantize, 0, 0, 128), selectedDeckId: decks.some(deck => deck.id === input.selectedDeckId) ? input.selectedDeckId : decks[0].id,
     decks, layers, groups: usedGroups, effects: effects(input.effects), audioEffects: effects(input.audioEffects, true), mappings, shortcuts: shortcuts(input.shortcuts),
     output: Object.fromEntries(['displayId', 'fullscreen', 'width', 'height'].filter(key =>
@@ -336,9 +350,17 @@ export function serializeProject(project) {
   return serialized;
 }
 
-export function crossfadeGain(group, value) {
+// Gain of bus A or B at a crossfader position. 'overlap' keeps both buses at
+// full strength in the middle; 'linear' is a classic mix (both at 50% in the
+// middle); 'smooth' is equal power; 'cut' switches at the centre.
+export function crossfadeGain(group, value, curve = 'overlap') {
   const position = number(value, 0.5, 0, 1);
-  return group === 'A' ? Math.min(1, 2 * (1 - position)) : group === 'B' ? Math.min(1, 2 * position) : 1;
+  if (group !== 'A' && group !== 'B') return 1;
+  const toward = group === 'A' ? 1 - position : position;
+  if (curve === 'linear') return toward;
+  if (curve === 'smooth') return Math.sin(toward * Math.PI / 2);
+  if (curve === 'cut') return toward >= 0.5 ? 1 : 0;
+  return Math.min(1, 2 * toward);
 }
 
 function seedFor(id) {
@@ -442,12 +464,16 @@ export class Transport {
     const previous = entry.current;
     if (previous) this._remember(previous);
     const saved = clip.trigger === 'continue' && !clip.beatSync ? this._memory.get(clip.id) : null;
+    // Relative pick-up (manual p. 62): start where the previous clip was, proportionally.
+    const relative = clip.trigger === 'relative' && previous && previous.clip.id !== clip.id
+      ? Math.min(1, Math.max(0, (previous.position - previous.clip.inPoint) / Math.max(EPS, previous.clip.outPoint - previous.clip.inPoint))) : null;
     entry.outgoing = previous && previous.clip.id !== clip.id && entry.layer.transition > 0 ? previous : null;
     entry.elapsed = 0; entry.fade = number(entry.layer.transition, 0, 0, 60);
     entry.transitionMode = entry.layer.transitionMode === 'random'
       ? TRANSITION_IDS[Math.floor(randomAt(seedFor(clip.id), ++entry.transitionSequence) * TRANSITION_IDS.length)] || 'normal'
       : choice(entry.layer.transitionMode, TRANSITION_IDS, 'normal');
-    entry.current = { clip, position: saved ? number(saved.position, clip.inPoint, clip.inPoint, clip.outPoint) : clip.direction < 0 ? clip.outPoint : clip.inPoint,
+    entry.current = { clip, position: relative !== null ? clip.inPoint + relative * (clip.outPoint - clip.inPoint)
+      : saved ? number(saved.position, clip.inPoint, clip.inPoint, clip.outPoint) : clip.direction < 0 ? clip.outPoint : clip.inPoint,
       direction: this.project.directionPin && this.project.directionPin !== 'pause' ? (clip.direction < 0 ? -1 : 1) : saved?.direction || (clip.direction < 0 ? -1 : 1), directionInput: clip.direction,
       randomPhase: saved?.randomPhase || 0, travel: saved?.travel || 0, completed: false, seed: seedFor(clip.id), beatLoopWindow: null,
       sourceLayerId: request.sourceLayerId || this._clips.get(clip.id)?.layer.id || entry.layer.id,
@@ -615,6 +641,20 @@ export class Transport {
     const { lo, hi } = bounds; const span = Math.max(0.000001, hi - lo);
     state.position = number(state.position, lo, lo, hi);
     if (clip.random || clip.loop === 'random') {
+      if (clip.randomInterval) {
+        // Play normally between jumps; every Interval jump up to Distance away.
+        const perSecond = clip.beatSync ? number(this.project.bpm, 120, 20, 999) / 60 / clip.randomInterval
+          : number(clip.speed, 1, 0, 16) * number(this.project.speed, 1, 0, 16) / clip.randomInterval;
+        state.randomPhase += seconds * perSecond;
+        const step = Math.floor(state.randomPhase + EPS);
+        if (step !== state.randomStep) {
+          state.randomStep = step;
+          const unit = clip.beatSync ? 1 / number(clip.beats, 16, 0.03125, 4096) : 1 / number(clip.duration, 8, 0.01, 86400);
+          const reach = Math.min(span, clip.randomDistance == null ? span : clip.randomDistance * unit);
+          state.position = lo + mod(state.position - lo + (randomAt(state.seed, step) * 2 - 1) * reach, span);
+        } else state.position = lo + mod(state.position - lo + rate * seconds * direction, span);
+        return;
+      }
       if (clip.beatSync) {
         state.randomPhase += seconds * this.project.bpm / 60;
         const beatIndex = Math.floor(state.randomPhase + EPS);
