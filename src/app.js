@@ -265,6 +265,7 @@ function refreshControls(animatedOnly=false){
   for(const row of $$('[data-group-row]')){const group=(project.groups||[]).find(item=>item.id===row.dataset.groupRow);if(!group)continue;for(const input of $$('[data-group-prop]',row))if(input!==focused&&input.type==='range')input.value=group[input.dataset.groupProp];}
   for(const [selector,key] of [['#bpm','bpm'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])if($(selector)!==focused)$(selector).value=project[key];
   $('#pause').classList.toggle('active',project.paused);$('#blackout').classList.toggle('active',project.blackout);$('#bypass-all').classList.toggle('active',project.bypass);
+  markFaders();
 }
 // Clip transport (manual pp. 58–63): Timeline or BPM Sync, in/out bar,
 // direction and play mode buttons, Duration or Beats, and Playmode Away.
@@ -334,6 +335,10 @@ function addPropertyCogs(host,scope,target){
   }
 }
 function spectrumFor(source){return engine.spectrum(source,source==='clip'?selectedClipId:source==='layer'?selectedLayerId:source==='group'?currentGroup()?.id:null);}
+// Like Resolume's M slider, video faders turn red below 100% so a faded
+// layer or master is obvious at a glance.
+const FADER_SELECTOR='[data-layer-prop="opacity"],[data-layer-prop="av"],[data-group-prop="opacity"],#master-opacity';
+function markFaders(root=document){for(const input of root.querySelectorAll(FADER_SELECTOR))input.classList.toggle('below-full',Number(input.value)<0.999);}
 function scheduleRefresh(){if(refreshQueued)return;refreshQueued=true;requestAnimationFrame(()=>{refreshQueued=false;refreshControls();});}
 
 function renderLayers(){
@@ -342,6 +347,7 @@ function renderLayers(){
   lastActive=project.layers.map(l=>l.activeClipId).join(',');
   $('#layer-bank').innerHTML=[...project.layers].reverse().map((layer,index,list)=>`${groupHeaderFor(layer,list[index-1])}<div class="layer-row ${layer.groupId?'in-group':''} ${groupOfLayer(layer)?.collapsed?'group-collapsed':''} ${layer.locked?'locked':''}" data-layer="${layer.id}">${layerHeader(layer)}<div class="clips">${clipList(layer).map((clip,index)=>clip?`<button class="clip-slot ${selectedClips.has(clip.id)?'selected':''} ${project.layers.some(item=>item.activeClipId===clip.id)?'playing':''}" data-slot="${index}" data-clip="${clip.id}" draggable="true" title="${esc(clip.name)} — click to trigger, right-click to edit"><div class="clip-art ${esc(clip.kind==='source'?clip.source:clip.kind)}" style="${clip.source==='solid'?`background:${esc(clip.color)}`:''}">${clipThumbnail(clip)}<span class="clip-kind">${clip.kind==='source'?'GEN':esc(clip.kind.toUpperCase())}</span></div><span class="clip-name">${esc(clip.name)}</span><div class="clip-progress"></div></button>`:`<button class="clip-slot empty-slot ${layer.id===selectedLayerId&&index===selectedColumn&&!selectedClipId?'selected':''}" data-slot="${index}" title="Drop media or double-click to import">+</button>`).join('')}</div></div>`).join('');
   bindGroupRows();
+  markFaders($('#layer-bank'));
   for(const row of $$('.layer-row')){
     const layer=project.layers.find(l=>l.id===row.dataset.layer);
     $('[data-layer-select]',row).onclick=()=>{selectedLayerId=layer.id;selectedGroupId=layer.groupId;inspectorTab='layer';renderLayers();renderInspector();};
@@ -350,7 +356,7 @@ function renderLayers(){
     head.ondragover=event=>{if(event.dataTransfer.types.includes('application/prism-effect')){event.preventDefault();head.classList.add('drag-over');}};
     head.ondragleave=()=>head.classList.remove('drag-over');
     head.ondrop=event=>{head.classList.remove('drag-over');const data=event.dataTransfer.getData('application/prism-effect');if(!data)return;event.preventDefault();selectedLayerId=layer.id;inspectorTab='layer';addEffect(layer,JSON.parse(data),event.altKey);renderLayers();};
-    for(const input of $$('[data-layer-prop]',row)) input.oninput=()=>{layer[input.dataset.layerProp]=input.type==='range'?+input.value:input.value;changed(input.type==='range'?'coalesce':true);};
+    for(const input of $$('[data-layer-prop]',row)) input.oninput=()=>{layer[input.dataset.layerProp]=input.type==='range'?+input.value:input.value;markFaders(row);changed(input.type==='range'?'coalesce':true);};
     for(const button of $$('[data-action]',row))button.onclick=()=>{const action=button.dataset.action;if(action==='stop'){triggerRequests.delete(layer.id);transport.stop(layer.id);}else layer[action]=!layer[action];changed();renderLayers();};
     bindLayerPerformance(row,layer);
     for(const button of $$('[data-group]',row))button.onclick=()=>{layer.group=layer.group===button.dataset.group?'none':button.dataset.group;changed();renderLayers();};
@@ -433,7 +439,7 @@ function bindGroupRows(){
     $('[data-group-select]',row).oncontextmenu=event=>{event.preventDefault();showMenu(event,[['Rename',()=>editName(group,'Group name',()=>{changed();renderAll();})],['Ungroup',()=>editComposition(()=>composition.ungroup(project,group.id))]]);};
     $('[data-group-collapse]',row).onclick=()=>{group.collapsed=!group.collapsed;changed();renderLayers();};
     for(const button of $$('[data-group-action]',row))button.onclick=()=>{const action=button.dataset.groupAction;if(action==='clear'){for(const layer of project.layers)if(layer.groupId===group.id){triggerRequests.delete(layer.id);transport.stop(layer.id);}}else group[action]=!group[action];changed();renderLayers();};
-    for(const input of $$('[data-group-prop]',row))input.oninput=()=>{group[input.dataset.groupProp]=input.type==='range'?Number(input.value):input.value;changed(input.type==='range'?'coalesce':true);if(inspectorTab==='group')scheduleRefresh();};
+    for(const input of $$('[data-group-prop]',row))input.oninput=()=>{group[input.dataset.groupProp]=input.type==='range'?Number(input.value):input.value;markFaders(row);changed(input.type==='range'?'coalesce':true);if(inspectorTab==='group')scheduleRefresh();};
     for(const button of $$('[data-group-column]',row))button.onclick=()=>triggerColumn(Number(button.dataset.groupColumn),{groupId:group.id});
   }
 }
@@ -860,7 +866,7 @@ function renderBrowser(){
 }
 
 function bindStatic(){
-  for(const [selector,key] of [['#project-name','name'],['#bpm','bpm'],['#quantize','quantize'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])$(selector).oninput=e=>{project[key]=key==='name'?e.target.value:+e.target.value;if(key==='bpm')project.bpm=Math.max(20,Math.min(300,project.bpm||120));$('#speed-value').textContent=project.speed.toFixed(2)+'×';changed('coalesce');};
+  for(const [selector,key] of [['#project-name','name'],['#bpm','bpm'],['#quantize','quantize'],['#global-speed','speed'],['#crossfader','crossfader'],['#master-opacity','masterOpacity'],['#master-volume','masterVolume']])$(selector).oninput=e=>{project[key]=key==='name'?e.target.value:+e.target.value;markFaders($('.monitor-footer'));if(key==='bpm')project.bpm=Math.max(20,Math.min(300,project.bpm||120));$('#speed-value').textContent=project.speed.toFixed(2)+'×';changed('coalesce');};
   $('#pause').onclick=()=>{project.paused=!project.paused;changed();syncGlobals();};
   const direction=(mode,pin=false)=>{if(pin&&project.directionPin===mode)project.directionPin=null;else transport.setGlobalDirection(mode,{pin});changed();syncGlobals();renderInspector();};
   for(const button of $$('[data-global-direction]')){button.onclick=()=>direction(button.dataset.globalDirection);button.oncontextmenu=event=>{event.preventDefault();direction(button.dataset.globalDirection,true);};}

@@ -189,8 +189,10 @@ export function createProject() {
     }
     layers[i].activeClipId = layers[i].clips[decks[0].id][0].id;
   }
-  layers[1].blend = 'screen'; layers[1].opacity = 0.65;
-  layers[2].blend = 'screen'; layers[2].opacity = 0.25;
+  // Every demo layer is at full opacity, so a clip triggered on an upper
+  // layer shows at full strength; Screen keeps the stack visibly mixed.
+  layers[1].blend = 'screen';
+  layers[2].blend = 'screen';
   return { version: 1, id: uid('project'), name: 'Untitled performance', description: '', columns: 8, width: 1280, height: 720, bpm: 120, av: 1, mask: null, renderOrder: renderOrder(),
     dashboard: normalizeDashboard(null, 'composition'),
     ...transform3D(), triggerStyle: 'normal', clipTarget: 'own', directionPin: null,
