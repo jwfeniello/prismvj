@@ -1,6 +1,6 @@
 # PrismVJ
 
-PrismVJ is a free, open-source alternative to Resolume™ Arena for live video performance on Windows. It does as much as possible on the GPU: HAP and DXV movies decode straight to textures, and mixing, effects and projection mapping run in WebGL2 shaders. It also has Ableton Link, DMX (Art-Net and sACN), MIDI, OSC and SMPTE timecode.
+PrismVJ is a free, open-source alternative to Resolume™ Arena for live video performance on Windows. It does as much as possible on the GPU: HAP and DXV movies decode straight to textures, and mixing, effects and projection mapping run in WebGL2 shaders. It plays along with CDJs over Pro DJ Link, runs thousands of community shaders from the ISF library, and has Ableton Link, DMX (Art-Net and sACN), MIDI, OSC and SMPTE timecode.
 
 ![PrismVJ main window](docs/screenshots/main.png)
 
@@ -26,12 +26,15 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 - **Saving:** save and open compositions, autosave and crash recovery, missing-file relinking, and undo/redo.
 
 ### Effects and sources
-- **80+ GPU video effects** across colour, distortion, blur, stylize, keying, feedback, tiling and more. Each has opacity, blend mode, bypass, presets and drag-to-reorder, on any clip, layer, group or the whole composition.
+- **100+ GPU video effects**, including every effect in the Resolume manual's effect list: colour, distortion, blur, stylize, keying, glitch, feedback and time effects (Stop Motion, Delay RGB, Freeze), tiling, Cube Tiles, Videowall, Luma Waves, Pixels In Space and more. Each has opacity, blend mode, bypass, presets and drag-to-reorder, on any clip, layer, group or the whole composition.
 - **19 audio effects:** EQ, filters, delay, reverb, distortion, compressor, limiter, chorus, phaser, flanger, auto pan and more.
 - **40 generators:** shapes, patterns, fractals, particles, lasers, audio spectrum and waveform, colour bars and a test card.
 - **Text Animator** with per-character animation.
 - **Live inputs** from capture devices and screen capture.
-- **ISF shader import**, so Interactive Shader Format effects and generators load straight from `.fs` files.
+- **ISF Library**: search, preview and install over 10,000 effects, generators and transitions from [editor.isf.video](https://editor.isf.video/shaders) straight from the effects browser. Installed shaders load every time PrismVJ starts.
+- **Full ISF support**: multi-pass, persistent and float buffers, custom pass sizes, vertex shaders, audio waveform and FFT inputs, extra image inputs, imported images and transitions, which work as layer blend modes, clip transitions and crossfader mixes. Shaders also import from `.fs` files and folders.
+
+![ISF Library](docs/screenshots/isf-library.png)
 
 ### Parameter animation
 - Any parameter can run on **Timeline**, **BPM Sync**, **Clip Position**, a **Dashboard** dial, or **Audio Analysis** (FFT of the composition, a group, a layer, a clip or an external input).
@@ -48,6 +51,8 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 ![Advanced Output](docs/screenshots/advanced-output.png)
 
 ### Control and sync
+- **Pro DJ Link (CDJ / XDJ / DJM):** PrismVJ joins the DJ network as a virtual player. It shows what every deck is playing (title, artist, BPM, pitch, playhead, on-air and master) and can follow the master player's tempo and beat.
+- **Track triggers:** map a song to a clip and that clip plays whenever the song plays on any deck, locked to the track's playhead and pitch. It holds when the DJ pauses and stops when the track is unloaded. Matching works by title and artist, so it follows the song across USB sticks.
 - **Ableton Link:** tempo and beat phase stay in sync with Ableton Live, Traktor and other Link apps on the network, with optional start/stop sync.
 - **MIDI:** learn mode, controller feedback, BPM from MIDI clock, and value, toggle, momentary, trigger, set and relative (encoder) modes.
 - **OSC** input and feedback output.
@@ -103,6 +108,6 @@ PrismVJ is free software released under the [GNU General Public License v3.0 or 
 
 ## Third-party software
 
-PrismVJ includes [Ableton Link](https://github.com/Ableton/link) (GPLv2+), [Electron](https://www.electronjs.org/) (MIT) and, in release builds, [FFmpeg](https://ffmpeg.org/) (GPL). Their licenses are in the `licenses` folder of each release.
+PrismVJ includes [Ableton Link](https://github.com/Ableton/link) (GPLv2+), [Electron](https://www.electronjs.org/) (MIT) and, in release builds, [FFmpeg](https://ffmpeg.org/) (GPL). The Pro DJ Link support is based on Deep Symmetry's [dysentery](https://github.com/Deep-Symmetry/dysentery) protocol analysis and [prolink-connect](https://github.com/evanpurkhiser/prolink-connect) (MIT). Shaders from editor.isf.video belong to their authors. The licenses are in the `licenses` folder of each release.
 
 Resolume is a trademark of Resolume BV. PrismVJ is not affiliated with or endorsed by Resolume.

@@ -590,6 +590,13 @@ export class Transport {
     return offset;
   }
 
+  // External clocks (Pro DJ Link track sync) scale a layer's playback rate:
+  // 1 is normal, 0 holds the frame. null clears the override.
+  setExternalRate(layerId, rate) {
+    if (rate === null || rate === undefined || !Number.isFinite(rate)) this._externalRates?.delete(layerId);
+    else (this._externalRates ||= new Map()).set(layerId, Math.min(16, Math.max(0, rate)));
+  }
+
   resync(nowSeconds) { this.tick(nowSeconds); this._beat = 0; for (const entry of this._entries.values()) if (entry.pending) this._request(entry, entry.pending.clip, 0, entry.pending); }
 
   getState(layerId) {
@@ -608,8 +615,9 @@ export class Transport {
     if (clip.paused || clip.direction === 0) return 0;
     // BPM Sync has its own power-of-two speed (manual p. 60), separate from
     // the Timeline speed; Timeline playback also applies the Duration stretch.
-    return clip.beatSync ? number(this.project.bpm, 120, 20, 999) / 60 / number(clip.beats, 16, 0.03125, 4096) * (BPM_SPEEDS.includes(clip.bpmSpeed) ? clip.bpmSpeed : 1)
-      : number(clip.speed, 1, 0, 16) * number(clip.stretch, 1, 0.0001, 10000) * number(this.project.speed, 1, 0, 16) * (this._speeds?.get(state.layerId) ?? 1) / number(clip.duration, 8, 0.01, 86400);
+    const external = this._externalRates?.get(state.layerId) ?? 1;
+    return external * (clip.beatSync ? number(this.project.bpm, 120, 20, 999) / 60 / number(clip.beats, 16, 0.03125, 4096) * (BPM_SPEEDS.includes(clip.bpmSpeed) ? clip.bpmSpeed : 1)
+      : number(clip.speed, 1, 0, 16) * number(clip.stretch, 1, 0.0001, 10000) * number(this.project.speed, 1, 0, 16) * (this._speeds?.get(state.layerId) ?? 1) / number(clip.duration, 8, 0.01, 86400));
   }
 
   _direction(state) {

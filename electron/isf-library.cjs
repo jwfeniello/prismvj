@@ -36,7 +36,38 @@ async function readShader(file, maxBytes) {
   }
 }
 
-// Returns [{ name, path, text }] sorted by name (case-insensitive), then path.
+const IMAGE_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp' };
+const MAX_IMAGE = 4 * 1024 * 1024;
+
+// IMPORTED image paths from the JSON header (best effort; the renderer parses
+// the header properly). Paths must stay inside the shader's folder.
+function importedPaths(text) {
+  const raw = /^\s*\/\*([\s\S]*?)\*\//.exec(text)?.[1];
+  if (!raw) return [];
+  let header;
+  try { header = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, '').replace(/,(\s*[}\]])/g, '$1')); } catch { return []; }
+  const imported = header?.IMPORTED;
+  const items = Array.isArray(imported) ? imported : imported && typeof imported === 'object' ? Object.values(imported) : [];
+  return items.map(item => item?.PATH).filter(item => typeof item === 'string' && item.length < 512).slice(0, 8);
+}
+
+async function readAssets(file, text) {
+  const folder = path.dirname(file), assets = {};
+  for (const relative of importedPaths(text)) {
+    const full = path.resolve(folder, relative);
+    const type = IMAGE_TYPES[path.extname(full).toLowerCase()];
+    if (!type || (full !== folder && !full.startsWith(folder + path.sep))) continue;
+    try {
+      const stat = await fs.lstat(full);
+      if (!stat.isFile() || stat.size > MAX_IMAGE) continue;
+      assets[relative] = `data:${type};base64,${(await fs.readFile(full)).toString('base64')}`;
+    } catch { /* missing image reads as black */ }
+  }
+  return assets;
+}
+
+// Returns [{ name, path, text, vertex, assets }] sorted by name (case-insensitive), then path.
+// vertex is the matching .vs file's text ('' when there is none).
 async function scanISFFolder(directory, { maxFiles = 500, maxBytes = 256 * 1024 } = {}) {
   if (typeof directory !== 'string' || !directory.trim() || directory.includes('\0')) throw new TypeError('scanISFFolder needs a directory path.');
   const fileLimit = positiveInt(maxFiles, 500, 10000);
@@ -55,7 +86,10 @@ async function scanISFFolder(directory, { maxFiles = 500, maxBytes = 256 * 1024 
       }
       if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== '.fs') continue;
       const text = await readShader(full, byteLimit);
-      if (text !== null) results.push({ name: entry.name, path: full, text });
+      if (text === null) continue;
+      const vertexPath = full.slice(0, -3) + '.vs';
+      const vertex = (await readShader(vertexPath, byteLimit)) ?? (await readShader(full.slice(0, -3) + '.VS', byteLimit)) ?? '';
+      results.push({ name: entry.name, path: full, text, vertex, assets: await readAssets(full, text) });
     }
     for (const subfolder of subfolders) {
       if (results.length >= fileLimit) return;

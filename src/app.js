@@ -2,7 +2,7 @@ import './style.css';
 import './ui/ui.css';
 import './fx/builtins.js';
 import { createProject, createLayer, createClip, validateProject, serializeProject, Transport, LIMITS } from './model.js';
-import { listEffects, listAudioEffects, listSources, effectDefinition, audioEffectDefinition, sourceDefinition, registerEffect, registerSource, compositionFeed } from './fx/registry.js';
+import { listEffects, listAudioEffects, listSources, effectDefinition, audioEffectDefinition, sourceDefinition, registerEffect, registerSource, registerTransition, transitionDefinition, unregisterEffect, unregisterSource, unregisterTransition, compositionFeed } from './fx/registry.js';
 import { defaultParams } from './fx/shader-template.js';
 
 import { Animator, BPM_SPEEDS } from './animation.js';
@@ -12,6 +12,7 @@ import { effectStackHTML, bindEffectStacks, sourceParamsHTML, cogButton, refresh
 import { animationMenuItems, decorateAnimations, updateAnimationStrips, inOutBarHTML, bindInOutBar } from './ui/animation-strip.js';
 import { ShortcutManager } from './ui/shortcuts.js';
 import { registerProjectExtension } from './model.js';
+import { normalizeTrackTriggers, playerFor, clipPosition, trackLabel } from './track-triggers.js';
 import { normalizeOutputConfig, screenFromComposition } from './output/output-model.js';
 import { evaluateExpression } from './expression.js';
 import { OutputWindows, routedSources } from './output/windows.js';
@@ -22,6 +23,7 @@ import { normalizeDmxConfig, sampleFixtures, fixtureSampleRect } from './dmx.js'
 // Advanced Output and DMX settings are saved with the composition.
 registerProjectExtension('advancedOutput', (value, owner) => normalizeOutputConfig(value, { compositionWidth: owner.width, compositionHeight: owner.height }));
 registerProjectExtension('dmx', value => normalizeDmxConfig(value));
+registerProjectExtension('trackTriggers', value => normalizeTrackTriggers(value));
 import { LiveEngine } from './engine.js';
 import { applyOSC } from './controls.js';
 import * as composition from './composition.js';
@@ -111,6 +113,7 @@ function initialize() {
   const snapshotButton=document.createElement('button');snapshotButton.id='snapshot-output';snapshotButton.textContent='Snapshot';snapshotButton.title='Save the current output as PNG';$('#record').before(snapshotButton);
   engine = new LiveEngine($('#output-canvas'), {onError: message => toast(message, true)});
   prewarmCatalog();
+  loadISFCollections();
   // A thumbnail is cached presentation, not an edit: patch the slot image in place.
   thumbnailer=new Thumbnailer({onThumbnail:(clip,thumbnail)=>{
     if(!findClip(clip.id))return;
@@ -129,6 +132,7 @@ function initialize() {
   if(preferences.midiClockSync)shortcuts.enableMidi().catch(()=>{});
   if(preferences.smpteInputDevice)startTimecode();
   setupLink();
+  setupProLink();
   if(preferences.audioInputDevice)engine.setExternalAudioInput(preferences.audioInputDevice).catch(error=>toast(`External audio input unavailable: ${error.message}`,true));
   fileBrowser=new FilesBrowser({desktop,onImport:item=>item?placeMedia(item,currentLayer()):importFiles(),onPreview:item=>startPreview(createClip(item.kind,item)),onRelink:relinkAll,onError:message=>toast(message,true)});
   bindStatic();
@@ -207,6 +211,7 @@ function preferencesDialog(){
   const dialog=showDialog('Preferences',Object.entries(labels).map(([key,label])=>`<label class="preference-option"><input data-preference="${key}" type="checkbox" ${preferences[key]?'checked':''}>${label}</label>`).join('')
     +`<h3 style="margin-top:12px">Audio</h3>${deviceSelect('audioOutputDevice','Audio output')}${deviceSelect('audioInputDevice','External FFT input')}<p class="browser-note">The external input drives parameters set to Audio Analysis › external (a DJ feed, band or microphone).</p>`
     +`<h3 style="margin-top:12px">SMPTE timecode (LTC)</h3>${deviceSelect('smpteInputDevice','LTC input')}<label class="select-field"><span>Channel</span><select data-number-preference="smpteChannel">${Array.from({length:8},(_,index)=>`<option value="${index}" ${preferences.smpteChannel===index?'selected':''}>${index+1}</option>`).join('')}</select></label><label class="select-field"><span>Frame rate</span><select data-text-preference="smpteFps">${['auto','23.976','24','25','29.97','30'].map(value=>`<option value="${value}" ${preferences.smpteFps===value?'selected':''}>${value==='auto'?'Detect':value+' fps'}</option>`).join('')}</select></label><p class="browser-note">Clips set to SMPTE transport follow this timecode from their offset.</p>`
+    +`<h3 style="margin-top:12px">Pro DJ Link (CDJ / XDJ / DJM)</h3>${[['prolinkEnabled','Connect to Pro DJ Link players'],['prolinkTempo','Follow the master player\'s tempo and beat'],['prolinkOnAir','Track triggers need the channel on air (DJM mixer)']].map(([key,label])=>`<label class="preference-option"><input data-preference="${key}" type="checkbox" ${preferences[key]?'checked':''}>${label}</label>`).join('')}<label class="select-field"><span>Our player number</span><select data-number-preference="prolinkNumber">${Array.from({length:15},(_,index)=>`<option value="${index+1}" ${preferences.prolinkNumber===index+1?'selected':''}>${index+1}</option>`).join('')}</select></label><p class="browser-note">PrismVJ joins the network as a virtual player. Pick a number no real player uses. For track names, use an unused 1–4 (1–6 with CDJ-3000s).</p>`
     +'<p class="browser-note">These settings apply to this computer and survive reopening PrismVJ.</p>',[['Cancel','cancel'],['Save settings','save']]);
   navigator.mediaDevices?.enumerateDevices?.().then(devices=>{
     for(const select of $$('[data-device-preference]',dialog)){
@@ -221,6 +226,7 @@ function preferencesDialog(){
       preferences=writePreferences({...preferences,...Object.fromEntries($$('[data-preference]',dialog).map(input=>[input.dataset.preference,input.checked])),...Object.fromEntries($$('[data-device-preference]',dialog).map(select=>[select.dataset.devicePreference,select.value])),...Object.fromEntries($$('[data-number-preference]',dialog).map(select=>[select.dataset.numberPreference,Number(select.value)])),...Object.fromEntries($$('[data-text-preference]',dialog).map(select=>[select.dataset.textPreference,select.value]))});
       applyPreferences();renderAll();
       shortcuts.clock.enabled=preferences.midiClockSync;if(preferences.midiClockSync)shortcuts.enableMidi().catch(error=>toast(`MIDI unavailable: ${error.message}`,true));
+      if(previous.prolinkEnabled!==preferences.prolinkEnabled||previous.prolinkNumber!==preferences.prolinkNumber)await (preferences.prolinkEnabled?startProLink():stopProLink());
       if(previous.audioInputDevice!==preferences.audioInputDevice)await engine.setExternalAudioInput(preferences.audioInputDevice||null);
       if(previous.smpteInputDevice!==preferences.smpteInputDevice||previous.smpteChannel!==preferences.smpteChannel||previous.smpteFps!==preferences.smpteFps)await startTimecode();
       if(previous.audioOutputDevice!==preferences.audioOutputDevice&&engine.audioContext?.setSinkId)await engine.audioContext.setSinkId(preferences.audioOutputDevice||'');
@@ -416,6 +422,121 @@ function updateLinkButton(){
 }
 // Our tempo edits go to the Link session (not echoes of its own changes).
 function linkTempoChanged(){if(link.enabled&&Math.abs(project.bpm-lastLinkTempo)>0.0001){lastLinkTempo=project.bpm;desktop.linkTempo(project.bpm).catch(()=>{});}}
+// Pro DJ Link: CDJ tempo/beat follow and track triggers ("when this song
+// plays, play this clip in sync"). The main process streams player state at
+// 20 Hz; positions are extrapolated between updates.
+let prolinkState={running:false,players:[],devices:[]},prolinkAt=0,lastProLinkPanel='',lastProLinkWarning=0;
+const prolinkLive=new Map();
+function setupProLink(){
+  if(!desktop?.startProLink)return;
+  // Also follow on every update, so triggers fire while rendering is throttled.
+  desktop.onProLinkState(state=>{prolinkState=state;prolinkAt=now();try{if(state.running)followProLink();}catch(error){console.error(error);}updateProLinkPanel();});
+  desktop.onProLinkBeat(beat=>{if(preferences.prolinkTempo&&beat.master&&beat.beatInBar>=1&&beat.beatInBar<=4)transport.syncBeat(beat.beatInBar-1,4,now());});
+  desktop.onProLinkWarning(message=>{if(now()-lastProLinkWarning>10){lastProLinkWarning=now();toast(`Pro DJ Link: ${message}`,true);}});
+  if(preferences.prolinkEnabled)startProLink();
+}
+async function startProLink(){
+  if(!desktop?.startProLink)return toast('Pro DJ Link needs the desktop app.',true);
+  try{prolinkState=await desktop.startProLink({number:preferences.prolinkNumber});prolinkAt=now();toast(`Pro DJ Link on: listening as player ${preferences.prolinkNumber}.`);}
+  catch(error){prolinkState={running:false,players:[],devices:[]};toast(`Pro DJ Link could not start: ${error.message}`,true);}
+  updateProLinkPanel();
+}
+async function stopProLink(){
+  await desktop?.stopProLink?.().catch(()=>{});
+  for(const entry of prolinkLive.values())transport.setExternalRate(entry.layerId,null);
+  prolinkLive.clear();prolinkState={running:false,players:[],devices:[]};updateProLinkPanel();
+}
+function followProLink(){
+  // Bring the transport clock current so seeks land at the right moment.
+  transport.tick(now());
+  const elapsed=Math.max(0,Math.min(1,now()-prolinkAt)),players=prolinkState.players||[];
+  const master=players.find(player=>player.master&&player.bpm);
+  if(preferences.prolinkTempo&&master&&Math.abs(master.bpm-project.bpm)>0.005){project.bpm=Math.round(master.bpm*100)/100;if(document.activeElement!==$('#bpm'))$('#bpm').value=project.bpm;}
+  for(const rule of project.trackTriggers||[]){
+    const found=findClip(rule.clipId),match=found&&playerFor(rule,players,{requireOnAir:preferences.prolinkOnAir}),active=prolinkLive.get(rule.id);
+    if(!found){if(active){transport.setExternalRate(active.layerId,null);prolinkLive.delete(rule.id);}continue;}
+    const layerId=found.layer.id;
+    if(match?.live){
+      const key=`${match.player.number}:${match.player.trackId}`;
+      if(active?.key!==key){prolinkLive.set(rule.id,{key,layerId});trigger(found.layer,found.clip);}
+      if(rule.sync){
+        const state=transport.getState(layerId);
+        if(state?.clipId===rule.clipId){
+          const target=clipPosition(rule,match.player,found.clip,elapsed);
+          transport.setExternalRate(layerId,1+(match.player.pitch||0)/100);
+          if(Math.abs(target-state.position)*found.clip.duration>1/30)transport.seek(layerId,target);
+        }
+      }
+    }else if(active){
+      // Paused or cued with the track still loaded: hold the frame in sync.
+      if(match&&!preferences.prolinkOnAir&&rule.sync){transport.setExternalRate(layerId,0);const state=transport.getState(layerId);if(state?.clipId===rule.clipId)transport.seek(layerId,clipPosition(rule,match.player,found.clip,0));continue;}
+      transport.setExternalRate(layerId,null);
+      if(rule.stopWithTrack&&transport.getState(layerId)?.clipId===rule.clipId)transport.stop(layerId);
+      prolinkLive.delete(rule.id);
+    }
+  }
+}
+const formatClock=seconds=>{const s=Math.max(0,Math.floor(seconds||0));return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;};
+const proLinkTempoText=player=>`${player.bpm?`${player.bpm.toFixed(2)} BPM`:''}${player.pitch?` (${player.pitch>0?'+':''}${player.pitch.toFixed(1)}%)`:''}`;
+const proLinkTimeText=player=>`${formatClock(player.position)}${player.length?` / ${formatClock(player.length)}`:''}${player.precise?'':' ≈'}`;
+// Rows re-render only when their content changes; time and tempo update in
+// place so buttons stay put under the pointer.
+const proLinkStructure=()=>JSON.stringify([prolinkState.running,prolinkState.number,prolinkState.address,(prolinkState.devices||[]).map(device=>[device.number,device.name,device.type]),(prolinkState.players||[]).map(player=>[player.number,player.trackId,player.track?.title,player.track?.artist,player.lookupError,player.master,player.onAir,player.playing])]);
+function proLinkPlayersHTML(){
+  const state=prolinkState;
+  if(!desktop?.startProLink)return '<p class="browser-note">Pro DJ Link needs the desktop app.</p>';
+  if(!state.running)return '<p class="browser-note">Off. Turn it on here or in Settings.</p>';
+  const players=state.players||[],mixers=(state.devices||[]).filter(device=>device.type==='mixer');
+  const head=`<p class="browser-note">Player ${state.number}${state.address?` on ${esc(state.address)}`:''} · ${(state.devices||[]).length} device${(state.devices||[]).length===1?'':'s'}${mixers.length?` · ${esc(mixers.map(item=>item.name).join(', '))}`:''}</p>`;
+  if(!players.length)return head+'<p class="browser-note">Waiting for players… Connect this computer to the same network as the CDJs.</p>';
+  return head+players.map(player=>{
+    const track=player.track,title=track?.title?`${esc(track.title)}${track.artist?` <span class="muted">— ${esc(track.artist)}</span>`:''}`:player.trackId?`Track #${player.trackId}${player.lookupError?' <span class="muted">(name unavailable)</span>':''}`:'<span class="muted">No track</span>';
+    const flags=[player.master?'<span class="pill">MASTER</span>':'',player.onAir?'<span class="pill on-air">ON AIR</span>':'',player.playing?'▶':'❚❚'].join(' ');
+    return `<div class="prolink-player"><div class="row"><strong>P${player.number}</strong> ${flags}<span class="spacer"></span><span class="muted" data-prolink-bpm="${player.number}">${proLinkTempoText(player)}</span></div><div class="prolink-track">${title}</div><div class="row"><span class="muted" data-prolink-time="${player.number}">${proLinkTimeText(player)}</span><span class="spacer"></span>${player.trackId?`<button data-prolink-map="${player.number}" title="Play the selected clip whenever this track plays">Map to selected clip</button>`:''}</div></div>`;
+  }).join('');
+}
+function proLinkTriggersHTML(){
+  const triggers=project.trackTriggers||[];
+  if(!triggers.length)return '<p class="browser-note">No track triggers. Select a clip, then use “Map to selected clip” on a player.</p>';
+  return triggers.map(trigger=>{const found=findClip(trigger.clipId);return `<div class="prolink-trigger" data-trigger="${esc(trigger.id)}"><div class="row"><strong class="grow">${esc(trackLabel(trigger))}</strong><button data-trigger-remove title="Remove trigger" aria-label="Remove trigger">✕</button></div><div class="muted">→ ${found?esc(found.clip.name):'(clip removed)'}${found?` · ${esc(found.layer.name)}`:''}</div><div class="row"><label><input type="checkbox" data-trigger-field="sync" ${trigger.sync?'checked':''}> Sync to track</label><label><input type="checkbox" data-trigger-field="stopWithTrack" ${trigger.stopWithTrack?'checked':''}> Stop with track</label><label title="Seconds added to the track position">Offset <input type="number" step="0.1" data-trigger-field="offset" value="${trigger.offset}" style="width:64px"></label></div></div>`;}).join('');
+}
+function proLinkPanelHTML(){
+  return `<div class="section"><h3>Pro DJ Link (CDJ / DJM)</h3><div class="row"><button id="prolink-toggle">${prolinkState.running?'Disconnect':'Connect'}</button><label><input type="checkbox" id="prolink-tempo" ${preferences.prolinkTempo?'checked':''}> Follow master tempo</label></div><div id="prolink-players">${proLinkPlayersHTML()}</div><h3>Track triggers</h3><div id="prolink-triggers">${proLinkTriggersHTML()}</div></div>`;
+}
+function updateProLinkPanel(){
+  const host=$('#prolink-players');if(!host)return;
+  const structure=proLinkStructure();
+  if(structure===lastProLinkPanel){
+    for(const player of prolinkState.players||[]){
+      const time=host.querySelector(`[data-prolink-time="${player.number}"]`),tempo=host.querySelector(`[data-prolink-bpm="${player.number}"]`);
+      if(time)time.textContent=proLinkTimeText(player);if(tempo)tempo.textContent=proLinkTempoText(player);
+    }
+    return;
+  }
+  lastProLinkPanel=structure;host.innerHTML=proLinkPlayersHTML();bindProLinkPlayers();
+  const toggle=$('#prolink-toggle');if(toggle)toggle.textContent=prolinkState.running?'Disconnect':'Connect';
+}
+function bindProLinkPlayers(){
+  for(const button of $$('[data-prolink-map]'))button.onclick=()=>{
+    const player=(prolinkState.players||[]).find(item=>item.number===Number(button.dataset.prolinkMap));
+    const clip=findClip(selectedClipId)?.clip;
+    if(!player?.trackId)return toast('That player has no track loaded.',true);
+    if(!clip)return toast('Select the clip to play for this track first.',true);
+    const trigger={id:id().replace(/[^A-Za-z0-9_-]/g,'').slice(0,32),title:player.track?.title||'',artist:player.track?.artist||'',trackId:player.trackId,clipId:clip.id,sync:true,offset:0,stopWithTrack:true};
+    project.trackTriggers=normalizeTrackTriggers([...(project.trackTriggers||[]).filter(item=>!(item.clipId===clip.id&&trackLabel(item)===trackLabel(trigger))),trigger]);
+    changed();renderBrowser();toast(`${trackLabel(trigger)} now plays ${clip.name}.`);
+  };
+}
+function bindProLinkPanel(){
+  $('#prolink-toggle')?.addEventListener('click',async()=>{const on=!prolinkState.running;preferences=writePreferences({...preferences,prolinkEnabled:on});await (on?startProLink():stopProLink());renderBrowser();});
+  $('#prolink-tempo')?.addEventListener('change',event=>{preferences=writePreferences({...preferences,prolinkTempo:event.target.checked});});
+  bindProLinkPlayers();
+  for(const row of $$('[data-trigger]')){
+    const trigger=(project.trackTriggers||[]).find(item=>item.id===row.dataset.trigger);if(!trigger)continue;
+    row.querySelector('[data-trigger-remove]').onclick=()=>{const entry=prolinkLive.get(trigger.id);if(entry)transport.setExternalRate(entry.layerId,null);prolinkLive.delete(trigger.id);project.trackTriggers=project.trackTriggers.filter(item=>item.id!==trigger.id);changed();renderBrowser();};
+    for(const input of row.querySelectorAll('[data-trigger-field]'))input.onchange=()=>{const key=input.dataset.triggerField;trigger[key]=input.type==='checkbox'?input.checked:Number(input.value)||0;project.trackTriggers=normalizeTrackTriggers(project.trackTriggers);changed();};
+  }
+}
 function timecodeFps(){return timecode?.state.fps||(preferences.smpteFps==='auto'?25:Number(preferences.smpteFps));}
 function followTimecode(frames){
   const state=timecode.state;
@@ -902,6 +1023,7 @@ function grouped(definitions,query){
   return [...groups].map(([category,items])=>[category,items.sort((a,b)=>a.name.localeCompare(b.name))]).sort((a,b)=>a[0].localeCompare(b[0]));
 }
 function effectsBrowserHTML(){
+  if(effectKind==='isf')return isfBrowserHTML();
   const query=effectSearch.trim().toLowerCase(),audio=effectKind==='audio',presets=readPresets();
   const definitions=audio?listAudioEffects():listEffects();
   const scopeName=effectScope==='composition'?'composition':effectScope==='group'?'group':effectScope==='layer'?'layer':'clip';
@@ -909,9 +1031,98 @@ function effectsBrowserHTML(){
     const own=presets[`${audio?'audio:':''}${definition.id}`]||[];
     return `<div class="browser-item fx-item" data-add-effect="${esc(definition.id)}" data-effect-kind="${audio?'audio':'video'}" draggable="true" title="Click to add to the selected ${scopeName}. Drag onto a clip, layer or panel; Alt-drop adds it at 0% opacity."><span class="pill">${audio?'AFX':'FX'}</span><strong>${esc(definition.name)}</strong><span class="spacer"></span><span class="muted">＋</span></div>${own.map((preset,index)=>`<div class="browser-item fx-item preset" data-add-effect="${esc(definition.id)}" data-effect-kind="${audio?'audio':'video'}" data-preset="${index}" draggable="true"><span class="muted">↳</span>${esc(preset.name)}</div>`).join('')}`;
   }).join('')}</details>`).join('');
-  return `<div class="browser-tools"><input id="effect-search" type="search" placeholder="Search effects (Ctrl+/)" value="${esc(effectSearch)}" aria-label="Search effects"><div class="segmented"><button data-effect-kind-tab="video" class="${audio?'':'active'}">Video</button><button data-effect-kind-tab="audio" class="${audio?'active':''}">Audio</button></div></div>
+  return `<div class="browser-tools"><input id="effect-search" type="search" placeholder="Search effects (Ctrl+/)" value="${esc(effectSearch)}" aria-label="Search effects">${effectKindTabs()}</div>
     <div class="browser-note">Adds to the selected <strong>${scopeName}</strong>. Effects process top to bottom. ${audio?'Audio effects mix with Dry/Wet.':'Each effect has its own opacity and blend mode.'}</div>${items||'<p class="browser-note">No effects match.</p>'}
-    ${audio?'':`<div class="section"><h3>ISF shaders</h3><p class="browser-note">Import Interactive Shader Format (.fs) effects and generators, e.g. from the ISF community library.</p><div class="row"><button id="load-isf-files">Import .fs files…</button>${desktop?.scanISFFolder?'<button id="load-isf-folder">Import folder…</button>':''}</div></div>`}`;
+    ${audio?'':`<div class="section"><h3>ISF shaders</h3><p class="browser-note">${query?`<button id="isf-search-online" class="primary">Search editor.isf.video for “${esc(effectSearch.trim())}”</button> `:''}Thousands more effects, generators and transitions are in the <a href="#" id="open-isf-tab">ISF Library</a>.</p></div>`}`;
+}
+// ISF community library (editor.isf.video) and imported ISF shaders.
+const ISF_CATEGORY_OPTIONS=['Generator','Color Adjustment','Color Effect','Blur','Distortion Effect','Glitch','Halftone Effect','Masking','Patterns','Sharpen','Stylize','Tile Effect','Geometry Adjustment','Film','Transition','Examples'];
+const ISF_KIND_LABEL={effect:'FX',source:'GEN',transition:'MIX'};
+let isfState={query:'',sort:'popular',category:'',kind:'all',page:0,items:[],total:0,more:false,loading:false,error:'',searched:false},isfModule=null;
+const isfInstalled=new Map();
+const isfDefinitionId=id=>`isf:web-${id}`;
+const isfParser=async()=>isfModule||=await import('./fx/isf.js');
+function effectKindTabs(){return `<div class="segmented">${[['video','Video'],['audio','Audio'],['isf','ISF Library']].map(([kind,label])=>`<button data-effect-kind-tab="${kind}" class="${effectKind===kind?'active':''}">${label}</button>`).join('')}</div>`;}
+function isfCardHTML(item){
+  const installed=isfInstalled.has(item.id),transition=item.kind==='transition';
+  const action=transition?(installed?'Installed':'Install'):installed?(item.kind==='source'?'Add to layer':'Add effect'):'Install & add';
+  return `<div class="isf-card" data-isf-id="${esc(item.id)}"><div class="isf-thumb">${item.thumbnail?`<img src="${esc(item.thumbnail)}" alt="" loading="lazy">`:''}<span class="pill">${ISF_KIND_LABEL[item.kind]||'ISF'}</span></div><div class="isf-meta"><strong title="${esc(item.description||item.title)}">${esc(item.title)}</strong><small>${esc(item.author||'')}${item.stars?` · ★ ${item.stars}`:''}</small></div><div class="isf-actions"><button data-isf-install="${esc(item.id)}" class="${installed?'':'primary'}" ${installed&&transition?'disabled':''}>${action}</button><button data-isf-open="${esc(item.link)}" title="Open on editor.isf.video" aria-label="Open ${esc(item.title)} on editor.isf.video">↗</button>${installed?`<button data-isf-remove="${esc(item.id)}" title="Uninstall" aria-label="Uninstall ${esc(item.title)}">✕</button>`:''}</div></div>`;
+}
+function isfBrowserHTML(){
+  const online=!!desktop?.searchISF;
+  const shown=isfState.items.filter(item=>isfState.kind==='all'||item.kind===isfState.kind);
+  const installed=[...isfInstalled.values()].sort((a,b)=>a.name.localeCompare(b.name));
+  const option=(value,label,current)=>`<option value="${esc(value)}" ${current===value?'selected':''}>${esc(label)}</option>`;
+  return `<div class="browser-tools isf-tools"><input id="isf-search" type="search" placeholder="Search editor.isf.video (Enter)" value="${esc(isfState.query)}" aria-label="Search the ISF library">${effectKindTabs()}</div>
+  <div class="isf-filters"><select id="isf-sort" aria-label="Sort">${[['popular','Most popular'],['newest','Newest'],['title','Title'],['relevance','Best match']].map(([v,l])=>option(v,l,isfState.sort)).join('')}</select><select id="isf-category" aria-label="Category">${option('','All categories',isfState.category)}${ISF_CATEGORY_OPTIONS.map(c=>option(c,c,isfState.category)).join('')}</select><select id="isf-kind" aria-label="Type">${[['all','All types'],['effect','Effects'],['source','Generators'],['transition','Transitions']].map(([v,l])=>option(v,l,isfState.kind)).join('')}</select></div>
+  ${online?'':'<p class="browser-note">The online library needs the desktop app. You can still import .fs files below.</p>'}
+  ${isfState.error?`<p class="browser-note error-note">${esc(isfState.error)}</p>`:''}
+  ${online&&isfState.searched?`<div class="browser-note">${isfState.total.toLocaleString()} shader${isfState.total===1?'':'s'} on editor.isf.video. Each belongs to its author: check the credit before commercial use.</div>`:''}
+  <div class="isf-grid">${shown.map(isfCardHTML).join('')}</div>
+  ${isfState.loading?'<p class="browser-note">Loading…</p>':isfState.more?'<button id="isf-more">Load more</button>':''}
+  <details class="browser-group" ${installed.length?'open':''}><summary>Installed <span class="muted">${installed.length}</span></summary>${installed.map(definition=>`<div class="browser-item"><span class="pill">${ISF_KIND_LABEL[definition.isf?.kind]||'ISF'}</span><strong>${esc(definition.name)}</strong><small>${esc(definition.credit||'')}</small><span class="spacer"></span><button data-isf-remove="${esc(definition.isfOnline)}" title="Uninstall" aria-label="Uninstall ${esc(definition.name)}">✕</button></div>`).join('')||'<p class="browser-note">Nothing installed yet.</p>'}</details>
+  <div class="section"><h3>Import from disk</h3><p class="browser-note">ISF .fs files (with a matching .vs and imported images), or a whole folder. Folders reload each time PrismVJ starts.</p><div class="row"><button id="load-isf-files">Import .fs files…</button>${desktop?.scanISFFolder?'<button id="load-isf-folder">Import folder…</button>':''}</div></div>`;
+}
+// Registers one parsed shader as an effect, source or transition and starts compiling it.
+function registerISFDefinition(parseISF,file,options={}){
+  const {definition,kind,warnings}=parseISF(file.text,{fileName:file.name,vertex:file.vertex||'',assets:file.assets||null,...options});
+  if(options.online)definition.isfOnline=options.online;
+  (kind==='transition'?registerTransition:kind==='source'?registerSource:registerEffect)(definition);
+  const registered=(kind==='transition'?transitionDefinition:kind==='source'?sourceDefinition:effectDefinition)(definition.id);
+  engine.prewarm([registered],{kind:kind==='source'?'source':'effect'});
+  return {definition:registered,kind,warnings};
+}
+async function isfSearch(reset){
+  if(!desktop?.searchISF){isfState.error='The online library needs the desktop app.';renderBrowser();return;}
+  if(isfState.loading)return;
+  const page=reset?0:isfState.page+1;
+  isfState={...isfState,loading:true,error:'',...(reset?{items:[],page:0,more:false}:{})};
+  if(browserTab==='effects'&&effectKind==='isf')renderBrowser();
+  try{
+    const result=await desktop.searchISF({q:isfState.query,category:isfState.category,sort:isfState.sort,page});
+    isfState={...isfState,items:reset?result.items:[...isfState.items,...result.items],total:result.total,more:result.more,page,searched:true};
+  }catch(error){isfState={...isfState,error:`Could not reach editor.isf.video: ${error.message}`};}
+  isfState.loading=false;
+  if(browserTab==='effects'&&effectKind==='isf')renderBrowser();
+}
+async function isfInstall(id){
+  const item=isfState.items.find(entry=>entry.id===id);
+  let definition=isfInstalled.get(id);
+  try{
+    if(!definition){
+      toast(`Installing ${item?.title||'shader'}…`);
+      const entry=await desktop.installISF(id),{parseISF}=await isfParser();
+      const result=registerISFDefinition(parseISF,{name:entry.name,text:entry.text,vertex:entry.vertex,assets:entry.assets},{id:isfDefinitionId(id),online:id,link:entry.link,author:entry.author});
+      definition=result.definition;isfInstalled.set(id,definition);
+      if(result.warnings.length)toast(`${definition.name}: ${result.warnings[0]}`);
+    }
+    if(definition.isf.kind==='effect')addEffect(inspectorTarget(effectScope),{type:definition.id,kind:'video'});
+    else if(definition.isf.kind==='source')addSource(definition.id,currentLayer());
+    else toast(`${definition.name} installed. Pick it as a layer blend mode, clip transition or crossfader mix.`);
+  }catch(error){toast(`Could not install: ${error.message}`,true);}
+  renderBrowser();
+}
+async function isfRemove(id){
+  const definition=isfInstalled.get(id);
+  try{await desktop.removeISF(id);}catch(error){toast(`Could not uninstall: ${error.message}`,true);return;}
+  isfInstalled.delete(id);
+  if(definition){unregisterEffect(definition.id);unregisterSource(definition.id);unregisterTransition(definition.id);}
+  toast(`${definition?.name||'Shader'} uninstalled.`);
+  renderBrowser();
+}
+// Installed library shaders and saved ISF folders load at start, so projects
+// that use them render the same after a restart.
+async function loadISFCollections(){
+  if(!desktop?.isfLibrary)return;
+  try{
+    const {parseISF}=await isfParser();
+    for(const entry of await desktop.isfLibrary()){
+      try{const {definition}=registerISFDefinition(parseISF,{name:entry.name,text:entry.text,vertex:entry.vertex,assets:entry.assets},{id:isfDefinitionId(entry.id),online:entry.id,link:entry.link,author:entry.author});isfInstalled.set(entry.id,definition);}
+      catch{/* a shader that no longer parses stays on disk but unlisted */}
+    }
+    for(const folder of preferences.isfFolders){try{const result=await desktop.scanISFFolder(folder);if(result)await importISFTexts(result.files,{quiet:true});}catch{/* folder moved or unavailable */}}
+    renderBrowser();renderInspector();
+  }catch(error){toast(`ISF shaders could not load: ${error.message}`,true);}
 }
 function sourcesBrowserHTML(){
   const query=sourceSearch.trim().toLowerCase();
@@ -926,15 +1137,15 @@ function sourcesBrowserHTML(){
     <button id="refresh-devices" class="icon-btn">Find capture devices</button></details>`;
   return `<div class="browser-tools"><input id="source-search" type="search" placeholder="Search sources" value="${esc(sourceSearch)}" aria-label="Search sources"></div><div class="browser-note">Drag a source into a clip slot, or click to add it to the selected layer.</div>${live}${items}`;
 }
-async function importISFTexts(files){
+async function importISFTexts(files,{quiet=false}={}){
   let added=0;const problems=[];
-  const {parseISF}=await import('./fx/isf.js');
+  const {parseISF}=await isfParser();
   for(const file of files){
-    try{const {definition,kind,warnings}=parseISF(file.text,{fileName:file.name});(kind==='source'?registerSource:registerEffect)(definition);engine.prewarm([definition],{kind:kind==='source'?'source':'effect'});added++;if(warnings.length)problems.push(`${file.name}: ${warnings[0]}`);}
+    try{const {warnings}=registerISFDefinition(parseISF,file);added++;if(warnings.length)problems.push(`${file.name}: ${warnings[0]}`);}
     catch(error){problems.push(`${file.name}: ${error.message}`);}
   }
   renderBrowser();
-  toast(`Imported ${added} ISF shader${added===1?'':'s'}.${problems.length?` ${problems.length} note${problems.length===1?'':'s'}: ${problems.slice(0,2).join(' · ')}`:''}`,added===0&&problems.length>0);
+  if(!quiet||(!added&&problems.length))toast(`Imported ${added} ISF shader${added===1?'':'s'}.${problems.length?` ${problems.length} note${problems.length===1?'':'s'}: ${problems.slice(0,2).join(' · ')}`:''}`,added===0&&problems.length>0);
   return added;
 }
 async function refreshCaptureDevices(){
@@ -950,7 +1161,7 @@ function renderBrowser(){
   if(browserTab==='sources')$('#browser').innerHTML=sourcesBrowserHTML();
   if(browserTab==='effects')$('#browser').innerHTML=effectsBrowserHTML();
   if(browserTab==='files'){fileBrowser.render($('#browser'));return;}else fileBrowser.detach();
-  if(browserTab==='controls')$('#browser').innerHTML=shortcuts.panelHTML()+controlExtrasHTML()+`<div class="section"><h3>Performance controls</h3><p class="browser-note">Number keys 1–0 trigger the selected layer; Shift triggers a column. Q–I trigger the top layer; A–K the middle; Z–comma the bottom. Space pauses. Escape clears blackout.</p><button id="enable-midi">${midiAccess?'MIDI connected':'Enable MIDI input'}</button><p id="midi-status" class="browser-note">${midiAccess?[...midiAccess.inputs.values()].map(x=>esc(x.name)).join(', ')||'No MIDI inputs detected':'Connect a controller, then enable MIDI.'}</p></div><div class="section"><h3>MIDI learn</h3><select id="learn-target"><option value="crossfader">Crossfader</option><option value="masterOpacity">Master video</option><option value="masterVolume">Master audio</option>${project.layers.map((l,i)=>`<option value="layer:${l.id}:opacity">${esc(l.name)} video</option>`).join('')}${Array.from({length:project.columns||8},(_,i)=>`<option value="column:${i}">Column ${i+1}</option>`).join('')}</select><button id="midi-learn" class="icon-btn">Learn</button><div id="mappings">${project.mappings.map((m,i)=>`<div class="mapping"><small class="grow">${esc(m.target)} ← ${m.type} ${m.number}</small><button data-unmap="${i}" class="icon-btn">×</button></div>`).join('')}</div></div>${desktop?.startOSC?'<div class="section"><h3>OSC input</h3><div class="row"><input id="osc-port" aria-label="OSC port" type="number" min="1024" max="65535" value="7000" style="width:80px"><button id="osc-start">Start OSC</button><button id="osc-stop">Stop</button></div><p class="browser-note">Local UDP input. /composition/video/fadeout/values, /layer1/audio/pan/values, /layer1/clip1/connect, /layer1/video/opacity/values.</p></div>':''}`;
+  if(browserTab==='controls')$('#browser').innerHTML=shortcuts.panelHTML()+proLinkPanelHTML()+controlExtrasHTML()+`<div class="section"><h3>Performance controls</h3><p class="browser-note">Number keys 1–0 trigger the selected layer; Shift triggers a column. Q–I trigger the top layer; A–K the middle; Z–comma the bottom. Space pauses. Escape clears blackout.</p><button id="enable-midi">${midiAccess?'MIDI connected':'Enable MIDI input'}</button><p id="midi-status" class="browser-note">${midiAccess?[...midiAccess.inputs.values()].map(x=>esc(x.name)).join(', ')||'No MIDI inputs detected':'Connect a controller, then enable MIDI.'}</p></div><div class="section"><h3>MIDI learn</h3><select id="learn-target"><option value="crossfader">Crossfader</option><option value="masterOpacity">Master video</option><option value="masterVolume">Master audio</option>${project.layers.map((l,i)=>`<option value="layer:${l.id}:opacity">${esc(l.name)} video</option>`).join('')}${Array.from({length:project.columns||8},(_,i)=>`<option value="column:${i}">Column ${i+1}</option>`).join('')}</select><button id="midi-learn" class="icon-btn">Learn</button><div id="mappings">${project.mappings.map((m,i)=>`<div class="mapping"><small class="grow">${esc(m.target)} ← ${m.type} ${m.number}</small><button data-unmap="${i}" class="icon-btn">×</button></div>`).join('')}</div></div>${desktop?.startOSC?'<div class="section"><h3>OSC input</h3><div class="row"><input id="osc-port" aria-label="OSC port" type="number" min="1024" max="65535" value="7000" style="width:80px"><button id="osc-start">Start OSC</button><button id="osc-stop">Stop</button></div><p class="browser-note">Local UDP input. /composition/video/fadeout/values, /layer1/audio/pan/values, /layer1/clip1/connect, /layer1/video/opacity/values.</p></div>':''}`;
   const sourceExtra=item=>({params:item.dataset.sourceParams?JSON.parse(item.dataset.sourceParams):undefined,name:item.dataset.sourceName});
   for(const item of $$('[data-source]')){item.onpointerenter=()=>{const definition=sourceDefinition(item.dataset.source);if(definition?.glsl)engine.prewarm([definition],{kind:'source',priority:true});};item.onclick=()=>addSource(item.dataset.source,currentLayer(),undefined,sourceExtra(item));item.ondragstart=e=>{e.dataTransfer.setData('application/prism-source',item.dataset.source);e.dataTransfer.setData('application/prism-source-extra',JSON.stringify(sourceExtra(item)));};}
   for(const item of $$('[data-add-effect]')){
@@ -961,11 +1172,21 @@ function renderBrowser(){
   }
   const search=$('#effect-search')||$('#source-search');
   if(search){search.oninput=()=>{if(search.id==='effect-search')effectSearch=search.value;else sourceSearch=search.value;const position=search.selectionStart;renderBrowser();const next=$('#'+search.id);next.focus();next.setSelectionRange(position,position);};}
-  for(const button of $$('[data-effect-kind-tab]'))button.onclick=()=>{effectKind=button.dataset.effectKindTab;renderBrowser();};
+  for(const button of $$('[data-effect-kind-tab]'))button.onclick=()=>{effectKind=button.dataset.effectKindTab;renderBrowser();if(effectKind==='isf'&&!isfState.searched)isfSearch(true);};
+  $('#open-isf-tab')?.addEventListener('click',event=>{event.preventDefault();effectKind='isf';renderBrowser();if(!isfState.searched)isfSearch(true);});
+  $('#isf-search-online')?.addEventListener('click',()=>{isfState.query=effectSearch.trim();effectKind='isf';isfSearch(true);});
+  const isfInput=$('#isf-search');
+  if(isfInput){isfInput.onkeydown=event=>{if(event.key==='Enter'){isfState.query=isfInput.value;isfSearch(true);}};isfInput.onsearch=()=>{if(isfInput.value!==isfState.query){isfState.query=isfInput.value;isfSearch(true);}};}
+  for(const [selector,key] of [['#isf-sort','sort'],['#isf-category','category']]){const select=$(selector);if(select)select.onchange=()=>{isfState[key]=select.value;isfSearch(true);};}
+  const isfKindSelect=$('#isf-kind');if(isfKindSelect)isfKindSelect.onchange=()=>{isfState.kind=isfKindSelect.value;renderBrowser();};
+  $('#isf-more')?.addEventListener('click',()=>isfSearch(false));
+  for(const button of $$('[data-isf-install]'))button.onclick=()=>isfInstall(button.dataset.isfInstall);
+  for(const button of $$('[data-isf-open]'))button.onclick=()=>desktop?.openISFPage?.(button.dataset.isfOpen);
+  for(const button of $$('[data-isf-remove]'))button.onclick=()=>isfRemove(button.dataset.isfRemove);
   $('#refresh-devices')?.addEventListener('click',refreshCaptureDevices);
   $('#load-isf-files')?.addEventListener('click',()=>{const input=document.createElement('input');input.type='file';input.accept='.fs,.frag,.glsl';input.multiple=true;input.onchange=async()=>importISFTexts(await Promise.all([...input.files].map(async file=>({name:file.name,text:await file.text()}))));input.click();});
   $('#load-isf-folder')?.addEventListener('click',async()=>{try{const result=await desktop.scanISFFolder();if(result)await importISFTexts(result.files);if(result?.folder&&!preferences.isfFolders.includes(result.folder))preferences=writePreferences({...preferences,isfFolders:[...preferences.isfFolders,result.folder]});}catch(error){toast(`ISF import failed: ${error.message}`,true);}});
-  if(browserTab==='controls')shortcuts.bindPanel($('#browser'),{prompt:promptText,render:renderBrowser});
+  if(browserTab==='controls'){shortcuts.bindPanel($('#browser'),{prompt:promptText,render:renderBrowser});lastProLinkPanel='';bindProLinkPanel();}
   $('#import-media')?.addEventListener('click',()=>importFiles());
   for(const item of $$('[data-library]'))item.onclick=()=>placeMedia(mediaLibrary[+item.dataset.library],currentLayer());
   $('#enable-midi')?.addEventListener('click',enableMidi);
@@ -1475,6 +1696,7 @@ function frame(timestamp){
   try{const frames=transport.tick(t);const dt=lastFrameTime?Math.min(1,Math.max(0,t-lastFrameTime)):0;lastFrameTime=t;
     animatedCount=applyAnimations(project,frames,animator,{dt:project.paused?0:dt,beat:transport.beat,spectrum:(source,owner)=>engine.spectrum(source,owner)});
     if(timecode)followTimecode(frames);
+    if(prolinkState.running)followProLink();
     engine.render(project,frames,t,{beat:transport.beat});
     if(animatedCount&&t-lastAnimationRefresh>1/30){lastAnimationRefresh=t;refreshControls();}
     for(const host of inspectorHosts)if(host.animationStrips?.length)updateAnimationStrips(host,animationContext);
@@ -1581,7 +1803,7 @@ window.prismDiagnostics=()=>{
   return {project:serializeProject(project),preferences:{...preferences},
     frames:frames.map(frame=>({clipId:frame.clip.id,layerId:frame.layer.id,sourceLayerId:frame.sourceLayerId,voiceId:frame.voiceId,inputId:transport.getState(frame.layer.id)?.inputId,direction:frame.direction,position:frame.position,time:frame.time,weight:frame.weight})),
     voices:frames.map(frame=>{const voiceId=frame.sourceLayerId!==frame.layer.id?frame.voiceId:undefined;const media=engine.getMedia(frame.clip.id,voiceId),audio=engine.getAudio(frame.clip.id,voiceId);return {clipId:frame.clip.id,layerId:frame.layer.id,voiceId:frame.voiceId,mediaTime:media?.currentTime??null,audioTime:audio?.currentTime??null,mediaPaused:media?.paused??null,audioPaused:audio?.paused??null};}),
-    stats:engine?.getStats?.(),recording:recorder?.state||'inactive',link:{available:link.available,enabled:link.enabled,peers:link.peers,tempo:link.tempo,beat:transport.beat},outputs:outputs?[...outputs.windows.values()].map(entry=>({name:entry.name,width:entry.canvas.width,height:entry.canvas.height})):[]};
+    prolink:{running:!!prolinkState.running,joined:!!prolinkState.joined,players:(prolinkState.players||[]).map(player=>({number:player.number,trackId:player.trackId,title:player.track?.title||null,playing:player.playing,position:player.position,master:player.master})),live:[...prolinkLive.entries()].map(([id,entry])=>({id,...entry}))},stats:engine?.getStats?.(),recording:recorder?.state||'inactive',link:{available:link.available,enabled:link.enabled,peers:link.peers,tempo:link.tempo,beat:transport.beat},outputs:outputs?[...outputs.windows.values()].map(entry=>({name:entry.name,width:entry.canvas.width,height:entry.canvas.height})):[]};
 };
 // Renders the composition and every output window once, then samples each
 // at its centre (for automated output checks).

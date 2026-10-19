@@ -21,6 +21,7 @@ before(async () => {
   const files = {
     '/shader-template.js': await readFile(new URL('../src/fx/shader-template.js', import.meta.url)),
     '/video-effects.js': await readFile(new URL('../src/fx/video-effects.js', import.meta.url)),
+    '/manual-effects.js': await readFile(new URL('../src/fx/manual-effects.js', import.meta.url)),
   };
   server = createServer((request, response) => {
     const file = files[request.url];

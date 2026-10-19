@@ -53,11 +53,16 @@ const aliases = new Map(BLEND_MODES.filter(mode => mode.supported).flatMap(mode 
   [mode.id.replace(/-/g, ''), mode.id],
 ]));
 aliases.set('alpha', 'normal');
+// ISF transitions ("isf:<id>") are kept even before their shader loads; the
+// engine crossfades until it is available.
+const ISF_MODE = /^isf:[a-zA-Z0-9_:.-]{1,116}$/;
+export const isIsfBlend = value => typeof value === 'string' && ISF_MODE.test(value);
 export function normalizeBlend(value, fallback = 'normal') {
+  if (isIsfBlend(value)) return value;
   const key = typeof value === 'string' ? value.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
   return aliases.get(key) || (lookup.has(fallback) ? fallback : 'normal');
 }
-export function blendIndex(value) { return lookup.get(normalizeBlend(value)).index; }
+export function blendIndex(value) { return (lookup.get(normalizeBlend(value)) || lookup.get('normal')).index; }
 const index = id => lookup.get(id).index;
 
 // Inputs and output are premultiplied RGBA. The same shader serves layer mixing

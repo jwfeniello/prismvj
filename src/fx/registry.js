@@ -4,7 +4,7 @@
 // (not yet loaded) effect types intact instead of dropping them.
 import { normalizeParams } from './shader-template.js';
 
-const video = new Map(), audio = new Map(), sources = new Map();
+const video = new Map(), audio = new Map(), sources = new Map(), transitions = new Map();
 const listeners = new Set();
 const ID = /^[a-zA-Z0-9_:.-]{1,120}$/;
 export const isDefinitionId = value => typeof value === 'string' && ID.test(value) && !['__proto__', 'constructor', 'prototype'].includes(value);
@@ -18,13 +18,19 @@ function register(map, definition) {
 export const registerEffect = definition => register(video, definition);
 export const registerAudioEffect = definition => register(audio, definition);
 export const registerSource = definition => register(sources, definition);
+// ISF transitions: usable as layer blend modes, clip transitions and the crossfader mix.
+export const registerTransition = definition => register(transitions, definition);
 export const unregisterEffect = id => video.delete(id);
 export const effectDefinition = id => video.get(id) || null;
 export const audioEffectDefinition = id => audio.get(id) || null;
 export const sourceDefinition = id => sources.get(id) || null;
+export const transitionDefinition = id => transitions.get(id) || null;
+export const unregisterSource = id => sources.delete(id);
+export const unregisterTransition = id => transitions.delete(id);
 export const listEffects = () => [...video.values()];
 export const listAudioEffects = () => [...audio.values()];
 export const listSources = () => [...sources.values()];
+export const listTransitions = () => [...transitions.values()];
 export function onRegistryChange(callback) { listeners.add(callback); return () => listeners.delete(callback); }
 
 // Parameter metadata for an effect instance's controls, including the

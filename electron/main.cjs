@@ -11,8 +11,13 @@ const dgram = require('node:dgram');
 const { isAutomatedLaunch, validateBuiltPage } = require('./startup.cjs');
 const { createMediaConverter } = require('./media-converter.cjs');
 const { scanISFFolder } = require('./isf-library.cjs');
+const { IsfOnline } = require('./isf-online.cjs');
 const { DmxSender, DmxReceiver } = require('./dmx-network.cjs');
 const abletonLink = require('./link.cjs');
+const { ProLink } = require('./prolink.cjs');
+// Pro DJ Link (CDJ/DJM network): one client at a time, state streamed at 20 Hz.
+let prolink = null, prolinkTimer = null;
+function stopProLink() { clearInterval(prolinkTimer); prolinkTimer = null; prolink?.stop(); prolink = null; }
 
 // Test profiles and automation/debugging switches also imply hidden mode. A
 // forgotten environment flag must never put test windows or dialogs on stage.
@@ -811,6 +816,18 @@ function setupIPC() {
   handle('prism:link-tempo', bpm => abletonLink.setTempo(bpm));
   handle('prism:link-playing', playing => abletonLink.setPlaying(playing));
   handle('prism:link-start-stop-sync', enabled => abletonLink.setStartStopSync(enabled));
+  handle('prism:prolink-start', async options => {
+    stopProLink();
+    const number = Number.isInteger(options?.number) && options.number >= 1 && options.number <= 15 ? options.number : 5;
+    const client = new ProLink({ number, name: 'PrismVJ' });
+    client.on('beat', beat => notify('prism:prolink-beat', beat));
+    client.on('warning', message => notify('prism:prolink-warning', String(message).slice(0, 300)));
+    await client.start();
+    prolink = client;
+    prolinkTimer = setInterval(() => { if (prolink === client) notify('prism:prolink-state', client.snapshot()); }, 50);
+    return client.snapshot();
+  });
+  handle('prism:prolink-stop', () => { stopProLink(); return true; });
   handle('prism:dmx-start', startDMX);
   handle('prism:dmx-stop', stopDMX);
   handle('prism:dmx-input-start', startDMXInput);
@@ -829,7 +846,19 @@ function setupIPC() {
       if (result.canceled || !result.filePaths[0]) return null;
       directory = result.filePaths[0];
     }
-    return { folder: directory, files: (await scanISFFolder(directory)).map(({ name, text }) => ({ name, text })) };
+    return { folder: directory, files: (await scanISFFolder(directory)).map(({ name, text, vertex, assets }) => ({ name, text, vertex, assets })) };
+  });
+  // ISF community library (editor.isf.video): search, install, installed list.
+  let isfOnline = null;
+  const isfLibrary = () => (isfOnline ||= new IsfOnline({ libraryDir: path.join(app.getPath('userData'), 'ISF Library') }));
+  handle('prism:isf-search', options => isfLibrary().search(options && typeof options === 'object' ? options : {}));
+  handle('prism:isf-install', id => isfLibrary().install(id));
+  handle('prism:isf-library', () => isfLibrary().library());
+  handle('prism:isf-remove', id => isfLibrary().remove(id));
+  handle('prism:isf-open', url => {
+    if (typeof url !== 'string' || !/^https:\/\/editor\.isf\.video\/shaders(\/[a-f0-9]{24})?$/.test(url)) return false;
+    shell.openExternal(url);
+    return true;
   });
   handle('prism:capture-sources', async () => (await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 0, height: 0 } }))
     .slice(0, 64).map(source => ({ id: source.id, name: source.name, screen: source.id.startsWith('screen:') })));
@@ -945,6 +974,7 @@ app.on('before-quit', event => {
     await stopDMX();
     await stopDMXInput();
     abletonLink.stop();
+    stopProLink();
     oscOutSocket?.close();
     await saveQueue;
     for (const record of recordings.values()) {

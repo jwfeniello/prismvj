@@ -49,6 +49,9 @@ const notices = [
   [path.join(root, 'native', 'link', 'vendor', 'GNU-GPL-v2.0.md'), 'AbletonLink-GNU-GPL-v2.0.md'],
 ];
 for (const [from, to] of notices) if (existsSync(from)) copyFileSync(from, path.join(licenses, to));
+// Notices for code PrismVJ adapts (kept in the repository's licenses folder).
+const ownLicenses = path.join(root, 'licenses');
+if (existsSync(ownLicenses)) for (const file of readdirSync(ownLicenses)) copyFileSync(path.join(ownLicenses, file), path.join(licenses, file));
 // electron-packager puts Electron's license at the top level; the top-level LICENSE should be PrismVJ's own.
 if (existsSync(path.join(root, 'LICENSE'))) copyFileSync(path.join(root, 'LICENSE'), path.join(appDir, 'LICENSE'));
 

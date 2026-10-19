@@ -3,6 +3,8 @@
 // ids and single-amount behaviour of the original engine effects so saved
 // projects keep rendering the same.
 
+import { MANUAL_EFFECTS } from './manual-effects.js';
+
 const num = (key, label, min, max, value) => ({ key, label, type: 'float', min, max, default: value });
 const int = (key, label, min, max, value) => ({ key, label, type: 'int', min, max, default: value, step: 1 });
 const bool = (key, label, value) => ({ key, label, type: 'bool', default: value });
@@ -955,7 +957,7 @@ const deepFreeze = value => {
   return value;
 };
 
-export const VIDEO_EFFECTS = deepFreeze([...COLOR, ...KEYING, ...BLUR, ...DISTORT, ...MIRROR, ...STYLIZE, ...GLITCH, ...TIME, ...GENERATE, ...LEGACY]);
+export const VIDEO_EFFECTS = deepFreeze([...COLOR, ...KEYING, ...BLUR, ...DISTORT, ...MIRROR, ...STYLIZE, ...GLITCH, ...TIME, ...GENERATE, ...MANUAL_EFFECTS, ...LEGACY]);
 export const VIDEO_EFFECT_CATEGORIES = Object.freeze([...new Set(VIDEO_EFFECTS.map(effect => effect.category))]);
 export const LEGACY_EFFECT_IDS = Object.freeze(LEGACY.map(effect => effect.id));
 

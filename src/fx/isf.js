@@ -1,46 +1,39 @@
 // ISF (Interactive Shader Format, https://github.com/mrRay/ISF_Spec) import.
-// parseISF turns one .fs file into an effect or source definition for
-// shader-template.js: the JSON header becomes params and passes, and the GLSL
-// body is rewritten token by token (ISF built-ins, inputs, GLSL 1.x idioms)
-// and wrapped in fx()/gen(). Shaders come from untrusted files, so every size
-// is bounded and nothing is evaluated.
-import { uniformName } from './shader-template.js';
+// parseISF turns one .fs file (plus its optional .vs) into a definition that
+// the ISF runtime (isf-runtime.js) renders as a standalone GLSL ES 3.00
+// program: the JSON header becomes params, uniforms, images and passes, and
+// the GLSL is translated token by token from GLSL 1.x idioms. ISF image
+// functions are preprocessor macros and PASSINDEX is a live uniform, so
+// multi-pass, persistent, FLOAT and custom-size buffers, vertex shaders, audio
+// inputs, imported images and transitions all run as written. Shaders come
+// from untrusted files, so every size is bounded and nothing is evaluated.
 
-export const ISF_LIMITS = Object.freeze({ text: 256 * 1024, header: 64 * 1024, inputs: 64, passes: 8, values: 256, depth: 128 });
+export const ISF_LIMITS = Object.freeze({ text: 512 * 1024, header: 64 * 1024, inputs: 64, passes: 16, values: 256, images: 12, expression: 256 });
 const NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
-// point2D values are render-target pixels; defaults are normalized against MAX
-// when it looks like a canvas size, otherwise against this reference size.
+// point2D values are pixels; defaults are normalized against MAX when it looks
+// like a canvas size, otherwise against this reference size.
 const POINT_REFERENCE = [640, 480];
-const FRAG_NORM = new Set(['isf_FragNormCoord', 'vv_FragNormCoord']);
-const BUILTINS = new Set(['RENDERSIZE', 'TIME', 'TIMEDELTA', 'FRAMEINDEX', 'DATE', 'PASSINDEX', ...FRAG_NORM]);
-// Identifiers the template already defines; user code using them is renamed.
-const TEMPLATE_NAMES = new Set(['PI', 'TAU', 'luma', 'rgb2hsv', 'hsv2rgb', 'hash12', 'noise2', 'rotate2', 'unpremultiply',
-  'src', 'orig', 'prev', 'uv', 'frag', 'fx', 'gen', 'uImage', 'uOriginal', 'uPrevious', 'uResolution', 'uAspect', 'uTime',
-  'uBeat', 'uAudio', 'uPass']);
+const BUILTINS = new Set(['RENDERSIZE', 'TIME', 'TIMEDELTA', 'FRAMEINDEX', 'DATE', 'PASSINDEX', 'isf_FragNormCoord', 'vv_FragNormCoord']);
 // Legal identifiers in GLSL 1.x that GLSL ES 3.00 reserves.
 const ES3_RESERVED = new Set(['sample', 'input', 'output', 'filter', 'smooth', 'flat', 'layout', 'centroid', 'active', 'common',
   'partition', 'half', 'fixed', 'patch', 'resource', 'union', 'enum', 'class', 'template', 'this', 'inline', 'noinline', 'public',
   'static', 'extern', 'external', 'interface', 'long', 'short', 'double', 'unsigned', 'superp', 'namespace', 'using', 'sizeof',
   'cast', 'goto', 'asm', 'volatile', 'coherent', 'restrict', 'readonly', 'writeonly', 'noperspective', 'subroutine', 'buffer',
-  'shared', 'packed', 'uint', 'switch', 'case']);
+  'shared', 'packed', 'uint', 'switch', 'case', 'default', 'sampler3D', 'samplerCube']);
 // GLSL ES 3.00 built-ins that GLSL 1.x shaders often define themselves.
 const ES3_FUNCTIONS = new Set(['round', 'roundEven', 'trunc', 'inverse', 'transpose', 'determinant', 'outerProduct', 'isnan',
   'isinf', 'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh', 'modf', 'textureSize', 'texelFetch', 'textureOffset',
-  'textureProj', 'textureLod', 'textureGrad', 'dFdx', 'dFdy', 'fwidth', 'floatBitsToInt', 'intBitsToFloat', 'packHalf2x16',
-  'unpackHalf2x16']);
+  'textureProj', 'textureLod', 'textureGrad', 'floatBitsToInt', 'intBitsToFloat', 'packHalf2x16', 'unpackHalf2x16',
+  // GLSL 1.x built-ins that desktop drivers let shaders redefine.
+  'radians', 'degrees', 'sign', 'mod', 'fract', 'smoothstep', 'step', 'mix', 'clamp', 'saturate', 'length', 'distance', 'normalize',
+  'reflect', 'refract', 'faceforward', 'cross', 'dot', 'atan', 'pow', 'exp', 'log', 'exp2', 'log2', 'inversesqrt', 'matrixCompMult']);
 const TYPES = new Set(['void', 'float', 'int', 'bool', 'vec2', 'vec3', 'vec4', 'ivec2', 'ivec3', 'ivec4', 'bvec2', 'bvec3',
   'bvec4', 'mat2', 'mat3', 'mat4', 'highp', 'mediump', 'lowp']);
 const QUALIFIERS = new Set(['uniform', 'varying', 'attribute', 'const', 'highp', 'mediump', 'lowp', 'in', 'out', 'flat', 'smooth', 'invariant', 'centroid']);
-const SAMPLE_CALLS = {
-  IMG_PIXEL: 'pixel', IMG_PIXEL_2D: 'pixel', IMG_PIXEL_RECT: 'pixel',
-  IMG_NORM_PIXEL: 'norm', IMG_NORM_PIXEL_2D: 'norm', IMG_NORM_PIXEL_RECT: 'norm',
-  IMG_THIS_PIXEL: 'this', IMG_THIS_NORM_PIXEL: 'this', IMG_THIS_PIXEL_2D: 'this', IMG_THIS_NORM_PIXEL_2D: 'this',
-  IMG_SIZE: 'size',
-  texture2D: 'norm', texture: 'norm', texture2DLod: 'norm', textureLod: 'norm', texture2DRect: 'pixel',
-};
 const GLSL1_FUNCTIONS = { texture2D: 'texture', texture2DLod: 'textureLod', texture2DProj: 'textureProj', texture2DProjLod: 'textureProjLod',
-  texture2DRect: 'texture', textureCube: 'texture', textureCubeLod: 'textureLod', texture2DLodEXT: 'textureLod', texture2DGradEXT: 'textureGrad' };
-const NOTES = { DATE: 'DATE is approximated (fixed date; seconds follow TIME).', TIMEDELTA: 'TIMEDELTA is approximated as 1/60 s.' };
+  textureCube: 'texture', textureCubeLod: 'textureLod', texture2DLodEXT: 'textureLod', texture2DGradEXT: 'textureGrad', texture2DRect: 'IMG_PIXEL' };
+// Choices for image inputs other than the effect input.
+export const ISF_IMAGE_SOURCES = Object.freeze(['None', 'This input', 'Below this layer', 'Bundled image']);
 
 const finite = value => typeof value === 'number' && Number.isFinite(value);
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -49,23 +42,20 @@ const truthy = value => value === true || (finite(value) && value > 0) || value 
 
 // ---------------------------------------------------------------- header
 
+function skipString(raw, i) {
+  let j = i + 1;
+  while (j < raw.length && raw[j] !== '"') j += raw[j] === '\\' ? 2 : 1;
+  return j;
+}
+
 function stripJSONComments(raw) {
   let out = '';
   for (let i = 0; i < raw.length; i++) {
     const c = raw[i];
-    if (c === '"') {
-      let j = i + 1;
-      while (j < raw.length && raw[j] !== '"') j += raw[j] === '\\' ? 2 : 1;
-      out += raw.slice(i, j + 1);
-      i = j;
-    } else if (c === '/' && raw[i + 1] === '/') {
-      while (i < raw.length && raw[i] !== '\n') i++;
-      out += '\n';
-    } else if (c === '/' && raw[i + 1] === '*') {
-      const end = raw.indexOf('*/', i + 2);
-      i = end < 0 ? raw.length : end + 1;
-      out += ' ';
-    } else out += c;
+    if (c === '"') { const j = skipString(raw, i); out += raw.slice(i, j + 1); i = j; }
+    else if (c === '/' && raw[i + 1] === '/') { while (i < raw.length && raw[i] !== '\n') i++; out += '\n'; }
+    else if (c === '/' && raw[i + 1] === '*') { const end = raw.indexOf('*/', i + 2); i = end < 0 ? raw.length : end + 1; out += ' '; }
+    else out += c;
   }
   return out;
 }
@@ -74,12 +64,8 @@ function stripTrailingCommas(raw) {
   let out = '';
   for (let i = 0; i < raw.length; i++) {
     const c = raw[i];
-    if (c === '"') {
-      let j = i + 1;
-      while (j < raw.length && raw[j] !== '"') j += raw[j] === '\\' ? 2 : 1;
-      out += raw.slice(i, j + 1);
-      i = j;
-    } else if (c === ',') {
+    if (c === '"') { const j = skipString(raw, i); out += raw.slice(i, j + 1); i = j; }
+    else if (c === ',') {
       let j = i + 1;
       while (j < raw.length && /\s/.test(raw[j])) j++;
       if (raw[j] !== '}' && raw[j] !== ']') out += c;
@@ -88,9 +74,30 @@ function stripTrailingCommas(raw) {
   return out;
 }
 
-function splitHeader(text) {
-  const start = text.search(/[^\s\uFEFF]/);
-  if (start < 0 || !text.startsWith('/*', start)) throw new Error('Not an ISF shader: missing the leading /*{ JSON }*/ header.');
+// The JSON header is the first /* */ comment whose text starts with "{";
+// line comments and other block comments may come before it.
+function findHeader(text) {
+  let i = 0;
+  while (i < text.length) {
+    const rest = text.slice(i);
+    const space = /^[\s\uFEFF]+/.exec(rest);
+    if (space) { i += space[0].length; continue; }
+    if (rest.startsWith('//')) { const end = text.indexOf('\n', i); i = end < 0 ? text.length : end + 1; continue; }
+    if (rest.startsWith('/*')) {
+      if (/^\/\*\s*\{/.test(rest)) return i;
+      const end = text.indexOf('*/', i + 2);
+      if (end < 0) return -1;
+      i = end + 2;
+      continue;
+    }
+    return -1;
+  }
+  return -1;
+}
+
+export function splitHeader(text) {
+  const start = findHeader(text);
+  if (start < 0) throw new Error('Not an ISF shader: missing the leading /*{ JSON }*/ header.');
   const end = text.indexOf('*/', start + 2);
   if (end < 0) throw new Error('ISF header comment is not closed.');
   const raw = text.slice(start + 2, end);
@@ -99,22 +106,88 @@ function splitHeader(text) {
   try { header = JSON.parse(stripTrailingCommas(stripJSONComments(raw))); }
   catch (error) { throw new Error(`Invalid ISF JSON header: ${error.message}`); }
   if (!header || typeof header !== 'object' || Array.isArray(header)) throw new Error('ISF JSON header must be an object.');
-  return { header, body: text.slice(end + 2) };
+  return { header, body: text.slice(0, start) + text.slice(end + 2) };
 }
 
+// ---------------------------------------------------------------- size expressions
+
+// WIDTH/HEIGHT pass sizes ("$WIDTH/4.0", "floor($HEIGHT*0.5)", "$blurAmount").
+// Parsed into a tiny AST at import; evaluated per frame by evaluateSize.
+const FUNCTIONS = { floor: 1, ceil: 1, round: 1, abs: 1, sqrt: 1, sin: 1, cos: 1, max: 2, min: 2, pow: 2, clamp: 3 };
+export function parseSizeExpression(source, variables) {
+  if (finite(source)) return { n: source };
+  if (typeof source !== 'string' || !source.trim() || source.length > ISF_LIMITS.expression) throw new Error('Invalid pass size expression.');
+  const tokens = source.match(/\$?[A-Za-z_][A-Za-z0-9_]*|\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|&&|\|\||[<>=!]=|[-+*/%(),?:<>]|\S/g) || [];
+  let i = 0;
+  const peek = () => tokens[i], take = () => tokens[i++];
+  const fail = () => { throw new Error(`Invalid pass size expression "${source}".`); };
+  const expect = token => { if (take() !== token) fail(); };
+  const primary = () => {
+    const token = take();
+    if (token === undefined) fail();
+    if (token === '(') { const node = ternary(); expect(')'); return node; }
+    if (token === '-') return { op: 'neg', a: primary() };
+    if (token === '+') return primary();
+    if (/^[\d.]/.test(token)) return { n: Number(token) };
+    if (token.startsWith('$')) {
+      const name = token.slice(1);
+      if (!variables.has(name)) throw new Error(`Pass size uses unknown variable ${token}.`);
+      return { v: name };
+    }
+    if (Object.hasOwn(FUNCTIONS, token)) {
+      expect('(');
+      const args = [ternary()];
+      while (peek() === ',') { take(); args.push(ternary()); }
+      expect(')');
+      if (args.length !== FUNCTIONS[token]) throw new Error(`${token}() takes ${FUNCTIONS[token]} argument(s) in a pass size.`);
+      return { f: token, args };
+    }
+    return fail();
+  };
+  const binary = (next, ops) => () => { let a = next(); while (ops.includes(peek())) { const op = take(); a = { op, a, b: next() }; } return a; };
+  const product = binary(primary, ['*', '/', '%']);
+  const sum = binary(product, ['+', '-']);
+  const compare = binary(sum, ['<', '>', '<=', '>=', '==', '!=']);
+  const logic = binary(compare, ['&&', '||']);
+  const ternary = () => { const c = logic(); if (peek() !== '?') return c; take(); const a = ternary(); expect(':'); return { op: '?', c, a, b: ternary() }; };
+  const tree = ternary();
+  if (i !== tokens.length) fail();
+  return tree;
+}
+
+export function evaluateSize(node, values, depth = 0) {
+  if (!node || depth > 64) return 0;
+  if (Object.hasOwn(node, 'n')) return node.n;
+  if (Object.hasOwn(node, 'v')) return Number(values[node.v]) || 0;
+  if (node.f) {
+    const args = node.args.map(arg => evaluateSize(arg, values, depth + 1));
+    if (node.f === 'clamp') return clamp(args[0], args[1], args[2]);
+    return Math[node.f](...args);
+  }
+  const a = evaluateSize(node.a, values, depth + 1);
+  if (node.op === 'neg') return -a;
+  if (node.op === '?') return evaluateSize(node.c, values, depth + 1) ? a : evaluateSize(node.b, values, depth + 1);
+  const b = evaluateSize(node.b, values, depth + 1);
+  switch (node.op) {
+    case '+': return a + b; case '-': return a - b; case '*': return a * b; case '/': return b ? a / b : 0; case '%': return b ? a % b : 0;
+    case '<': return +(a < b); case '>': return +(a > b); case '<=': return +(a <= b); case '>=': return +(a >= b);
+    case '==': return +(a === b); case '!=': return +(a !== b); case '&&': return +(a && b); case '||': return +(a || b);
+    default: return 0;
+  }
+}
 // ---------------------------------------------------------------- inputs
 
 const pair = value => Array.isArray(value) && value.length >= 2 && finite(value[0]) && finite(value[1]) ? [bound(value[0]), bound(value[1])] : null;
 const hexByte = value => Math.round(clamp(finite(value) ? value : 1, 0, 1) * 255).toString(16).padStart(2, '0');
 
 function checkName(name, what) {
-  if (typeof name !== 'string' || !NAME.test(name) || name.startsWith('gl_') || name.startsWith('isf_')) {
+  if (typeof name !== 'string' || !NAME.test(name) || name.startsWith('gl_') || name.startsWith('isf_') || name.startsWith('_')) {
     throw new Error(`Invalid ISF ${what} name ${JSON.stringify(String(name).slice(0, 40))}.`);
   }
   if (BUILTINS.has(name)) throw new Error(`ISF ${what} name "${name}" clashes with an ISF built-in.`);
 }
 
-function longInput(input, name, label, helpers) {
+function longInput(input, name, label) {
   let values;
   if (Array.isArray(input.VALUES)) {
     if (!input.VALUES.length || input.VALUES.length > ISF_LIMITS.values || !input.VALUES.every(finite)) throw new Error(`ISF long input "${name}" has invalid VALUES.`);
@@ -129,92 +202,95 @@ function longInput(input, name, label, helpers) {
   const labels = Array.isArray(input.LABELS) ? input.LABELS.slice(0, values.length) : [];
   const options = values.map((value, index) => typeof labels[index] === 'string' || finite(labels[index]) ? String(labels[index]).slice(0, 64) : String(value));
   const found = values.indexOf(finite(input.DEFAULT) ? Math.trunc(input.DEFAULT) : values[0]);
-  const uniform = uniformName(name);
-  let replacement = uniform;
-  if (!values.every((value, index) => value === index)) {
-    // The stored param is the option index; the shader sees the ISF VALUE.
-    const n = values.length;
-    helpers.push(`int isf_long_${name}() {\n  const int values[${n}] = int[${n}](${values.join(', ')});\n  return values[clamp(${uniform}, 0, ${n - 1})];\n}`);
-    replacement = `isf_long_${name}()`;
-  }
-  return { param: { key: name, label, type: 'choice', options, default: Math.max(0, found), isfValues: values }, replacement };
+  return { key: name, label, type: 'choice', options, default: Math.max(0, found), isfValues: values };
 }
 
 function pointInput(input, name, label, warn) {
   const def = pair(input.DEFAULT), min = pair(input.MIN), max = pair(input.MAX);
-  const uniform = uniformName(name);
   if (max && max[0] <= 1 && max[1] <= 1) {
-    // Authored with normalized coordinates (MAX <= 1): pass through unchanged.
+    // Authored with normalized coordinates (MAX <= 1): passed through unchanged.
     const lo = min ? Math.min(min[0], min[1]) : 0, hi = Math.max(max[0], max[1], lo);
     const value = def ? def.map(item => clamp(item, lo, hi)) : [(lo + hi) / 2, (lo + hi) / 2];
-    return { param: { key: name, label, type: 'point', min: lo, max: hi, default: value, isfPoint: 'normalized' }, replacement: uniform };
+    return { key: name, label, type: 'point', min: lo, max: hi, default: value, isfPoint: 'normalized' };
   }
   // Pixel coordinates: the param stores a 0..1 fraction of the frame and the
-  // shader sees it scaled back to pixels of the current render size.
+  // shader sees it scaled to pixels of the render size.
   const reference = max && max[0] > 1 && max[1] > 1 ? max : POINT_REFERENCE;
   if (def && reference === POINT_REFERENCE && (def[0] || def[1])) warn(`point2D "${name}" default assumed relative to a ${POINT_REFERENCE.join('x')} canvas.`);
   const lo = min ? clamp(Math.min(min[0] / reference[0], min[1] / reference[1]), -1, 0) : 0;
   const value = def ? [clamp(def[0] / reference[0], lo, 1), clamp(def[1] / reference[1], lo, 1)] : [0.5, 0.5];
-  return { param: { key: name, label, type: 'point', min: lo, max: 1, default: value, isfPoint: 'pixels', isfReference: [...reference] }, replacement: `(${uniform} * uResolution)` };
+  return { key: name, label, type: 'point', min: lo, max: 1, default: value, isfPoint: 'pixels' };
+}
+
+function importedImages(header) {
+  const raw = header.IMPORTED;
+  const entries = Array.isArray(raw) ? raw.map(item => [item?.NAME, item]) : raw && typeof raw === 'object' ? Object.entries(raw) : [];
+  return entries.slice(0, ISF_LIMITS.images).map(([name, item]) => {
+    checkName(name, 'imported image');
+    const path = typeof item?.PATH === 'string' ? item.PATH.slice(0, 512) : '';
+    return { name, path };
+  });
 }
 
 function readInputs(header, warn) {
   const raw = header.INPUTS ?? [];
   if (!Array.isArray(raw)) throw new Error('ISF INPUTS must be an array.');
   if (raw.length > ISF_LIMITS.inputs) throw new Error(`ISF shader has too many inputs (limit ${ISF_LIMITS.inputs}).`);
-  const params = [], helpers = [], replacements = new Map(), images = new Map();
-  let hasInputImage = false;
+  const params = [], uniforms = [], images = [], names = new Set();
+  const transition = isfKind(header) === 'transition';
   for (const input of raw) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('ISF inputs must be objects.');
     const { NAME: name, TYPE: type } = input;
     checkName(name, 'input');
-    if (replacements.has(name) || images.has(name)) throw new Error(`Duplicate ISF input "${name}".`);
+    if (names.has(name)) throw new Error(`Duplicate ISF input "${name}".`);
+    names.add(name);
     const label = typeof input.LABEL === 'string' && input.LABEL.trim() ? input.LABEL.trim().slice(0, 64) : name;
-    const uniform = uniformName(name);
     if (type === 'float') {
+      // A transition's progress is driven by the mix, not shown as a control.
+      if (name === 'progress' && transition) { uniforms.push({ name, type: 'float', role: 'progress' }); continue; }
       const fallback = finite(input.DEFAULT) ? bound(input.DEFAULT) : 0;
       const lo = finite(input.MIN) ? bound(input.MIN) : Math.min(0, fallback);
       const hi = finite(input.MAX) ? bound(input.MAX) : Math.max(lo + 1, fallback, 1);
       const min = Math.min(lo, hi), max = Math.max(lo, hi);
       params.push({ key: name, label, type: 'float', min, max, default: clamp(finite(input.DEFAULT) ? bound(input.DEFAULT) : min, min, max) });
-      replacements.set(name, uniform);
+      uniforms.push({ name, type: 'float', key: name });
     } else if (type === 'bool') {
       params.push({ key: name, label, type: 'bool', default: truthy(input.DEFAULT) });
-      replacements.set(name, uniform);
+      uniforms.push({ name, type: 'bool', key: name });
     } else if (type === 'event') {
       params.push({ key: name, label, type: 'bool', default: false, momentary: true });
-      replacements.set(name, uniform);
+      uniforms.push({ name, type: 'bool', key: name });
     } else if (type === 'long') {
-      const { param, replacement } = longInput(input, name, label, helpers);
+      const param = longInput(input, name, label);
       params.push(param);
-      replacements.set(name, replacement);
+      uniforms.push({ name, type: 'long', key: name, values: param.isfValues });
     } else if (type === 'color') {
       const rgba = Array.isArray(input.DEFAULT) && input.DEFAULT.length >= 3 && input.DEFAULT.slice(0, 4).every(finite) ? input.DEFAULT : [1, 1, 1, 1];
       params.push({ key: name, label, type: 'color', default: `#${[0, 1, 2, 3].map(index => hexByte(rgba[index])).join('')}` });
-      replacements.set(name, uniform);
+      uniforms.push({ name, type: 'color', key: name });
     } else if (type === 'point2D') {
-      const { param, replacement } = pointInput(input, name, label, warn);
+      const param = pointInput(input, name, label, warn);
       params.push(param);
-      replacements.set(name, replacement);
+      uniforms.push({ name, type: 'point', key: name, mode: param.isfPoint });
     } else if (type === 'image') {
-      if (name === 'inputImage') { hasInputImage = true; images.set(name, { kind: 'input' }); continue; }
-      warn(`Image input "${name}" is not supported and reads as transparent black.`);
-      images.set(name, { kind: 'blank' });
+      if (name === 'inputImage') images.push({ name, role: 'input' });
+      else if (name === 'startImage' && transition) images.push({ name, role: 'start' });
+      else if (name === 'endImage' && transition) images.push({ name, role: 'end' });
+      else {
+        params.push({ key: name, label, type: 'choice', options: [...ISF_IMAGE_SOURCES], default: 1, isfImage: true });
+        images.push({ name, role: 'param', key: name });
+      }
     } else if (type === 'audio' || type === 'audioFFT') {
-      const count = finite(input.MAX) ? clamp(Math.trunc(input.MAX), 1, 4096) : 256;
-      warn(`${type} input "${name}" is approximated from the live audio levels.`);
-      images.set(name, { kind: type === 'audio' ? 'wave' : 'fft', size: `vec2(${count}.0, 1.0)` });
+      const count = finite(input.MAX) ? clamp(Math.trunc(input.MAX), 4, 4096) : 256;
+      images.push({ name, role: type === 'audio' ? 'wave' : 'fft', count });
     } else {
       throw new Error(`Unsupported ISF input type ${JSON.stringify(String(type).slice(0, 20))} for "${name}".`);
     }
   }
-  if (images.has('startImage') && images.has('endImage')) throw new Error('ISF transitions (startImage/endImage) are not supported.');
-  return { params, helpers, replacements, images, hasInputImage };
+  return { params, uniforms, images, names };
 }
 
-// ---------------------------------------------------------------- passes
-
-function readPasses(header, inputs, warn) {
+function readPasses(header, names, warn) {
   let raw = header.PASSES ?? [{}];
   if (!Array.isArray(raw)) throw new Error('ISF PASSES must be an array.');
   if (!raw.length) raw = [{}];
@@ -223,25 +299,26 @@ function readPasses(header, inputs, warn) {
   const legacy = header.PERSISTENT_BUFFERS;
   const legacyObject = legacy && typeof legacy === 'object' && !Array.isArray(legacy) ? legacy : null;
   const legacyNames = new Set(Array.isArray(legacy) ? legacy.filter(item => typeof item === 'string') : legacyObject ? Object.keys(legacyObject) : []);
-  const targets = new Map();
-  const passes = raw.map((pass, index) => {
+  const variables = new Set(['WIDTH', 'HEIGHT', ...names]);
+  const size = (value, index, axis) => {
+    if (value === undefined || value === null || value === '') return null;
+    try { return parseSizeExpression(value, variables); }
+    catch (error) { warn(`Pass ${index + 1} ${axis}: ${error.message} It renders at full size.`); return null; }
+  };
+  return raw.map((pass, index) => {
     if (!pass || typeof pass !== 'object' || Array.isArray(pass)) throw new Error('ISF passes must be objects.');
     const target = pass.TARGET === undefined || pass.TARGET === null || pass.TARGET === '' ? null : pass.TARGET;
     if (target !== null) {
       checkName(target, 'pass target');
-      if (inputs.images.has(target) || inputs.replacements.has(target)) throw new Error(`ISF pass target "${target}" clashes with an input.`);
-      if (targets.has(target)) throw new Error(`ISF pass target "${target}" is written by more than one pass.`);
-      targets.set(target, index);
+      if (names.has(target)) throw new Error(`ISF pass target "${target}" clashes with an input.`);
     }
-    const entry = target && legacyObject && Object.hasOwn(legacyObject, target) ? legacyObject[target] : null;
-    const legacyEntry = entry && typeof entry === 'object' ? entry : {};
-    if (truthy(pass.FLOAT) || truthy(legacyEntry.FLOAT)) warn(`Pass ${index + 1} asks for a FLOAT target; it renders at 8-bit precision.`);
-    if (pass.WIDTH !== undefined || pass.HEIGHT !== undefined || legacyEntry.WIDTH !== undefined || legacyEntry.HEIGHT !== undefined) {
-      warn(`Pass ${index + 1} has a custom WIDTH/HEIGHT; it renders at full resolution.`);
-    }
-    return { target, persistent: target !== null && (truthy(pass.PERSISTENT) || legacyNames.has(target)) };
+    const entry = target && legacyObject && legacyObject[target] && typeof legacyObject[target] === 'object' ? legacyObject[target] : {};
+    return {
+      target, persistent: target !== null && (truthy(pass.PERSISTENT) || legacyNames.has(target)),
+      float: truthy(pass.FLOAT) || truthy(entry.FLOAT),
+      width: size(pass.WIDTH ?? entry.WIDTH, index, 'WIDTH'), height: size(pass.HEIGHT ?? entry.HEIGHT, index, 'HEIGHT'),
+    };
   });
-  return { passes, targets };
 }
 // ---------------------------------------------------------------- tokens
 
@@ -267,17 +344,6 @@ const textAt = (tokens, index) => index >= 0 && index < tokens.length ? tokens[i
 const PAIRS = { '(': ')', '[': ']', '{': '}' };
 const CLOSERS = new Set([')', ']', '}']);
 
-function matching(tokens, open) {
-  const opener = textAt(tokens, open), closer = PAIRS[opener];
-  if (!closer) throw new Error('Malformed GLSL in ISF shader (expected a bracket).');
-  for (let j = open, depth = 0; j < tokens.length; j++) {
-    if (tokens[j].type !== 'punct') continue;
-    if (tokens[j].text === opener) depth++;
-    else if (tokens[j].text === closer && --depth === 0) return j;
-  }
-  throw new Error('Unbalanced brackets in ISF shader.');
-}
-
 function checkBalance(tokens) {
   const stack = [];
   for (const token of tokens) {
@@ -288,13 +354,12 @@ function checkBalance(tokens) {
   if (stack.length) throw new Error('Unbalanced brackets in ISF shader.');
 }
 
-// Drop #version and #extension lines: the template supplies its own header.
-function stripDirectives(tokens, warn) {
+// Drop #version and #extension lines: the runtime supplies its own header.
+function stripDirectives(tokens) {
   const out = [];
   for (let i = 0; i < tokens.length; i++) {
     const directive = tokens[i].text === '#' ? textAt(tokens, nextSig(tokens, i)) : '';
     if (directive === 'version' || directive === 'extension') {
-      if (directive === 'extension') warn('#extension directives are ignored.');
       while (i + 1 < tokens.length && !(tokens[i + 1].type === 'ws' && tokens[i + 1].text.includes('\n'))) i++;
       continue;
     }
@@ -303,35 +368,40 @@ function stripDirectives(tokens, warn) {
   return out;
 }
 
-// Remove declarations the host provides (ISF built-ins, inputs, the normalized
-// coordinate varying) and reject vertex-shader dependencies.
-function stripDeclarations(tokens, known, images, warn) {
+// Removes declarations the runtime provides (built-ins, inputs, buffers) and
+// turns varyings into in/out. Custom uniforms are kept (they read as zero).
+function rewriteDeclarations(tokens, { known, stage, hasVertex, warn }) {
   const out = [];
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
-    if (token.type === 'id' && (token.text === 'uniform' || token.text === 'varying' || token.text === 'attribute')) {
+    if (token.type === 'id' && ['uniform', 'varying', 'attribute'].includes(token.text) && textAt(tokens, prevSig(tokens, i)) !== '.') {
       let end = i;
       while (end < tokens.length && tokens[end].text !== ';') end++;
       if (end >= tokens.length) throw new Error(`Unterminated ${token.text} declaration in ISF shader.`);
       const ids = tokens.slice(i, end).filter(item => item.type === 'id' && !QUALIFIERS.has(item.text)).map(item => item.text);
       const [type, ...names] = ids;
       if (!type || !names.length) throw new Error(`Malformed ${token.text} declaration in ISF shader.`);
-      if (token.text === 'attribute') throw new Error('ISF shader declares vertex attributes; custom vertex shaders (.vs) are not supported.');
-      if (token.text === 'varying') {
-        const custom = names.filter(name => !FRAG_NORM.has(name));
-        if (custom.length) throw new Error(`ISF shader relies on custom varyings (${custom.join(', ')}) from a vertex shader (.vs), which is not supported.`);
+      if (token.text === 'uniform') {
+        const unknown = names.filter(name => !known.has(name));
+        if (!unknown.length) { i = end; continue; }
+        warn(`Custom uniform ${unknown.join(', ')} is not set by ISF and reads as zero.`);
+        out.push(token);
+        continue;
+      }
+      if (token.text === 'attribute') {
+        if (stage === 'vertex') warn('Vertex attributes are not supplied; isf_vertShaderInit() sets the position.');
         i = end;
         continue;
       }
-      const unknown = names.filter(name => !known.has(name));
-      if (unknown.length && /^sampler/.test(type)) {
-        for (const name of unknown) images.set(name, { kind: 'blank' });
-        warn(`Sampler uniform ${unknown.join(', ')} is not bound and reads as transparent black.`);
-        i = end;
+      const custom = names.filter(name => !BUILTINS.has(name));
+      if (!custom.length) { i = end; continue; }
+      if (stage === 'fragment' && !hasVertex) {
+        // No vertex shader sets it: the declaration stays as a plain global.
+        warn(`Varying ${custom.join(', ')} has no vertex shader to set it and reads as zero.`);
         continue;
       }
-      if (!unknown.length) { i = end; continue; }
-      warn(`Custom uniform ${unknown.join(', ')} is not bound and reads as zero.`);
+      out.push({ type: 'id', text: stage === 'vertex' ? 'out' : 'in' });
+      continue;
     }
     out.push(token);
   }
@@ -347,243 +417,229 @@ function builtinOverrides(tokens) {
   return names;
 }
 
-// ---------------------------------------------------------------- PASSINDEX branches
-
-const FLIP = { '<': '>', '>': '<', '<=': '>=', '>=': '<=', '==': '==', '!=': '!=' };
-function passCondition(tokens, passIndex) {
-  let text = tokens.filter(significant).map(token => token.text).join('');
-  while (/^\(.*\)$/.test(text)) text = text.slice(1, -1);
-  let match = /^PASSINDEX(==|!=|<=|>=|<|>)(\d+)$/.exec(text), op, value;
-  if (match) [, op, value] = match;
-  else if ((match = /^(\d+)(==|!=|<=|>=|<|>)PASSINDEX$/.exec(text))) { value = match[1]; op = FLIP[match[2]]; }
-  else return null;
-  value = Number(value);
-  return { '==': passIndex === value, '!=': passIndex !== value, '<': passIndex < value, '>': passIndex > value, '<=': passIndex <= value, '>=': passIndex >= value }[op];
-}
-
-// Index of the last token of the statement starting at `start`.
-function statementEnd(tokens, start, depth = 0) {
-  if (start < 0 || depth > ISF_LIMITS.depth) throw new Error('Malformed or too deeply nested GLSL in ISF shader.');
-  const text = tokens[start].text;
-  if (text === '{') return matching(tokens, start);
-  if (text === 'if' || text === 'for' || text === 'while') {
-    const close = matching(tokens, nextSig(tokens, start));
-    let end = statementEnd(tokens, nextSig(tokens, close), depth + 1);
-    const next = nextSig(tokens, end);
-    if (text === 'if' && textAt(tokens, next) === 'else') end = statementEnd(tokens, nextSig(tokens, next), depth + 1);
-    return end;
-  }
-  for (let j = start, nest = 0; j < tokens.length; j++) {
-    const item = tokens[j];
-    if (item.type !== 'punct') continue;
-    if (PAIRS[item.text]) nest++;
-    else if (CLOSERS.has(item.text)) nest--;
-    else if (item.text === ';' && nest === 0) return j;
-  }
-  throw new Error('Unterminated statement in ISF shader.');
-}
-
-// Resolve `if (PASSINDEX == n)` style branches for one pass, so each pass body
-// only contains (and is validated against) the code it actually runs.
-function pruneBranches(tokens, passIndex, depth = 0) {
-  if (depth > ISF_LIMITS.depth) throw new Error('ISF shader nests PASSINDEX branches too deeply.');
-  const out = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    if (token.type === 'id' && token.text === 'if' && textAt(tokens, prevSig(tokens, i)) !== '#') {
-      const open = nextSig(tokens, i);
-      if (textAt(tokens, open) === '(') {
-        const close = matching(tokens, open);
-        const result = passCondition(tokens.slice(open + 1, close), passIndex);
-        if (result !== null) {
-          const thenStart = nextSig(tokens, close), thenEnd = statementEnd(tokens, thenStart);
-          let end = thenEnd, keep = result ? [thenStart, thenEnd] : null;
-          const next = nextSig(tokens, thenEnd);
-          if (textAt(tokens, next) === 'else') {
-            const elseStart = nextSig(tokens, next);
-            end = statementEnd(tokens, elseStart);
-            if (!result) keep = [elseStart, end];
-          }
-          if (keep) for (const item of pruneBranches(tokens.slice(keep[0], keep[1] + 1), passIndex, depth + 1)) out.push(item);
-          else out.push({ type: 'punct', text: ';' });
-          i = end;
-          continue;
-        }
-      }
-    }
-    out.push(token);
-  }
-  return out;
-}
-// ---------------------------------------------------------------- translation
-
-function splitArgs(tokens, open) {
-  const close = matching(tokens, open);
-  const args = [[]];
-  for (let j = open + 1, nest = 0; j < close; j++) {
-    const text = tokens[j].type === 'punct' ? tokens[j].text : '';
-    if (PAIRS[text]) nest++;
-    else if (CLOSERS.has(text)) nest--;
-    if (text === ',' && nest === 0) { args.push([]); continue; }
-    args[args.length - 1].push(tokens[j]);
-  }
-  return { args: args.length === 1 && !args[0].some(significant) ? [] : args, close };
-}
-
-function sampleExpression(image, mode, coord, used) {
-  const size = image.size || 'uResolution';
-  if (mode === 'size') return size;
-  const p = mode === 'this' ? 'uv' : mode === 'pixel' ? `((${coord}) / ${size})` : `(${coord})`;
-  if (image.kind === 'src' || image.kind === 'orig' || image.kind === 'prev') return `${image.kind}(${p})`;
-  if (image.kind === 'fft' || image.kind === 'wave') { used.add(image.kind); return `isf_audio_${image.kind}(${p})`; }
-  return 'vec4(0.0)';
-}
-
-function translate(tokens, ctx, depth = 0) {
-  if (depth > ISF_LIMITS.depth) throw new Error('ISF shader nests image lookups too deeply.');
+function translate(tokens, rename, stage) {
   let out = '';
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     if (token.type !== 'id') { out += token.text; continue; }
     const name = token.text;
-    // Member access / swizzles keep their name (only clashing names are renamed).
-    if (textAt(tokens, prevSig(tokens, i)) === '.') { out += ctx.rename(name) ? `isf_u_${name}` : name; continue; }
-    const next = nextSig(tokens, i);
-    const call = textAt(tokens, next) === '(';
-    if (call && Object.hasOwn(SAMPLE_CALLS, name)) {
-      const { args, close } = splitArgs(tokens, next);
-      const first = args[0]?.filter(significant) || [];
-      const image = first.length === 1 && first[0].type === 'id' ? ctx.image(first[0].text) : null;
-      if (image) {
-        const mode = SAMPLE_CALLS[name];
-        const wanted = mode === 'this' || mode === 'size' ? 1 : 2;
-        if (args.length < wanted || (wanted === 1 && args.length > 1)) throw new Error(`${name}() called with the wrong number of arguments.`);
-        out += sampleExpression(image, mode, wanted === 2 ? translate(args[1], ctx, depth + 1).trim() : '', ctx.used);
-        i = close;
-        continue;
-      }
-      if (name.startsWith('IMG_')) throw new Error(`${name}() must name an image input directly.`);
-    }
-    if (ctx.image(name)) throw new Error(`Image "${name}" can only be read through IMG_PIXEL/IMG_NORM_PIXEL/IMG_THIS_PIXEL/IMG_SIZE.`);
-    if (name === 'gl_FragData') {
+    if (textAt(tokens, prevSig(tokens, i)) === '.') { out += name; continue; } // swizzles and struct members
+    const call = textAt(tokens, nextSig(tokens, i)) === '(';
+    if (name === 'gl_FragData' && stage === 'fragment') {
       const a = nextSig(tokens, i), b = nextSig(tokens, a), c = nextSig(tokens, b);
       if (textAt(tokens, a) !== '[' || textAt(tokens, b) !== '0' || textAt(tokens, c) !== ']') throw new Error('gl_FragData with multiple render targets is not supported.');
       out += 'isf_FragColor';
       i = c;
       continue;
     }
-    if (Object.hasOwn(NOTES, name)) ctx.warn(NOTES[name]);
-    if (name === 'texture' && !call) out += 'isf_u_texture';
-    else if (ctx.replacements.has(name)) out += ctx.replacements.get(name);
-    else out += ctx.rename(name) ? `isf_u_${name}` : name;
+    if (name === 'gl_FragColor' && stage === 'fragment') { out += 'isf_FragColor'; continue; }
+    if (name === 'vv_FragNormCoord') { out += 'isf_FragNormCoord'; continue; }
+    if (call && Object.hasOwn(GLSL1_FUNCTIONS, name)) { out += GLSL1_FUNCTIONS[name]; continue; }
+    // A variable called "texture" would hide the ES3 texture() function.
+    if (name === 'texture') { out += call ? name : 'isf_u_texture'; continue; }
+    out += rename(name);
   }
   return out;
 }
 
-const AUDIO_HELPERS = {
-  fft: 'vec4 isf_audio_fft(vec2 p) {\n  float x = clamp(p.x, 0.0, 1.0);\n  float v = x < 0.5 ? mix(uAudio.x, uAudio.y, x * 2.0) : mix(uAudio.y, uAudio.z, x * 2.0 - 1.0);\n  return vec4(vec3(v), 1.0);\n}',
-  wave: 'vec4 isf_audio_wave(vec2 p) {\n  return vec4(vec3(0.5 + 0.5 * uAudio.w * sin(p.x * 62.83185 + uTime * 12.0)), 1.0);\n}',
-};
+// ---------------------------------------------------------------- program text
 
-function passContext(shared, passIndex) {
-  const { kind, inputs, passes, targets, warn } = shared;
-  const last = passes.length - 1;
-  const replacements = new Map([
-    ['RENDERSIZE', 'uResolution'], ['TIME', 'uTime'], ['TIMEDELTA', '(1.0 / 60.0)'], ['FRAMEINDEX', 'int(uTime * 60.0)'],
-    ['DATE', 'vec4(2024.0, 1.0, 1.0, mod(uTime, 86400.0))'], ['PASSINDEX', String(passIndex)],
-    ['isf_FragNormCoord', 'uv'], ['vv_FragNormCoord', 'uv'], ['gl_FragCoord', 'vec4(uv * uResolution, 0.0, 1.0)'],
-    ['gl_FragColor', 'isf_FragColor'], ['main', 'isf_main'], ...Object.entries(GLSL1_FUNCTIONS), ...inputs.replacements,
-  ]);
-  const image = name => {
-    const input = inputs.images.get(name);
-    if (input) return input.kind === 'input' ? { kind: passIndex === 0 ? 'src' : 'orig' } : input;
-    if (!targets.has(name)) return null;
-    const writer = targets.get(name), pass = passes[writer];
-    if (kind === 'source') {
-      if (pass.persistent) throw new Error('Feedback (PERSISTENT buffer) ISF generators are not supported.');
-      warn(`Buffer "${name}" is read before it is rendered and reads as transparent black.`);
-      return { kind: 'blank' };
-    }
-    if (writer === passIndex - 1) return { kind: 'src' };
-    if (passIndex <= writer) {
-      if (!pass.persistent) {
-        warn(`Pass ${passIndex + 1} reads buffer "${name}" before it is rendered; it reads as transparent black.`);
-        return { kind: 'blank' };
-      }
-      if (writer !== last) warn(`Persistent buffer "${name}" is approximated by the effect's previous output.`);
-      shared.feedbackTargets.add(name);
-      return { kind: 'prev' };
-    }
-    throw new Error(`Pass ${passIndex + 1} reads buffer "${name}" written by pass ${writer + 1}; only the immediately preceding pass can be read.`);
-  };
-  return { replacements, image, rename: shared.rename, used: shared.used, warn };
+const VERTEX_INIT = `void isf_vertShaderInit() {
+  vec2 isf_p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  isf_FragNormCoord = isf_p;
+  gl_Position = vec4(isf_p * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+const UNIFORM_TYPES = { float: 'float', bool: 'bool', long: 'int', color: 'vec4', point: 'vec2' };
+
+function preamble(stage, uniforms, samplers) {
+  const lines = ['#version 300 es', 'precision highp float;', 'precision highp int;', 'precision highp sampler2D;',
+    'uniform int PASSINDEX;', 'uniform vec2 RENDERSIZE;', 'uniform float TIME;', 'uniform float TIMEDELTA;', 'uniform vec4 DATE;', 'uniform int FRAMEINDEX;'];
+  for (const uniform of uniforms) lines.push(`uniform ${UNIFORM_TYPES[uniform.type]} ${uniform.glsl};`);
+  for (const name of samplers) lines.push(`uniform sampler2D ${name};`, `uniform vec2 _${name}_imgSize;`);
+  lines.push(
+    // textureSize gives the bound image's real size for any sampler,
+    // including samplers passed into user functions.
+    '#define IMG_SIZE(img) vec2(textureSize(img, 0))',
+    '#define IMG_NORM_PIXEL(img, c) texture(img, c)',
+    '#define IMG_PIXEL(img, c) texture(img, (c) / vec2(textureSize(img, 0)))',
+    '#define IMG_THIS_PIXEL(img) texture(img, isf_FragNormCoord)',
+    '#define IMG_THIS_NORM_PIXEL(img) texture(img, isf_FragNormCoord)',
+    '#define IMG_NORM_PIXEL_2D(img, s, c) texture(img, c)',
+    '#define IMG_PIXEL_2D(img, s, c) texture(img, (c) / (s))',
+    '#define IMG_THIS_PIXEL_2D(img, s) texture(img, isf_FragNormCoord)',
+    '#define IMG_THIS_NORM_PIXEL_2D(img, s) texture(img, isf_FragNormCoord)',
+    '#define IMG_NORM_PIXEL_RECT(img, s, c) texture(img, c)',
+    '#define IMG_PIXEL_RECT(img, s, c) texture(img, (c) / (s))',
+    '#define IMG_THIS_PIXEL_RECT(img, s) texture(img, isf_FragNormCoord)',
+    '#define ISF_PRISMVJ 1');
+  if (stage === 'vertex') lines.push('out vec2 isf_FragNormCoord;', VERTEX_INIT, '#define vv_vertShaderInit isf_vertShaderInit');
+  else lines.push('in vec2 isf_FragNormCoord;', 'out vec4 isf_FragColor;');
+  return `${lines.join('\n')}\n`;
 }
 
-function wrap(kind, helpers, body) {
-  return `// Imported ISF shader.\nvec4 isf_FragColor;\n${helpers.map(item => `${item}\n`).join('')}${body.trim()}\nvec4 ${kind === 'effect' ? 'fx' : 'gen'}(vec2 isf_uv) {\n  isf_FragColor = vec4(0.0);\n  isf_main();\n  return isf_FragColor;\n}\n`;
+// GLSL ES only allows constant global initializers; desktop ISF shaders often
+// write "vec2 center = RENDERSIZE * 0.5;". Such globals are declared without
+// the initializer and assigned at the top of main(), which runs first.
+const DECLARATION_START = new Set([...TYPES, 'mat2x2', 'mat3x3', 'mat4x4']);
+function hoistGlobals(tokens) {
+  const assignments = [];
+  const out = [];
+  let depth = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.type === 'punct' && token.text === '{') depth++;
+    if (token.type === 'punct' && token.text === '}') depth--;
+    // A global declaration: at file scope, starts with a type (after any precision qualifier).
+    const lineStart = i === 0 || /\n/.test(tokens[i - 1]?.text || '') || [';', '}'].includes(textAt(tokens, prevSig(tokens, i))) || prevSig(tokens, i) < 0;
+    if (depth === 0 && token.type === 'id' && DECLARATION_START.has(token.text) && lineStart && textAt(tokens, prevSig(tokens, i)) !== '#') {
+      let end = i, nest = 0, isFunction = false;
+      for (; end < tokens.length; end++) {
+        const text = tokens[end].type === 'punct' ? tokens[end].text : '';
+        if (text === '(' || text === '[') { if (text === '(' && nest === 0 && !tokens.slice(i, end).some(item => item.text === '=')) { isFunction = true; break; } nest++; }
+        else if (text === ')' || text === ']') nest--;
+        else if (text === ';' && nest === 0) break;
+        else if (text === '{' && nest === 0) { isFunction = true; break; }
+      }
+      const statement = tokens.slice(i, end);
+      if (!isFunction && end < tokens.length && statement.some(item => item.type === 'punct' && item.text === '=')) {
+        // Split top-level declarators: "float a = 1.0, b = x;".
+        const parts = [[]];
+        let level = 0;
+        for (const item of statement) {
+          if (item.type === 'punct' && ['(', '['].includes(item.text)) level++;
+          if (item.type === 'punct' && [')', ']'].includes(item.text)) level--;
+          if (item.type === 'punct' && item.text === ',' && level === 0) { parts.push([]); continue; }
+          parts[parts.length - 1].push(item);
+        }
+        const declared = [];
+        let type = null;
+        parts.forEach((part, index) => {
+          const equals = part.findIndex(item => item.type === 'punct' && item.text === '=');
+          const head = equals < 0 ? part : part.slice(0, equals);
+          if (index === 0) {
+            const names = head.filter(significant);
+            const nameIndex = names.findIndex((item, at) => item.type === 'id' && !QUALIFIERS.has(item.text) && !DECLARATION_START.has(item.text) && at > 0);
+            type = names.slice(0, nameIndex).map(item => item.text).join(' ');
+            declared.push(names.slice(nameIndex).map(item => item.text).join(''));
+          } else declared.push(head.filter(significant).map(item => item.text).join(''));
+          const target = declared[declared.length - 1].replace(/\[.*$/, '');
+          if (equals >= 0) assignments.push(`${target} = ${part.slice(equals + 1).map(item => item.text).join('').trim()};`);
+        });
+        out.push(...tokenize(`${type} ${declared.join(', ')};`));
+        i = end;
+        continue;
+      }
+    }
+    out.push(token);
+  }
+  if (!assignments.length) return tokens;
+  // Insert after main's opening brace.
+  for (let i = 0; i < out.length; i++) {
+    if (out[i].type === 'id' && out[i].text === 'main' && textAt(out, nextSig(out, i)) === '(') {
+      const close = out.findIndex((item, index) => index > i && item.text === ')');
+      const brace = nextSig(out, close);
+      if (textAt(out, brace) !== '{') continue;
+      out.splice(brace + 1, 0, ...tokenize(`\n  ${assignments.join('\n  ')}\n`));
+      return out;
+    }
+  }
+  return tokens;
+}
+
+function prepareStage(code, stage, ctx) {
+  let tokens = stripDirectives(tokenize(code));
+  checkBalance(tokens);
+  tokens = hoistGlobals(rewriteDeclarations(tokens, { ...ctx, stage }));
+  if (!tokens.some((token, index) => token.type === 'id' && token.text === 'main' && textAt(tokens, nextSig(tokens, index)) === '(')) {
+    throw new Error(`ISF ${stage} shader has no main() function.`);
+  }
+  for (const name of builtinOverrides(tokens)) ctx.overrides.add(name);
+  return tokens;
 }
 
 function baseName(fileName) {
   return String(fileName ?? '').slice(0, 512).split(/[\\/]/).pop().replace(/\.(fs|frag|glsl|isf|txt)$/i, '');
 }
 
+export function isfKind(header) {
+  const inputs = Array.isArray(header?.INPUTS) ? header.INPUTS : [];
+  const names = new Set(inputs.map(input => input?.NAME));
+  if (names.has('startImage') && names.has('endImage')) return 'transition';
+  return names.has('inputImage') ? 'effect' : 'source';
+}
+
 // ---------------------------------------------------------------- entry point
 
-// Parse one ISF fragment shader. Returns { definition, kind, warnings } where
-// definition follows shader-template.js; throws Error for invalid or
-// unsupported shaders.
-export function parseISF(text, { fileName = '' } = {}) {
+// Parse one ISF fragment shader (and optional vertex shader). Returns
+// { definition, kind: 'effect'|'source'|'transition', warnings }; throws for
+// invalid or unsupported shaders. `id` overrides the id derived from the file
+// name; `assets` maps imported/bundled image names or paths to data: URLs;
+// `link`/`author` describe where an online shader came from.
+export function parseISF(text, { fileName = '', vertex = '', id = '', assets = null, link = '', author = '' } = {}) {
   if (typeof text !== 'string') throw new TypeError('ISF source must be a string.');
   if (text.length > ISF_LIMITS.text) throw new Error(`ISF shader is too large (limit ${ISF_LIMITS.text / 1024} KB).`);
-  if (text.includes('\0')) throw new Error('ISF shader contains binary data.');
+  if (typeof vertex !== 'string' || vertex.length > ISF_LIMITS.text) throw new Error('ISF vertex shader is invalid or too large.');
+  if (text.includes('\0') || vertex.includes('\0')) throw new Error('ISF shader contains binary data.');
   const warnings = new Set();
   const warn = message => { if (warnings.size < 64) warnings.add(message); };
   const { header, body } = splitHeader(text);
   const inputs = readInputs(header, warn);
-  const { passes, targets } = readPasses(header, inputs, warn);
-  let kind = inputs.hasInputImage ? 'effect' : 'source';
+  const passes = readPasses(header, inputs.names, warn);
+  let kind = isfKind(header);
   if (kind === 'source' && /\binputImage\b/.test(body)) {
     kind = 'effect';
-    inputs.images.set('inputImage', { kind: 'input' });
+    inputs.images.push({ name: 'inputImage', role: 'input' });
     warn('inputImage is used without being declared; it is treated as the effect input.');
   }
-  if (kind === 'source' && passes.length > 1) throw new Error('Multi-pass ISF generators are not supported; only effects (with an inputImage) can use PASSES.');
-  if (header.IMPORTED && typeof header.IMPORTED === 'object' && !Array.isArray(header.IMPORTED)) {
-    for (const name of Object.keys(header.IMPORTED).slice(0, ISF_LIMITS.inputs)) {
-      checkName(name, 'imported image');
-      inputs.images.set(name, { kind: 'blank' });
-      warn(`Imported image "${name}" is not supported and reads as transparent black.`);
-    }
+  if (kind === 'transition' && !inputs.uniforms.some(uniform => uniform.role === 'progress')) {
+    if (inputs.names.has('progress')) throw new Error('A transition\'s "progress" input must be a float.');
+    inputs.uniforms.push({ name: 'progress', type: 'float', role: 'progress' });
+    warn('Transition has no "progress" input; one is supplied.');
   }
+  for (const image of importedImages(header)) {
+    if (inputs.names.has(image.name)) throw new Error(`Imported image "${image.name}" clashes with an input.`);
+    inputs.images.push({ name: image.name, role: 'imported', path: image.path });
+  }
+  for (const name of new Set(passes.map(pass => pass.target).filter(Boolean))) {
+    if (inputs.images.some(image => image.name === name)) throw new Error(`ISF pass target "${name}" clashes with an image.`);
+    inputs.images.push({ name, role: 'buffer' });
+  }
+  if (inputs.images.length > ISF_LIMITS.images) throw new Error(`ISF shader uses too many images and buffers (limit ${ISF_LIMITS.images}).`);
 
-  const known = new Set([...BUILTINS, ...inputs.replacements.keys(), ...inputs.images.keys(), ...targets.keys()]);
-  let tokens = stripDirectives(tokenize(body), warn);
-  checkBalance(tokens);
-  tokens = stripDeclarations(tokens, known, inputs.images, warn);
-  if (!tokens.some((token, index) => token.type === 'id' && token.text === 'main' && textAt(tokens, nextSig(tokens, index)) === '(')) {
-    throw new Error('ISF shader has no main() function.');
-  }
-  const overrides = builtinOverrides(tokens);
-  const rename = name => TEMPLATE_NAMES.has(name) || ES3_RESERVED.has(name) || overrides.has(name) || name.startsWith('p_');
-  const shared = { kind, inputs, passes, targets, warn, rename, used: new Set(), feedbackTargets: new Set() };
-  const bodies = passes.map((_, index) => translate(pruneBranches(tokens, index), passContext(shared, index)));
-  if (shared.feedbackTargets.size > 1) throw new Error(`Only one persistent buffer can be read for feedback (found ${[...shared.feedbackTargets].join(', ')}).`);
-  const helpers = [...inputs.helpers, ...[...shared.used].map(name => AUDIO_HELPERS[name])];
-  const glsl = bodies.map(item => wrap(kind, helpers, item));
+  const known = new Set([...BUILTINS, ...inputs.names, ...inputs.images.map(image => image.name)]);
+  const hasVertex = /\bmain\s*\(/.test(vertex);
+  const overrides = new Set();
+  const ctx = { known, hasVertex, warn, overrides };
+  // Built-in overrides found in either stage are renamed in both.
+  const fragmentTokens = prepareStage(body, 'fragment', ctx);
+  const vertexTokens = hasVertex ? prepareStage(vertex, 'vertex', ctx) : null;
+  const rename = name => ES3_RESERVED.has(name) || overrides.has(name) ? `isf_u_${name}` : name;
+  for (const uniform of inputs.uniforms) uniform.glsl = rename(uniform.name);
+  for (const image of inputs.images) image.glsl = rename(image.name);
+  const samplers = inputs.images.map(image => image.glsl);
+  const program = {
+    fragment: preamble('fragment', inputs.uniforms, samplers) + translate(fragmentTokens, rename, 'fragment'),
+    vertex: preamble('vertex', inputs.uniforms, samplers) + (vertexTokens ? translate(vertexTokens, rename, 'vertex') : 'void main() {\n  isf_vertShaderInit();\n}\n'),
+  };
 
   const base = baseName(fileName);
   const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 100) || 'shader';
-  const category = Array.isArray(header.CATEGORIES) && typeof header.CATEGORIES[0] === 'string' && header.CATEGORIES[0].trim()
-    ? header.CATEGORIES[0].trim().slice(0, 40) : 'ISF';
+  const categories = Array.isArray(header.CATEGORIES) ? header.CATEGORIES.filter(item => typeof item === 'string' && item.trim()).map(item => item.trim().slice(0, 40)).slice(0, 8) : [];
   const definition = {
-    id: `isf:${slug}`,
+    id: id || `isf:${slug}`,
     name: base.replace(/_+/g, ' ').trim().slice(0, 80) || 'ISF Shader',
-    category,
+    category: categories[0] || 'ISF',
+    categories,
     params: inputs.params,
-    glsl: glsl[0],
+    isf: Object.freeze({
+      kind, program, passes, uniforms: inputs.uniforms, images: inputs.images,
+      assets: assets && typeof assets === 'object' ? Object.freeze({ ...assets }) : null,
+    }),
   };
-  if (kind === 'effect' && glsl.length > 1) definition.passes = glsl;
-  if (shared.feedbackTargets.size) definition.feedback = true;
   if (typeof header.DESCRIPTION === 'string' && header.DESCRIPTION.trim()) definition.description = header.DESCRIPTION.trim().slice(0, 500);
+  const credit = typeof header.CREDIT === 'string' ? header.CREDIT.trim().slice(0, 200) : '';
+  if (credit || author) definition.credit = (credit || String(author)).slice(0, 200);
+  if (typeof link === 'string' && /^https:\/\/editor\.isf\.video\/shaders\/[a-f0-9]{24}$/.test(link)) definition.link = link;
   return { definition, kind, warnings: [...warnings] };
 }

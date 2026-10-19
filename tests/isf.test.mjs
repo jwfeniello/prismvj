@@ -4,18 +4,21 @@ import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
-import { parseISF } from '../src/fx/isf.js';
-import { buildEffectShader, buildSourceShader, defaultParams } from '../src/fx/shader-template.js';
+import { parseISF, parseSizeExpression, evaluateSize, isfKind } from '../src/fx/isf.js';
 
 const { scanISFFolder } = createRequire(import.meta.url)('../electron/isf-library.cjs');
 const isf = (header, body = 'void main() { gl_FragColor = vec4(1.0); }') => `/*${typeof header === 'string' ? header : JSON.stringify(header)}*/\n${body}`;
 const image = { NAME: 'inputImage', TYPE: 'image' };
+const userCode = definition => definition.isf.program.fragment.split('#define ISF_PRISMVJ 1')[1];
 
-test('parses the JSON header, tolerating comments and trailing commas', () => {
-  const text = `/*{
+test('parses the JSON header, tolerating comments, trailing commas and leading line comments', () => {
+  const text = `// Week 25 by someone
+// 2016
+/*{
     // ISF v2 header with a comment
     "ISFVSN": "2",
     "DESCRIPTION": "Tint, with \\"quotes\\" // not a comment",
+    "CREDIT": "Someone",
     "CATEGORIES": ["Color Effect", "Stylize",],
     "INPUTS": [ { "NAME": "inputImage", "TYPE": "image" }, ],
   }*/
@@ -24,25 +27,30 @@ test('parses the JSON header, tolerating comments and trailing commas', () => {
   assert.equal(kind, 'effect');
   assert.deepEqual(warnings, []);
   assert.equal(definition.category, 'Color Effect');
+  assert.deepEqual(definition.categories, ['Color Effect', 'Stylize']);
   assert.equal(definition.description, 'Tint, with "quotes" // not a comment');
-  assert.match(definition.glsl, /isf_FragColor = src\(uv\);/);
-  assert.match(definition.glsl, /vec4 fx\(vec2 isf_uv\)/);
-  assert.match(buildEffectShader(definition), /void isf_main\(\)/);
+  assert.equal(definition.credit, 'Someone');
+  assert.match(userCode(definition), /isf_FragColor = IMG_THIS_PIXEL\(inputImage\);/);
+  assert.match(definition.isf.program.fragment, /^#version 300 es\n/);
+  assert.match(definition.isf.program.fragment, /uniform sampler2D inputImage;/);
+  assert.match(definition.isf.program.vertex, /void main\(\) \{\n  isf_vertShaderInit\(\);/);
 });
 
-test('generates stable ids, names and categories from the file name', () => {
+test('generates stable ids, names and categories; online ids and links are kept', () => {
   const { definition, kind } = parseISF(isf({ INPUTS: [] }), { fileName: '/lib/My Cool_Shader v2.fs' });
   assert.equal(kind, 'source');
   assert.equal(definition.id, 'isf:my-cool-shader-v2');
   assert.equal(definition.name, 'My Cool Shader v2');
   assert.equal(definition.category, 'ISF');
-  assert.match(definition.glsl, /vec4 gen\(vec2 isf_uv\)/);
-  assert.match(buildSourceShader(definition), /isf_main\(\);/);
   assert.equal(parseISF(isf({}), { fileName: '!!!.fs' }).definition.id, 'isf:shader');
-  assert.equal(parseISF(isf({})).definition.name, 'ISF Shader');
+  const online = parseISF(isf({}), { fileName: 'Tunnel', id: 'isf:web-5e7a7fdd7c113618206de5d9', link: 'https://editor.isf.video/shaders/5e7a7fdd7c113618206de5d9', author: 'joshpbatty' }).definition;
+  assert.equal(online.id, 'isf:web-5e7a7fdd7c113618206de5d9');
+  assert.equal(online.link, 'https://editor.isf.video/shaders/5e7a7fdd7c113618206de5d9');
+  assert.equal(online.credit, 'joshpbatty');
+  assert.equal(parseISF(isf({}), { link: 'https://evil.example/x' }).definition.link, undefined);
 });
 
-test('maps float, bool, event, color and point2D inputs to params', () => {
+test('maps float, bool, event, color, point2D and long inputs to params and uniforms', () => {
   const { definition, warnings } = parseISF(isf({ INPUTS: [
     { NAME: 'amount', TYPE: 'float', MIN: -2, MAX: 4, DEFAULT: 9, LABEL: 'Amount' },
     { NAME: 'loose', TYPE: 'float', DEFAULT: 3 },
@@ -51,153 +59,166 @@ test('maps float, bool, event, color and point2D inputs to params', () => {
     { NAME: 'tint', TYPE: 'color', DEFAULT: [1, 0.5, 0, 0.25] },
     { NAME: 'center', TYPE: 'point2D', DEFAULT: [320, 120], MIN: [0, 0], MAX: [640, 480] },
     { NAME: 'unit', TYPE: 'point2D', DEFAULT: [0.25, 0.75], MIN: [0, 0], MAX: [1, 1] },
-  ] }, 'void main() { gl_FragColor = flip || flash ? tint : vec4(amount + loose, center / RENDERSIZE + unit); }'));
+    { NAME: 'mode', TYPE: 'long', VALUES: [10, 20, -5], LABELS: ['Ten', 'Twenty'], DEFAULT: 20 },
+    { NAME: 'ranged', TYPE: 'long', MIN: 2, MAX: 4, DEFAULT: 3 },
+  ] }));
   const params = Object.fromEntries(definition.params.map(param => [param.key, param]));
   assert.deepEqual(params.amount, { key: 'amount', label: 'Amount', type: 'float', min: -2, max: 4, default: 4 });
   assert.equal(params.loose.max, 3);
-  assert.equal(params.loose.default, 3);
-  assert.equal(params.flip.type, 'bool');
-  assert.equal(params.flip.default, true);
+  assert.deepEqual([params.flip.type, params.flip.default], ['bool', true]);
   assert.deepEqual([params.flash.type, params.flash.default, params.flash.momentary], ['bool', false, true]);
   assert.equal(params.tint.default, '#ff800040');
   assert.deepEqual([params.center.type, params.center.default, params.center.isfPoint], ['point', [0.5, 0.25], 'pixels']);
   assert.deepEqual([params.unit.default, params.unit.isfPoint], [[0.25, 0.75], 'normalized']);
+  assert.deepEqual([params.mode.type, params.mode.options, params.mode.default, params.mode.isfValues], ['choice', ['Ten', 'Twenty', '-5'], 1, [10, 20, -5]]);
+  assert.deepEqual([params.ranged.options, params.ranged.default], [['2', '3', '4'], 1]);
   assert.deepEqual(warnings, []);
-  assert.match(definition.glsl, /p_flip \|\| p_flash \? p_tint : vec4\(p_amount \+ p_loose, \(p_center \* uResolution\) \/ uResolution \+ p_unit\)/);
-  assert.deepEqual(defaultParams(definition).center, [0.5, 0.25]);
+  const declared = definition.isf.program.fragment;
+  for (const line of ['uniform float amount;', 'uniform bool flip;', 'uniform bool flash;', 'uniform vec4 tint;', 'uniform vec2 center;', 'uniform int mode;']) assert.ok(declared.includes(line), line);
+  assert.deepEqual(definition.isf.uniforms.find(uniform => uniform.key === 'mode').values, [10, 20, -5]);
 });
 
-test('point2D without a canvas-sized MAX uses the reference size and warns', () => {
-  const { definition, warnings } = parseISF(isf({ INPUTS: [{ NAME: 'pos', TYPE: 'point2D', DEFAULT: [320, 240] }] }));
-  assert.deepEqual(definition.params[0].default, [0.5, 0.5]);
-  assert.equal(warnings.length, 1);
+test('extra image inputs become a source choice; audio inputs become textures', () => {
+  const { definition, warnings } = parseISF(isf({ INPUTS: [image, { NAME: 'mask', TYPE: 'image' }, { NAME: 'fft', TYPE: 'audioFFT', MAX: 64 }, { NAME: 'wave', TYPE: 'audio' }] },
+    'void main() { gl_FragColor = IMG_THIS_PIXEL(mask) + IMG_NORM_PIXEL(fft, vec2(0.5, 0.0)) + IMG_PIXEL(wave, vec2(3.0, 0.0)) * IMG_SIZE(fft).x; }'));
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(definition.params[0].options, ['None', 'This input', 'Below this layer', 'Bundled image']);
+  assert.deepEqual(definition.isf.images.map(item => [item.name, item.role, item.count]), [['inputImage', 'input', undefined], ['mask', 'param', undefined], ['fft', 'fft', 64], ['wave', 'wave', 256]]);
+  assert.match(definition.isf.program.fragment, /#define IMG_SIZE\(img\) vec2\(textureSize\(img, 0\)\)/);
+  assert.doesNotMatch(definition.isf.program.fragment, /##/);
 });
 
-test('long inputs become choices whose index maps to the ISF VALUES in GLSL', () => {
-  const { definition } = parseISF(isf({ INPUTS: [
-    { NAME: 'mode', TYPE: 'long', VALUES: [10, 20, -5], LABELS: ['Ten', 'Twenty'], DEFAULT: 20 },
-    { NAME: 'plain', TYPE: 'long', VALUES: [0, 1, 2], LABELS: ['A', 'B', 'C'], DEFAULT: 2 },
-    { NAME: 'ranged', TYPE: 'long', MIN: 2, MAX: 4, DEFAULT: 3 },
-  ] }, 'void main() { gl_FragColor = vec4(float(mode + plain + ranged)); }'));
-  const [mode, plain, ranged] = definition.params;
-  assert.deepEqual([mode.type, mode.options, mode.default, mode.isfValues], ['choice', ['Ten', 'Twenty', '-5'], 1, [10, 20, -5]]);
-  assert.deepEqual([plain.options, plain.default], [['A', 'B', 'C'], 2]);
-  assert.deepEqual([ranged.options, ranged.default], [['2', '3', '4'], 1]);
-  assert.match(definition.glsl, /const int values\[3\] = int\[3\]\(10, 20, -5\);\n  return values\[clamp\(p_mode, 0, 2\)\];/);
-  assert.match(definition.glsl, /float\(isf_long_mode\(\) \+ p_plain \+ isf_long_ranged\(\)\)/);
-  assert.doesNotMatch(definition.glsl, /isf_long_plain/);
-});
-
-test('translates ISF built-ins and GLSL 1.x idioms', () => {
+test('translates GLSL 1.x idioms, reserved words and redefined built-ins', () => {
   const body = `#version 110
 #extension GL_OES_standard_derivatives : enable
 varying vec2 vv_FragNormCoord;
 uniform float TIME;
 uniform sampler2D inputImage;
-float luma(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
 float round(float x) { return floor(x + 0.5); }
+float sign(float x) { return x < 0.0 ? -1.0 : 1.0; }
 void main(void) {
   vec2 uv = vv_FragNormCoord;
   vec4 c = texture2D(inputImage, uv) + IMG_PIXEL(inputImage, gl_FragCoord.xy) * IMG_SIZE(inputImage).x;
-  float sample = luma(c.rgb) + round(TIMEDELTA) + float(FRAMEINDEX) + DATE.w + float(PASSINDEX);
+  float sample = round(TIMEDELTA) + sign(-1.0) + float(FRAMEINDEX) + DATE.w + float(PASSINDEX);
   gl_FragData[0] = vec4(c.rgb * sample, c.a) + vec4(TIME);
 }`;
-  const { definition, warnings } = parseISF(isf({ INPUTS: [image] }, body));
-  const glsl = definition.glsl;
-  assert.doesNotMatch(glsl, /#version|#extension|varying|uniform|texture2D|gl_Frag|vv_FragNormCoord|\bmain\(/);
-  assert.match(glsl, /float isf_u_luma\(vec3 c\)/);
-  assert.match(glsl, /float isf_u_round\(float x\)/);
-  assert.match(glsl, /vec2 isf_u_uv = uv;/);
-  assert.match(glsl, /src\(\(isf_u_uv\)\)/);
-  assert.match(glsl, /src\(\(\(vec4\(uv \* uResolution, 0\.0, 1\.0\)\.xy\) \/ uResolution\)\) \* uResolution\.x/);
-  assert.match(glsl, /float isf_u_sample = isf_u_luma\(c\.rgb\) \+ isf_u_round\(\(1\.0 \/ 60\.0\)\) \+ float\(int\(uTime \* 60\.0\)\) \+ vec4\(2024\.0, 1\.0, 1\.0, mod\(uTime, 86400\.0\)\)\.w \+ float\(0\)/);
-  assert.match(glsl, /isf_FragColor = vec4\(c\.rgb \* isf_u_sample, c\.a\) \+ vec4\(uTime\);/);
-  assert.ok(warnings.some(message => /extension/.test(message)));
-  assert.ok(warnings.some(message => /DATE/.test(message)));
+  const { definition } = parseISF(isf({ INPUTS: [image] }, body));
+  const code = userCode(definition);
+  assert.doesNotMatch(code, /#version|#extension|varying|uniform|texture2D|gl_FragColor|gl_FragData|vv_FragNormCoord/);
+  assert.match(code, /float isf_u_round\(float x\)/);
+  assert.match(code, /float isf_u_sign\(float x\)/);
+  assert.match(code, /vec2 uv = isf_FragNormCoord;/);
+  assert.match(code, /texture\(inputImage, uv\)/);
+  assert.match(code, /float isf_u_sample = isf_u_round\(TIMEDELTA\) \+ isf_u_sign\(-1\.0\) \+ float\(FRAMEINDEX\) \+ DATE\.w \+ float\(PASSINDEX\);/);
+  assert.match(code, /isf_FragColor = vec4\(c\.rgb \* isf_u_sample, c\.a\) \+ vec4\(TIME\);/);
 });
 
-test('unsupported images and audio inputs degrade with warnings', () => {
-  const { definition, warnings } = parseISF(isf({ INPUTS: [image, { NAME: 'mask', TYPE: 'image' }, { NAME: 'fft', TYPE: 'audioFFT', MAX: 64 }, { NAME: 'wave', TYPE: 'audio' }] },
-    'void main() { gl_FragColor = IMG_THIS_PIXEL(mask) + IMG_NORM_PIXEL(fft, vec2(0.5, 0.0)) + IMG_PIXEL(wave, vec2(3.0, 0.0)) * IMG_SIZE(fft).x; }'));
-  assert.equal(warnings.length, 3);
-  assert.match(definition.glsl, /vec4\(0\.0\) \+ isf_audio_fft\(\(vec2\(0\.5, 0\.0\)\)\) \+ isf_audio_wave\(\(\(vec2\(3\.0, 0\.0\)\) \/ vec2\(256\.0, 1\.0\)\)\) \* vec2\(64\.0, 1\.0\)\.x/);
-  assert.match(definition.glsl, /vec4 isf_audio_fft\(vec2 p\)/);
+test('inputs named after reserved words are renamed in uniforms and code', () => {
+  const { definition } = parseISF(isf({ INPUTS: [image, { NAME: 'filter', TYPE: 'float' }, { NAME: 'sample', TYPE: 'image' }] },
+    'void main() { gl_FragColor = IMG_THIS_PIXEL(sample) * filter; }'));
+  assert.match(definition.isf.program.fragment, /uniform float isf_u_filter;/);
+  assert.match(definition.isf.program.fragment, /uniform sampler2D isf_u_sample;/);
+  assert.match(userCode(definition), /IMG_THIS_PIXEL\(isf_u_sample\) \* isf_u_filter/);
+  assert.equal(definition.params.find(param => param.key === 'filter').key, 'filter');
 });
 
-test('sequential passes map to template passes and prune PASSINDEX branches', () => {
-  const { definition, warnings } = parseISF(isf({
-    INPUTS: [image],
-    PASSES: [{ TARGET: 'first', FLOAT: true }, { TARGET: 'second', WIDTH: '$WIDTH/2', HEIGHT: '$HEIGHT/2' }, {}],
-  }, `void main() {
-  if (PASSINDEX == 0) gl_FragColor = IMG_THIS_PIXEL(inputImage);
-  else if (PASSINDEX == 1) { gl_FragColor = IMG_THIS_PIXEL(first) * 0.5; }
-  else { gl_FragColor = IMG_THIS_PIXEL(second) + IMG_THIS_PIXEL(inputImage); }
+test('non-constant global initializers move into main()', () => {
+  const { definition } = parseISF(isf({ INPUTS: [{ NAME: 'scale', TYPE: 'float', DEFAULT: 2 }] }, `vec2 center = RENDERSIZE * 0.5, offset = vec2(scale);
+const float k = 2.0;
+float helper(float x) { return x * k; }
+void main() {
+  gl_FragColor = vec4(center / RENDERSIZE + offset, helper(1.0), 1.0);
 }`));
-  assert.equal(definition.passes.length, 3);
-  assert.equal(definition.glsl, definition.passes[0]);
-  assert.equal(definition.feedback, undefined);
-  assert.match(definition.passes[0], /isf_FragColor = src\(uv\);/);
-  assert.doesNotMatch(definition.passes[0], /PASSINDEX|\* 0\.5/);
-  assert.match(definition.passes[1], /\{ isf_FragColor = src\(uv\) \* 0\.5; \}/);
-  assert.match(definition.passes[2], /isf_FragColor = src\(uv\) \+ orig\(uv\);/);
-  assert.equal(warnings.length, 2);
-  for (let pass = 0; pass < 3; pass++) assert.match(buildEffectShader(definition, pass), /vec4 fx\(/);
+  const code = userCode(definition);
+  assert.match(code, /vec2 center, offset;/);
+  assert.match(code, /void main\(\) \{\s*center = RENDERSIZE \* 0\.5;\s*offset = vec2\(scale\);/);
+  assert.match(code, /const float k = 2\.0;/);
+  assert.match(code, /float helper\(float x\)/);
 });
 
-test('a persistent buffer maps to feedback and prev()', () => {
-  const single = parseISF(isf({ INPUTS: [image, { NAME: 'decay', TYPE: 'float', DEFAULT: 0.9 }], PASSES: [{ TARGET: 'trail', PERSISTENT: true }] },
-    'void main() { gl_FragColor = max(IMG_THIS_PIXEL(inputImage), IMG_NORM_PIXEL(trail, isf_FragNormCoord) * decay); }'));
-  assert.equal(single.definition.feedback, true);
-  assert.equal(single.definition.passes, undefined);
-  assert.match(single.definition.glsl, /max\(src\(uv\), prev\(\(uv\)\) \* p_decay\)/);
-  assert.deepEqual(single.warnings, []);
-
-  const twoPass = parseISF(isf({ INPUTS: [image], PASSES: [{ TARGET: 'buf', PERSISTENT: 1 }, {}] },
-    'void main() { if (PASSINDEX == 0) gl_FragColor = mix(IMG_THIS_PIXEL(inputImage), IMG_THIS_PIXEL(buf), 0.5); else gl_FragColor = IMG_THIS_PIXEL(buf); }'));
-  assert.equal(twoPass.definition.feedback, true);
-  assert.match(twoPass.definition.passes[0], /mix\(src\(uv\), prev\(uv\), 0\.5\)/);
-  assert.match(twoPass.definition.passes[1], /isf_FragColor = src\(uv\);/);
-  assert.ok(twoPass.warnings.some(message => /approximated/.test(message)));
-
-  const legacy = parseISF(isf({ INPUTS: [image], PERSISTENT_BUFFERS: ['old'], PASSES: [{ TARGET: 'old' }] },
-    'void main() { gl_FragColor = IMG_THIS_PIXEL(old) + IMG_THIS_PIXEL(inputImage); }'));
-  assert.equal(legacy.definition.feedback, true);
+test('passes keep targets, persistence, FLOAT and size expressions', () => {
+  const { definition, warnings } = parseISF(isf({
+    INPUTS: [image, { NAME: 'blur', TYPE: 'float', DEFAULT: 4 }],
+    PERSISTENT_BUFFERS: ['legacy'],
+    PASSES: [{ TARGET: 'half', WIDTH: '$WIDTH/2.0', HEIGHT: 'floor($HEIGHT/$blur)', FLOAT: true }, { TARGET: 'trail', PERSISTENT: true }, { TARGET: 'legacy' }, { WIDTH: 'nonsense(' }],
+  }, 'void main() { gl_FragColor = IMG_THIS_PIXEL(half) + IMG_THIS_PIXEL(trail) + IMG_THIS_PIXEL(legacy); }'));
+  const [half, trail, legacy, last] = definition.isf.passes;
+  assert.deepEqual([half.target, half.persistent, half.float], ['half', false, true]);
+  assert.equal(evaluateSize(half.width, { WIDTH: 1280, HEIGHT: 720, blur: 4 }), 640);
+  assert.equal(evaluateSize(half.height, { WIDTH: 1280, HEIGHT: 720, blur: 4 }), 180);
+  assert.deepEqual([trail.persistent, legacy.persistent, last.target, last.width], [true, true, null, null]);
+  assert.equal(warnings.length, 1);
+  assert.deepEqual(definition.isf.images.filter(item => item.role === 'buffer').map(item => item.name), ['half', 'trail', 'legacy']);
 });
 
-test('unsupported topologies and invalid shaders throw clear errors', () => {
+test('size expressions support math, functions, comparisons and reject unknowns', () => {
+  const variables = new Set(['WIDTH', 'HEIGHT', 'amount']);
+  const run = (text, values = { WIDTH: 100, HEIGHT: 50, amount: 3 }) => evaluateSize(parseSizeExpression(text, variables), values);
+  assert.equal(run('max($WIDTH, $HEIGHT) * 2.0'), 200);
+  assert.equal(run('clamp($amount, 1.0, 2.0)'), 2);
+  assert.equal(run('$amount > 2.0 ? $WIDTH : $HEIGHT'), 100);
+  assert.equal(run('-$HEIGHT + 60 % 7'), -46);
+  assert.equal(run(320), 320);
+  assert.throws(() => parseSizeExpression('$nope', variables), /unknown variable/);
+  assert.throws(() => parseSizeExpression('alert(1)', variables), /Invalid/);
+  assert.throws(() => parseSizeExpression('$WIDTH +', variables), /Invalid/);
+});
+
+test('transitions: start/end images and a driven progress uniform', () => {
+  const { definition, kind, warnings } = parseISF(isf({ INPUTS: [{ NAME: 'startImage', TYPE: 'image' }, { NAME: 'endImage', TYPE: 'image' }, { NAME: 'progress', TYPE: 'float' }, { NAME: 'softness', TYPE: 'float', DEFAULT: 0.2 }] },
+    'void main() { gl_FragColor = mix(IMG_THIS_PIXEL(startImage), IMG_THIS_PIXEL(endImage), smoothstep(progress - softness, progress + softness, isf_FragNormCoord.x)); }'));
+  assert.equal(kind, 'transition');
+  assert.equal(isfKind({ INPUTS: [{ NAME: 'startImage' }, { NAME: 'endImage' }] }), 'transition');
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(definition.params.map(param => param.key), ['softness']);
+  assert.deepEqual(definition.isf.uniforms.find(uniform => uniform.name === 'progress').role, 'progress');
+  assert.deepEqual(definition.isf.images.map(item => item.role), ['start', 'end']);
+  const supplied = parseISF(isf({ INPUTS: [{ NAME: 'startImage', TYPE: 'image' }, { NAME: 'endImage', TYPE: 'image' }] }));
+  assert.equal(supplied.kind, 'transition');
+  assert.equal(supplied.warnings.length, 1);
+});
+
+test('vertex shaders: varyings become out/in and the legacy init name works', () => {
+  const vertex = 'varying vec2 offset;\nvoid main() {\n  vv_vertShaderInit();\n  offset = isf_FragNormCoord + vec2(0.1);\n}';
+  const { definition, warnings } = parseISF(isf({ INPUTS: [image] }, 'varying vec2 offset;\nvoid main() { gl_FragColor = IMG_NORM_PIXEL(inputImage, offset); }'), { vertex });
+  assert.deepEqual(warnings, []);
+  assert.match(definition.isf.program.vertex, /out vec2 offset;/);
+  assert.match(definition.isf.program.vertex, /#define vv_vertShaderInit isf_vertShaderInit/);
+  assert.match(definition.isf.program.fragment, /in vec2 offset;/);
+  const missing = parseISF(isf({ INPUTS: [image] }, 'varying vec2 offset;\nvoid main() { gl_FragColor = IMG_NORM_PIXEL(inputImage, offset); }'));
+  assert.ok(missing.warnings.some(message => /no vertex shader/.test(message)));
+  assert.match(userCode(missing.definition), /\s vec2 offset;/);
+});
+
+test('imported images and bundled assets are kept', () => {
+  const assets = { 'noise.png': 'data:image/png;base64,AAAA', logo: 'data:image/png;base64,BBBB' };
+  const { definition } = parseISF(isf({ INPUTS: [image, { NAME: 'logo', TYPE: 'image' }], IMPORTED: { noiseTex: { PATH: 'noise.png' } } },
+    'void main() { gl_FragColor = IMG_THIS_PIXEL(noiseTex) + IMG_THIS_PIXEL(logo); }'), { assets });
+  assert.deepEqual(definition.isf.images.find(item => item.name === 'noiseTex'), { name: 'noiseTex', role: 'imported', path: 'noise.png', glsl: 'noiseTex' });
+  assert.equal(definition.isf.assets.logo, assets.logo);
+  assert.equal(parseISF(isf({ INPUTS: [image], IMPORTED: [{ NAME: 'arr', PATH: 'a.jpg' }] })).definition.isf.images[1].path, 'a.jpg');
+});
+
+test('invalid shaders throw clear errors', () => {
   const cases = [
     ['void main() {}', /missing the leading/],
+    ['/* plain comment */ void main() {}', /missing the leading/],
     ['/*{ "INPUTS": [ }*/ void main() {}', /Invalid ISF JSON header/],
-    ['/*[1, 2]*/ void main() {}', /must be an object/],
     [isf({}, 'void notMain() {}'), /no main\(\)/],
     [isf({ INPUTS: [{ NAME: 'bad name', TYPE: 'float' }] }), /Invalid ISF input name/],
     [isf({ INPUTS: [{ NAME: 'TIME', TYPE: 'float' }] }), /clashes with an ISF built-in/],
     [isf({ INPUTS: [{ NAME: 'a', TYPE: 'float' }, { NAME: 'a', TYPE: 'bool' }] }), /Duplicate/],
     [isf({ INPUTS: [{ NAME: 'cube', TYPE: 'cube' }] }), /Unsupported ISF input type/],
     [isf({ INPUTS: [{ NAME: 'm', TYPE: 'long', VALUES: ['x'] }] }), /invalid VALUES/],
-    [isf({ INPUTS: [{ NAME: 'startImage', TYPE: 'image' }, { NAME: 'endImage', TYPE: 'image' }, { NAME: 'progress', TYPE: 'float' }] }), /transitions/],
-    [isf({ INPUTS: [image] }, 'varying vec2 texOffset;\nvoid main() { gl_FragColor = IMG_NORM_PIXEL(inputImage, texOffset); }'), /custom varyings \(texOffset\).*vertex shader/],
-    [isf({ INPUTS: [image] }, 'attribute vec2 position;\nvoid main() {}'), /vertex/],
-    [isf({ INPUTS: [image], PASSES: [{ TARGET: 'a' }, { TARGET: 'b' }, {}] }, 'void main() { gl_FragColor = IMG_THIS_PIXEL(a); }'), /Pass 3 reads buffer "a" written by pass 1/],
-    [isf({ INPUTS: [image], PASSES: [{ TARGET: 'a', PERSISTENT: true }, { TARGET: 'b', PERSISTENT: true }] }, 'void main() { gl_FragColor = IMG_THIS_PIXEL(a) + IMG_THIS_PIXEL(b); }'), /Only one persistent buffer/],
-    [isf({ PASSES: [{ TARGET: 'a' }, {}] }), /Multi-pass ISF generators/],
-    [isf({ PASSES: [{ TARGET: 'a', PERSISTENT: true }] }, 'void main() { gl_FragColor = IMG_THIS_PIXEL(a); }'), /Feedback.*generators/],
-    [isf({ INPUTS: [image], PASSES: [{ TARGET: 'a' }, { TARGET: 'a' }] }), /more than one pass/],
-    [isf({ INPUTS: [image], PASSES: Array.from({ length: 9 }, () => ({})) }), /too many passes/],
-    [isf({ INPUTS: [image] }, 'vec4 f(sampler2D s) { return IMG_THIS_PIXEL(s); } void main() { gl_FragColor = f(inputImage); }'), /must name an image input directly/],
+    [isf({ INPUTS: [image, { NAME: 'a', TYPE: 'float' }], PASSES: [{ TARGET: 'a' }] }), /clashes with an input/],
+    [isf({ INPUTS: [image], PASSES: Array.from({ length: 17 }, () => ({})) }), /too many passes/],
     [isf({ INPUTS: [image] }, 'void main() { gl_FragColor = vec4(1.0); { }'), /Unbalanced|Unterminated/],
-    [`/*{}*/${' '.repeat(300 * 1024)}`, /too large/],
+    [isf({ INPUTS: [image] }, 'void main() { gl_FragData[1] = vec4(1.0); }'), /multiple render targets/],
+    [`/*{}*/${' '.repeat(600 * 1024)}`, /too large/],
   ];
   for (const [text, pattern] of cases) assert.throws(() => parseISF(text), pattern, String(text).slice(0, 120));
   assert.throws(() => parseISF(null), TypeError);
-});
-
-test('reading a later buffer before it is rendered falls back to blank with a warning', () => {
-  const { definition, warnings } = parseISF(isf({ INPUTS: [image], PASSES: [{ TARGET: 'a' }, {}] },
-    'void main() { gl_FragColor = IMG_THIS_PIXEL(a) + IMG_THIS_PIXEL(inputImage); }'));
-  assert.match(definition.passes[0], /vec4\(0\.0\) \+ src\(uv\)/);
-  assert.match(definition.passes[1], /src\(uv\) \+ orig\(uv\)/);
-  assert.equal(warnings.length, 1);
+  assert.throws(() => parseISF(isf({}), { vertex: 'x\0' }), /binary/);
 });
 
 test('inputImage used without a declaration still makes an effect', () => {
@@ -206,7 +227,7 @@ test('inputImage used without a declaration still makes an effect', () => {
   assert.equal(warnings.length, 1);
 });
 
-test('scanISFFolder reads .fs files one level deep, skipping oversized files and symlinks', async () => {
+test('scanISFFolder reads .fs files one level deep with their .vs and imported images', async () => {
   const root = await mkdtemp(join(tmpdir(), 'isf-scan-'));
   try {
     await mkdir(join(root, 'Sub', 'Deeper'), { recursive: true });
@@ -215,15 +236,22 @@ test('scanISFFolder reads .fs files one level deep, skipping oversized files and
     await writeFile(join(root, 'A.FS'), 'A');
     await writeFile(join(root, 'notes.txt'), 'x');
     await writeFile(join(root, 'big.fs'), 'x'.repeat(2048));
-    await writeFile(join(root, 'Sub', 'c.fs'), 'C');
+    await writeFile(join(root, 'Sub', 'c.fs'), '/*{"IMPORTED":{"tex":{"PATH":"tex.png"},"escape":{"PATH":"../../secret.png"}}}*/ void main(){}');
+    await writeFile(join(root, 'Sub', 'c.vs'), 'void main(){ isf_vertShaderInit(); }');
+    await writeFile(join(root, 'Sub', 'tex.png'), Buffer.from([137, 80, 78, 71]));
+    await writeFile(join(root, 'secret.png'), Buffer.from([1]));
     await writeFile(join(root, 'Sub', 'Deeper', 'd.fs'), 'D');
     await writeFile(join(root, '.hidden', 'e.fs'), 'E');
     // A link back to the root (a junction on Windows) must not be followed.
     await symlink(root, join(root, 'loop'), 'junction').catch(() => {});
     const results = await scanISFFolder(root, { maxBytes: 1024 });
     assert.deepEqual(results.map(item => item.name), ['A.FS', 'b.fs', 'c.fs']);
-    assert.deepEqual(results.map(item => item.text), ['A', 'B', 'C']);
+    assert.deepEqual(results.map(item => item.text.slice(0, 1)), ['A', 'B', '/']);
     assert.equal(results[2].path, join(root, 'Sub', 'c.fs'));
+    assert.equal(results[2].vertex, 'void main(){ isf_vertShaderInit(); }');
+    assert.deepEqual(Object.keys(results[2].assets), ['tex.png']);
+    assert.equal(results[2].assets['tex.png'], 'data:image/png;base64,iVBORw==');
+    assert.equal(results[0].vertex, '');
     assert.equal((await scanISFFolder(root, { maxFiles: 1, maxBytes: 1024 })).length, 1);
     assert.equal((await scanISFFolder(root)).length, 4);
     assert.deepEqual(await scanISFFolder(join(root, 'missing')), []);

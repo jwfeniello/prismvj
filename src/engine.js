@@ -1,7 +1,8 @@
 import { COMPOSITE_FRAGMENT, blendIndex, normalizeBlend } from './blends.js';
 import { GifPlayback, isGifAsset } from './gif-playback.js';
 import { buildEffectShader, buildSourceShader, bindParams, uniformNames, effectPasses } from './fx/shader-template.js';
-import { effectDefinition, sourceDefinition } from './fx/registry.js';
+import { effectDefinition, sourceDefinition, transitionDefinition } from './fx/registry.js';
+import { IsfRuntime } from './fx/isf-runtime.js';
 import { AudioEffectChain } from './audio-fx.js';
 import { crossfadeGain } from './model.js';
 import { GpuVideoPlayer } from './gpu-video/player.js';
@@ -261,6 +262,7 @@ export class LiveEngine {
       this.feedback.clear();
       this.layerCache.clear();
       for (const source of this.canvasSources.values()) source.texture = null;
+      this.isf?.reset();
       try {
         this._initGL();
         for (const entry of this.media.values()) {
@@ -446,6 +448,8 @@ export class LiveEngine {
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.CULL_FACE);
     gl.disable(gl.BLEND);
+    this.isf = new IsfRuntime(gl, { onError: (key, message) => this._error(key, message) });
+    this.isf.audioProvider = () => this._isfAudio();
     this.blankTexture = this._texture();
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
     this.resize(this.canvas.width || 1280, this.canvas.height || 720, true);
@@ -887,6 +891,33 @@ export class LiveEngine {
     return this._channels(clip, this._fullFrame(this.targets[0]));
   }
 
+  // ISF hosts (isf-runtime.js). Output is copied into an engine target so it
+  // carries the usual content/fit sizes.
+  _runIsf(key, definition, options, sizeFrom = null) {
+    const output = this.isf.run(key, definition, { below: this.routerBase, width: this.canvas.width, height: this.canvas.height, ...options });
+    if (!output) return null;
+    const target = sizeFrom ? this._scratch(sizeFrom) : this.targets[0];
+    this._copy(output, target);
+    if (sizeFrom) this._copySize(sizeFrom, target); else this._fullFrame(target);
+    return target;
+  }
+
+  _isfSource(clip, definition, time) {
+    const target = this._runIsf(`src:${clip.id}`, definition, { params: this._sourceParams(clip, definition), time: number(time) });
+    return target ? this._channels(clip, target) : null;
+  }
+
+  // Waveform and spectrum of the composition output for ISF audio inputs.
+  _isfAudio() {
+    if (this._audioContext?.state !== 'running') return null;
+    const analyser = this._analyser('composition:', this.limiter);
+    if (!analyser) return null;
+    if (!analyser.wave) analyser.wave = new Uint8Array(analyser.node.fftSize);
+    analyser.node.getByteTimeDomainData(analyser.wave);
+    this._readSpectrum(analyser);
+    return { wave: analyser.wave, fft: analyser.bins.subarray(0, Math.max(1, analyser.bins.length >> 1)) };
+  }
+
   _channels(clip, input) {
     if (clip.red !== false && clip.green !== false && clip.blue !== false) return input;
     const target = this._scratch(input), gl = this.gl, u = this._use(this.channelsProgram);
@@ -948,6 +979,7 @@ export class LiveEngine {
       const definition = sourceDefinition(clip.source);
       if (definition?.kind === 'canvas' && typeof definition.create === 'function') return this._canvasSource(clip, definition, time);
       if (definition?.kind === 'router') return this._routerSource(clip);
+      if (definition?.isf) return this._isfSource(clip, definition, time);
       if (definition?.glsl) return this._shaderSource(clip, definition, time);
     }
     const generated = clip.kind === 'source' && !liveSource(clip);
@@ -1082,7 +1114,7 @@ export class LiveEngine {
     return true;
   }
 
-  hasPendingPrograms() { for (const entry of this.fxPrograms.values()) if (entry.pending) return true; return false; }
+  hasPendingPrograms() { for (const entry of this.fxPrograms.values()) if (entry.pending) return true; return !!this.isf?.pending(); }
 
   // Finish every pending compile now (blocking). Returns true when any
   // program became ready, i.e. a re-render would differ. Used for snapshots.
@@ -1093,7 +1125,7 @@ export class LiveEngine {
     this.parallelCompile = null;
     try { for (const [key, entry] of this.fxPrograms) if (entry.pending) { this._finishProgram(key, entry); finished = true; } }
     finally { this.parallelCompile = parallel; }
-    return finished;
+    return this.isf.flush() || finished;
   }
 
   // Queue catalog definitions for background compilation (a few per frame),
@@ -1103,6 +1135,7 @@ export class LiveEngine {
   prewarm(definitions, { kind = 'effect', priority = false } = {}) {
     if (!this.parallelCompile || this.lost) return;
     for (const definition of definitions) {
+      if (definition?.isf) { this.isf.prewarm(definition); continue; }
       if (!definition?.glsl && !definition?.passes) continue;
       const keys = kind === 'source'
         ? [[`src:${definition.id}`, () => buildSourceShader(definition)]]
@@ -1134,6 +1167,7 @@ export class LiveEngine {
   }
 
   _runEffect(input, effect, definition, now) {
+    if (definition.isf) return this._runIsf(`fx:${effect.id}`, definition, { input, params: effectParams(effect), time: now }, input);
     const passes = effectPasses(definition), params = effectParams(effect), gl = this.gl;
     const history = definition.feedback ? this._feedbackTarget(effect.id) : null;
     let source = input;
@@ -1268,6 +1302,13 @@ export class LiveEngine {
   }
 
   _composite(base, top, target, mode, opacity, now, transition = false) {
+    if (typeof mode === 'string' && mode.startsWith('isf:')) {
+      const definition = transitionDefinition(mode);
+      const output = definition && this.isf.run(`mix:${mode}`, definition, { start: base, end: top, progress: opacity, time: now, width: this.canvas.width, height: this.canvas.height });
+      if (output) { this._copy(output, target); this._copySize(top, target); return; }
+      mode = 'normal';
+      transition = true;
+    }
     this._bind(target);
     const gl = this.gl, u = this._use(this.compositeProgram);
     this._sample(base.texture, u.uBase, 0);
@@ -1428,6 +1469,7 @@ export class LiveEngine {
     if (this.disposed) return;
     const started = performance.now();
     this.frameIndex++;
+    this.isf?.beginFrame();
     this.beat = Number.isFinite(beat) ? beat : now*number(project.bpm, 120)/60;
     this._analyseAudio();
     const delta = this.lastRender ? now-this.lastRender : 0;
@@ -1962,6 +2004,7 @@ export class LiveEngine {
       for (const program of this.programs) gl.deleteProgram(program);
       gl.deleteTexture(this.blankTexture);
       gl.deleteVertexArray(this.vao);
+      this.isf?.dispose();
     }
     this.masterGain?.disconnect();
     this.masterPanner?.disconnect();

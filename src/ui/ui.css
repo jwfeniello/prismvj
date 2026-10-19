@@ -116,4 +116,20 @@ input[type=range].below-full{box-shadow:inset 0 0 0 1px rgba(255,77,77,.55)}/* P
    into the rest of the workspace (and vice versa). */
 .inspector-content,.browser-content{contain:content}
 .layer-bank{contain:layout paint style}.timecode-field{width:96px;font-family:Consolas,'Courier New',monospace;text-align:center}
-#timecode-status{font-family:Consolas,'Courier New',monospace;color:var(--accent)}.link-button.active{background:#2a7bf0;color:#fff;border-color:#1a4fa0}
+#timecode-status{font-family:Consolas,'Courier New',monospace;color:var(--accent)}.link-button.active{background:#2a7bf0;color:#fff;border-color:#1a4fa0}/* ISF Library (editor.isf.video) */
+.isf-filters{display:flex;gap:4px;padding:0 6px 6px;flex-wrap:wrap}.isf-filters select{flex:1;min-width:90px}
+.isf-tools{flex-wrap:wrap}.isf-tools #isf-search{flex:1 1 100%}
+.isf-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:5px;padding:6px}
+.isf-card{display:flex;flex-direction:column;background:#202020;border:1px solid #111;border-radius:3px;overflow:hidden;min-width:0}
+.isf-card:hover{border-color:#4b806e}
+.isf-thumb{position:relative;aspect-ratio:10/7;background:#0d0d0d}.isf-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.isf-thumb .pill{position:absolute;top:4px;left:4px}
+.isf-meta{display:flex;flex-direction:column;gap:1px;padding:3px 5px;min-width:0;font-size:11px}.isf-meta strong,.isf-meta small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.isf-meta small{color:var(--muted)}
+.isf-actions{display:flex;gap:3px;padding:0 5px 5px}.isf-actions button{font-size:11px}.isf-actions button:first-child{flex:1}.isf-actions button{padding:2px 6px}
+.browser-panel #isf-more{display:block;margin:4px auto 10px}
+.error-note{color:#ff9a8a}
+/* Pro DJ Link players and track triggers */
+.prolink-player,.prolink-trigger{background:#1e1e1e;border:1px solid #111;border-radius:3px;padding:5px 6px;margin:4px 0;display:flex;flex-direction:column;gap:3px}
+.prolink-player .row,.prolink-trigger .row{gap:6px;align-items:center;flex-wrap:wrap}
+.prolink-track{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill.on-air{background:#b3261e;color:#fff}

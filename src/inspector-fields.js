@@ -1,4 +1,5 @@
-import { BLEND_MODES, TRANSITION_IDS } from './blends.js';
+import { BLEND_MODES, TRANSITION_IDS, isIsfBlend } from './blends.js';
+import { listTransitions } from './fx/registry.js';
 import { DASHBOARD_PARAMETERS } from './dashboard.js';
 
 const escape = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
@@ -6,8 +7,12 @@ const valueOf = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 
 export function blendOptions(selected, transitions = false) {
   const modes = BLEND_MODES.filter(mode => mode.supported && (!transitions || TRANSITION_IDS.includes(mode.id)));
-  return (transitions ? [{id:'random',label:'Random'}, ...modes] : modes)
-    .map(mode => `<option value="${mode.id}" ${selected===mode.id?'selected':''}>${escape(mode.label)}</option>`).join('');
+  const option = mode => `<option value="${escape(mode.id)}" ${selected===mode.id?'selected':''}>${escape(mode.label)}</option>`;
+  // ISF transitions work as mixers too: start = below, end = this, progress = opacity.
+  const isf = listTransitions().map(definition => ({ id: definition.id, label: definition.name }));
+  if (isIsfBlend(selected) && !isf.some(mode => mode.id === selected)) isf.push({ id: selected, label: `${selected.slice(4)} (not loaded)` });
+  return (transitions ? [{id:'random',label:'Random'}, ...modes] : modes).map(option).join('')
+    + (isf.length ? `<optgroup label="ISF transitions">${isf.map(option).join('')}</optgroup>` : '');
 }
 
 export function numericField(label, key, value, minimum, maximum, step = '.01', { pixels = false, disabled = false } = {}) {
