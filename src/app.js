@@ -94,7 +94,7 @@ const snapshot = () => JSON.stringify(validateProject(project));
 
 function initialize() {
   $('#app').innerHTML = `
-    <header class="topbar"><div class="brand">PrismVJ</div><input type="text" class="project-title" id="project-name" aria-label="Composition name" value="${esc(project.name)}"><span class="pill" id="save-state">LOCAL SESSION</span><div class="spacer"></div><button id="new-project">New</button><button id="open-project">Open</button><button id="save-project">Save</button><div class="divider"></div><button id="record">● Record</button><button id="output" class="primary">Output</button><button id="preferences" title="Preferences">Settings</button><button id="help" title="Keyboard shortcuts">?</button></header>
+    <header class="topbar"><div class="brand">PrismVJ</div><input type="text" class="project-title" id="project-name" aria-label="Composition name" value="${esc(project.name)}"><span class="pill" id="save-state">LOCAL SESSION</span><div class="spacer"></div><button id="new-project">New</button><button id="open-project">Open</button><button id="save-project">Save</button><div class="divider"></div><button id="converter" title="Convert media to HAP or HAP Alpha">Convert</button><button id="record">● Record</button><button id="output" class="primary">Output</button><button id="preferences" title="Preferences">Settings</button><button id="help" title="Keyboard shortcuts">?</button></header>
     <div class="toolbar"><label>BPM</label><input id="bpm" class="tempo" type="number" min="20" max="300" step=".1" value="${project.bpm}" aria-label="Tempo"><button id="tap" class="icon-btn">Tap</button><button id="link" class="icon-btn link-button" title="Ableton Link: sync tempo and beat with other apps on the network. Right-click for options." hidden>Link</button><button id="resync" class="icon-btn" title="Resync beat clock">↻</button><div class="divider"></div><label>Quantize</label><select id="quantize" aria-label="Trigger quantization"><option value="0">Immediate</option><option value=".25">¼ beat</option><option value="1">1 beat</option><option value="4">1 bar</option><option value="8">2 bars</option></select><div class="divider"></div><button data-global-direction="backward" class="icon-btn" title="Reverse all active clips; right-click to pin">◀</button><button data-global-direction="forward" class="icon-btn" title="Forward all active clips; right-click to pin">▶</button><button data-global-direction="random" class="icon-btn" title="Random playback; right-click to pin">R</button><button id="pause" class="icon-btn" title="Pause composition; right-click to pin paused clip launches">Ⅱ Pause</button><label>Speed</label><input id="global-speed" aria-label="Global speed" type="range" min=".1" max="4" step=".01" value="1"><output id="speed-value">1.00×</output><div class="spacer"></div><button id="bypass-all" class="icon-btn">Bypass all</button><button id="clear-all" class="icon-btn">Clear all</button><button id="blackout" class="icon-btn">Blackout</button></div>
     <section class="workspace"><div class="layer-label row"><span class="muted">Composition</span><button id="previous-column" class="icon-btn" title="Trigger previous column" aria-label="Trigger previous column">◀</button><button id="next-column" class="icon-btn" title="Trigger next column" aria-label="Trigger next column">▶</button><div class="spacer"></div><button id="insert-layer" class="icon-btn" title="Insert layer below selected">↧</button><button id="add-layer" class="icon-btn" title="Add layer">+</button></div><div id="column-viewport"><div id="column-heads" class="column-heads"></div></div><div id="layer-bank" class="layer-bank"></div></section>
     <nav class="deckbar"><div class="crossfade"><button id="cross-a" title="Fade to A">A</button><input id="crossfader" type="range" min="0" max="1" step=".001" value=".5" aria-label="Crossfader"><button id="cross-b" title="Fade to B">B</button></div><div id="decks" class="row"></div><button id="add-deck" class="icon-btn" title="Add deck">+</button><button id="deck-actions" class="icon-btn" title="Edit selected deck">Deck…</button><button id="column-actions" class="icon-btn" title="Edit columns">Columns…</button><span class="spacer"></span><button id="copy-clip" class="icon-btn" title="Copy selected clip (Ctrl+C)">Copy</button><button id="cut-clip" class="icon-btn" title="Cut selected clip (Ctrl+X)">Cut</button><button id="paste-clip" class="icon-btn" title="Paste into selected slot (Ctrl+V)">Paste</button></nav>
@@ -1223,7 +1223,7 @@ function bindStatic(){
   $('#copy-clip').onclick=()=>copySelection(false);$('#cut-clip').onclick=()=>copySelection(true);$('#paste-clip').onclick=pasteSelection;
   $('#save-project').onclick=()=>saveProject();$('#open-project').onclick=openProject;
   $('#new-project').onclick=async()=>{if(dirty){const ok=await confirmDialog('Create a new composition?','Your recovery copy will be kept until the new composition changes. Save the current composition first if you want to keep it.','Create new');if(!ok)return;}await desktop?.resetProjectPath?.();loadProject(createProject());};
-  $('#record').onclick=toggleRecording;$('#output').onclick=openOutput;
+  $('#record').onclick=toggleRecording;$('#output').onclick=openOutput;$('#converter').onclick=()=>openConverterView();
   $('#snapshot-output').onclick=()=>captureSnapshot('output');
   $('#preview-toggle').onclick=togglePreview;$('#help').onclick=help;
   window.addEventListener('keydown',keyDown);window.addEventListener('keyup',keyUp);
@@ -1431,6 +1431,42 @@ function applyReconnected(result){
   toast(`Reconnected ${count} media reference${count===1?'':'s'}. ${remaining} still missing.${result.ambiguous?.length?' Some names match multiple files; reconnect those individually.':''}${result.scan?.truncated||result.scan?.errors?.length?' The search was incomplete; choose a smaller folder with readable files.':''}`,remaining>0);
 }
 
+// Converter (HAP / HAP Alpha / HAP Q), opened over the workspace like Advanced Output.
+let converterView=null;
+const isGpuClip=clip=>/[?&]gpu=/.test(clip?.url||'');
+async function openConverterView(initialPaths=[]){
+  if(!desktop?.convertAdd)return toast('The converter needs the desktop app.',true);
+  if(converterView){if(initialPaths.length)converterView.add(initialPaths);return;}
+  const {openConverter}=await import('./converter/converter.js');
+  if(converterView)return;
+  const host=document.createElement('div');host.className='converter-overlay';document.body.append(host);
+  const escape=event=>{if(event.key==='Escape'&&!event.defaultPrevented&&converterView&&!document.querySelector('dialog[open]'))converterView.close();};
+  converterView=openConverter({host,desktop,toast,initialPaths,
+    compositionPaths:()=>[...new Set(project.layers.flatMap(layer=>Object.values(layer.clips).flat()).filter(clip=>clip&&clip.kind==='video'&&clip.path&&!isGpuClip(clip)).map(clip=>clip.path))],
+    onReplace:(source,output)=>replaceClipMedia(source,output),
+    onImport:async output=>{const [item]=await desktop.importPaths([output]);await placeMedia(item,currentLayer());},
+    onClose:()=>{converterView=null;host.remove();document.removeEventListener('keydown',escape);}});
+  document.addEventListener('keydown',escape);
+}
+// Automation and support: open the converter with files already added.
+window.prismOpenConverter=paths=>openConverterView(Array.isArray(paths)?paths:[]);
+// Points every clip that uses `source` at the converted file, keeping cues,
+// effects and settings (like Reconnect media).
+async function replaceClipMedia(source,output){
+  const [item]=await desktop.importPaths([output]);
+  if(!item||item.error)throw new Error(item?.error||'The converted file could not be opened.');
+  const same=value=>String(value||'').toLowerCase()===String(source).toLowerCase();
+  let count=0;
+  for(const layer of project.layers)for(const clips of Object.values(layer.clips))for(const clip of clips){
+    if(!clip||!same(clip.path))continue;
+    const replacement={...clip,path:item.path||'',url:item.url,kind:item.kind||clip.kind,hasAlpha:item.hasAlpha??clip.hasAlpha};
+    engine.remove(clip.id);
+    try{const media=await engine.prepare(replacement);if(!replacement.audio&&media&&Number.isFinite(media.duration))replacement.duration=media.duration;Object.assign(clip,replacement);count++;}
+    catch(error){toast(`Could not switch ${clip.name} to the converted file: ${error.message}`,true);}
+  }
+  if(count){changed();renderAll();toast(`${count} clip${count===1?' now uses':'s now use'} ${item.name}.`);}
+  return count;
+}
 async function relinkClip(clip){
   async function replace(item){
     if(item.error)throw new Error(item.error);

@@ -12,6 +12,7 @@ const { isAutomatedLaunch, validateBuiltPage } = require('./startup.cjs');
 const { createMediaConverter } = require('./media-converter.cjs');
 const { scanISFFolder } = require('./isf-library.cjs');
 const { IsfOnline } = require('./isf-online.cjs');
+const { createHapConverter } = require('./hap-converter.cjs');
 const { DmxSender, DmxReceiver } = require('./dmx-network.cjs');
 const abletonLink = require('./link.cjs');
 const { ProLink } = require('./prolink.cjs');
@@ -818,6 +819,7 @@ function setupIPC() {
   handle('prism:link-start-stop-sync', enabled => abletonLink.setStartStopSync(enabled));
   handle('prism:prolink-start', async options => {
     stopProLink();
+    hapConverter?.close();
     const number = Number.isInteger(options?.number) && options.number >= 1 && options.number <= 15 ? options.number : 5;
     const client = new ProLink({ number, name: 'PrismVJ' });
     client.on('beat', beat => notify('prism:prolink-beat', beat));
@@ -828,6 +830,39 @@ function setupIPC() {
     return client.snapshot();
   });
   handle('prism:prolink-stop', () => { stopProLink(); return true; });
+  // HAP converter (an Alley-style convert queue for HAP / HAP Alpha / HAP Q).
+  let hapConverter = null;
+  const converterInstance = () => (hapConverter ||= createHapConverter({ cacheDirectory: path.join(app.getPath('userData'), 'converter-cache'), resourcesPath: process.resourcesPath,
+    onUpdate: state => notify('prism:convert-state', state) }));
+  const plainItem = item => item && JSON.parse(JSON.stringify(item));
+  handle('prism:convert-add', async paths => (await converterInstance().add(Array.isArray(paths) ? paths.filter(item => typeof item === 'string').slice(0, 500) : [])).map(plainItem));
+  handle('prism:convert-pick', async kind => {
+    const result = await dialog.showOpenDialog(editor, kind === 'folder'
+      ? { title: 'Add a folder to convert', properties: ['openDirectory', 'multiSelections'] }
+      : { title: 'Add files to convert', properties: ['openFile', 'multiSelections'], filters: [{ name: 'Video and image sequences', extensions: ['mov', 'mp4', 'm4v', 'avi', 'mkv', 'webm', 'mxf', 'mpg', 'wmv', 'gif', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'exr', 'tga', 'dpx'] }, { name: 'All files', extensions: ['*'] }] });
+    if (result.canceled) return [];
+    return (await converterInstance().add(result.filePaths)).map(plainItem);
+  });
+  handle('prism:convert-folder', async () => { const result = await dialog.showOpenDialog(editor, { title: 'Choose where converted files go', properties: ['openDirectory', 'createDirectory'] }); return result.canceled ? null : result.filePaths[0] || null; });
+  handle('prism:convert-frame', (id, seconds) => converterInstance().frame(id, seconds));
+  handle('prism:convert-preview', async id => {
+    const file = await converterInstance().preview(id);
+    let token = mediaPaths.get(file);
+    if (!token) { token = randomUUID(); mediaTokens.set(token, file); mediaPaths.set(file, token); }
+    return `prism-media://media/${token}/${encodeURIComponent(path.basename(file))}`;
+  });
+  handle('prism:convert-enqueue', requests => converterInstance().enqueue(requests));
+  handle('prism:convert-cancel', id => converterInstance().cancel(id));
+  handle('prism:convert-prioritize', ids => converterInstance().prioritize(ids));
+  handle('prism:convert-clear', () => { converterInstance().clearFinished(); return true; });
+  handle('prism:convert-forget', ids => converterInstance().forget(ids));
+  handle('prism:convert-state', () => converterInstance().state());
+  handle('prism:convert-reveal', output => {
+    const job = converterInstance().state().jobs.find(entry => entry.output === output && entry.status === 'done');
+    if (!job) return false;
+    shell.showItemInFolder(job.output);
+    return true;
+  });
   handle('prism:dmx-start', startDMX);
   handle('prism:dmx-stop', stopDMX);
   handle('prism:dmx-input-start', startDMXInput);

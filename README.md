@@ -14,6 +14,14 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 - **Audio:** each clip has its own soundtrack with volume and pan. You can pair a separate audio file with any visual, and Linked AV faders move audio and video together.
 - **Recording and snapshots:** record the output with mixed audio, or save a PNG of the output or of a single clip. New recordings and snapshots drop into the clip bank.
 
+### Converter
+- **Built-in HAP converter**, in the style of Resolume Alley: drop in files, folders or image sequences and they convert to **HAP**, or to **HAP Alpha** when the clip actually uses transparency. A clip that merely has an alpha channel but is fully opaque gets plain HAP and stays half the size. HAP Q and an Auto High Quality preset are there too.
+- **Settings:** size (fit, fill or stretch), frame rate, trim, audio (Linear PCM), output folder, file name and presets. Change many files at once by selecting them together.
+- **Fast:** files encode in parallel across all CPU cores, each using multithreaded HAP compression. Add any clip to the queue first with Convert first.
+- **Made for PrismVJ:** + From composition converts the media your composition uses and switches those clips to the HAP versions when they finish, keeping their cues, effects and settings. Add to layer places a finished file in the selected layer.
+
+![Converter](docs/screenshots/converter.png)
+
 ### Composition
 - **Decks, layers and columns.** Multiple decks with renameable columns, and clips can persist across decks.
 - **Layers** have their own blend mode, opacity, audio, bypass and solo, plus mask mode, locking and auto-transitions.
