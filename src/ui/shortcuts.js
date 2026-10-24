@@ -138,10 +138,12 @@ export class ShortcutManager {
 
   async enableMidi() {
     if (this.midiAccess) return this.midiAccess;
-    this.midiAccess = await navigator.requestMIDIAccess({ sysex: false });
+    // SysEx lets controller templates switch devices into host mode (APC Ableton mode).
+    this.midiAccess = await navigator.requestMIDIAccess({ sysex: true }).catch(() => navigator.requestMIDIAccess({ sysex: false }));
     const bind = () => { for (const input of this.midiAccess.inputs.values()) input.onmidimessage = event => this.handleMidi(event.data, input.name || ''); };
     bind();
     this.midiAccess.onstatechange = () => { bind(); this.ctx.onDevicesChange?.(); };
+    this.ctx.onMidiAccess?.(this.midiAccess);
     return this.midiAccess;
   }
 
@@ -149,12 +151,17 @@ export class ShortcutManager {
     this.ctx.onRawMidi?.(data);
     const [status, a = 0, b = 0] = data, kind = status & 0xf0, channel = status & 15;
     if (status === 0xf8 || status === 0xfa || status === 0xfc) { this._clock(status); return; }
+    // SysEx (controller identity replies) goes to the built-in controller mappings.
+    if (status === 0xf0) { this.ctx.onControllerMidi?.(data, device); return; }
     let type = null, number = a, value = 0, pressed = true;
     if (kind === 0x90 || kind === 0x80) { type = 'note'; value = kind === 0x90 ? b / 127 : 0; pressed = kind === 0x90 && b > 0; }
     else if (kind === 0xb0) { type = 'cc'; value = b / 127; pressed = b > 0; }
     else if (kind === 0xe0) { type = 'pitch'; number = 0; value = ((b << 7) | a) / 16383; }
     if (!type) return;
     if (this.editing === 'midi') { if (pressed || type !== 'note') this.assign('midi', { type, channel, number, device: '' }); return; }
+    // Learned shortcuts win; anything else may belong to a built-in controller mapping.
+    const learned = this.list.some(shortcut => shortcut.source === 'midi' && shortcut.input.type === type && shortcut.input.channel === channel && (type === 'pitch' || shortcut.input.number === number) && (!shortcut.input.device || shortcut.input.device === device));
+    if (!learned && this.ctx.onControllerMidi?.(data, device)) return;
     for (const shortcut of this.list) {
       const input = shortcut.input;
       if (shortcut.source !== 'midi' || input.type !== type || input.channel !== channel || (type !== 'pitch' && input.number !== number) || (input.device && input.device !== device)) continue;

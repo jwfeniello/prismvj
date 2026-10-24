@@ -13,6 +13,8 @@ import { animationMenuItems, decorateAnimations, updateAnimationStrips, inOutBar
 import { ShortcutManager } from './ui/shortcuts.js';
 import { registerProjectExtension } from './model.js';
 import { normalizeTrackTriggers, playerFor, clipPosition, trackLabel } from './track-triggers.js';
+import { ControllerManager } from './controllers/manager.js';
+import { writeOwner, denormalizedValue } from './params.js';
 import { normalizeOutputConfig, screenFromComposition } from './output/output-model.js';
 import { evaluateExpression } from './expression.js';
 import { OutputWindows, routedSources } from './output/windows.js';
@@ -84,7 +86,7 @@ const shortcutHolds=new Map();
 let timecode=null,lastTimecodeLabel='';
 // Ableton Link session as last reported by the main process.
 let link={available:false,enabled:false,peers:0,tempo:0,playing:false,receivedAt:0,beat:0,quantum:4},lastLinkTempo=0,lastLinkPlaying=null;
-let shortcuts,thumbnailer=null,lastColumn=-1,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
+let shortcuts,controllers=null,thumbnailer=null,lastColumn=-1,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
 const oscSent=new Map();
 let lastPaint=0,paintFrames=0,paintStart=0,lastActive='';
 const layerPlayheads=new Map(),clipPlayheads=new Map(),queuedSlots=new Map();
@@ -127,9 +129,12 @@ function initialize() {
   shortcuts=new ShortcutManager({getProject:()=>project,toast,runAction,targetFor,actionState,retarget,
     changed:(structural)=>{changed(structural);if(structural&&browserTab==='controls')renderBrowser();else if(!structural)scheduleRefresh();},
     onEditChange:()=>{if(browserTab==='controls')renderBrowser();},onDevicesChange:()=>{if(browserTab==='controls')renderBrowser();},
-    onRawMidi:data=>midiMessage({data}),onClockBPM:bpm=>{project.bpm=bpm;if(document.activeElement!==$('#bpm'))$('#bpm').value=bpm;},onClockStart:()=>transport.resync(now())});
+    onRawMidi:data=>midiMessage({data}),onControllerMidi:(data,device)=>controllers.handle(data,device),onMidiAccess:access=>controllers.attach(access),onClockBPM:bpm=>{project.bpm=bpm;if(document.activeElement!==$('#bpm'))$('#bpm').value=bpm;},onClockStart:()=>transport.resync(now())});
   shortcuts.clock.enabled=preferences.midiClockSync;
-  if(preferences.midiClockSync)shortcuts.enableMidi().catch(()=>{});
+  controllers=createControllers();
+  // The desktop app listens for MIDI from the start, so supported controllers just work when plugged in.
+  if(preferences.midiClockSync||(desktop&&navigator.requestMIDIAccess))shortcuts.enableMidi().catch(()=>{});
+  window.addEventListener('beforeunload',()=>controllers.blank());
   if(preferences.smpteInputDevice)startTimecode();
   setupLink();
   setupProLink();
@@ -422,6 +427,70 @@ function updateLinkButton(){
 }
 // Our tempo edits go to the Link session (not echoes of its own changes).
 function linkTempoChanged(){if(link.enabled&&Math.abs(project.bpm-lastLinkTempo)>0.0001){lastLinkTempo=project.bpm;desktop.linkTempo(project.bpm).catch(()=>{});}}
+// Built-in MIDI controller mappings (Akai APC40 first generation, APC20).
+function controllerSetParam(path,normalized){
+  const target=resolvePath(project,path);
+  if(!target)return;
+  writeOwner(target.scope,target.owner,target.key,denormalizedValue(target.param,normalized));
+  if(target.scope==='composition'||target.scope==='layer'||target.scope==='clip')syncDashboard(target.owner,target.scope,target.key);
+  changed(false);scheduleRefresh();
+}
+function createControllers(){
+  const layerById=layerId=>project.layers.find(layer=>layer.id===layerId);
+  return new ControllerManager({getProject:()=>project,clipsOf:layer=>clipList(layer),layerState:layerId=>transport.getState(layerId),
+    selection:()=>({layerId:selectedLayerId,clipId:selectedClipId}),findClip:clipId=>findClip(clipId)?.clip||null,
+    recording:()=>recorder?.state==='recording',isEnabled:model=>!preferences.controllersDisabled.includes(model),
+    onDevicesChange:()=>{if(browserTab==='controls'){const host=$('#controllers-list');if(host){host.innerHTML=controllersListHTML();bindControllersList();}}},
+    actions:{
+      clip:(layerId,clipId,pressed,inputId)=>runAction(`action/clip/${clipId}`,pressed,inputId),
+      column:(index,pressed,inputId)=>runAction(`action/column/${index}`,pressed,inputId),
+      clearLayer:layerId=>runAction(`action/layer/${layerId}/clear`,true),
+      clearAll:()=>runAction('action/composition/clear',true),
+      selectLayer:layerId=>{if(!layerById(layerId))return;selectedLayerId=layerId;inspectorTab='layer';renderLayers();renderInspector();},
+      selectClip:(layerId,clipId)=>{selectedLayerId=layerId;selectedClipId=clipId;selectedClips.clear();selectedClips.add(clipId);inspectorTab='clip';renderLayers();renderInspector();},
+      selectComposition:()=>{inspectorTab='composition';renderInspector();},
+      setParam:controllerSetParam,
+      adjust:(path,delta)=>{const target=resolvePath(project,path);if(!target)return;const min=target.param.min??0,max=target.param.max??1,current=Number(readOwner(target.scope,target.owner,target.key))||0;controllerSetParam(path,(Math.min(max,Math.max(min,current+delta))-min)/(max-min||1));},
+      setBus:(layerId,bus)=>{const layer=layerById(layerId);if(!layer)return;layer.crossfader=bus;changed();renderLayers();},
+      dashboard:(scope,ownerId,index,value)=>{
+        const owner=scope==='composition'?project:scope==='layer'?layerById(ownerId):findClip(ownerId)?.clip;
+        const dial=owner?.dashboard?.[index];if(!dial)return;
+        if(!moveDashboard(owner,scope,index,value))dial.value=Math.max(0,Math.min(1,value));
+        changed(false);scheduleRefresh();
+      },
+      setPaused:paused=>{if(project.paused===paused)return;project.paused=paused;changed();syncGlobals();},
+      resync:()=>transport.resync(now()),
+      tap:()=>$('#tap').click(),
+      nudgeBpm:delta=>{project.bpm=Math.round(Math.min(300,Math.max(20,project.bpm+delta))*100)/100;if(document.activeElement!==$('#bpm'))$('#bpm').value=project.bpm;linkTempoChanged();changed(false);},
+      toggleRecording:()=>toggleRecording(),
+      toggleBlackout:()=>{project.blackout=!project.blackout;syncGlobals();},
+      stepColumn:step=>stepColumn(step),
+      selectDeck:index=>{const deck=project.decks[index];if(deck)runAction(`action/deck/${deck.id}`,true);},
+    }});
+}
+function controllersListHTML(){
+  const devices=controllers?.status()||[];
+  if(!devices.length)return '<p class="browser-note">Connect an Akai APC40 (first generation) or APC20. It is set up automatically.</p>';
+  return devices.map(device=>`<div class="controller-device" data-controller="${esc(device.key)}"><div class="row"><strong class="grow">${esc(device.name)}</strong><label><input type="checkbox" data-controller-enabled="${esc(device.model)}" ${device.enabled?'checked':''}> On</label></div><div class="muted">${!device.connected?'Input only: no output port found, so the LEDs stay dark.':device.hostMode?'Host mode: PrismVJ lights the pads.':'SysEx unavailable: the controller stays in generic mode.'}</div><div class="row"><span class="grow">Rows: layers ${device.window.top}–${device.window.bottom} · Columns ${device.window.firstColumn}–${device.window.lastColumn}</span><button data-controller-scroll="-1,0" title="Higher layers">▲</button><button data-controller-scroll="1,0" title="Lower layers">▼</button><button data-controller-scroll="0,-1" title="Previous columns">◀</button><button data-controller-scroll="0,1" title="Next columns">▶</button></div></div>`).join('');
+}
+function controllersPanelHTML(){
+  const midiOn=!!shortcuts?.midiAccess;
+  return `<div class="section"><h3>MIDI controllers</h3>${midiOn?'':'<p class="browser-note">MIDI is off. Use <b>Enable MIDI input</b> below.</p>'}<div id="controllers-list">${controllersListHTML()}</div>
+    <details class="controller-help"><summary>APC40 / APC20 controls</summary><table>
+    <tr><td>Clip pads</td><td>The grid mirrors the clip bank: rows are layers (top row = top layer), columns are columns. Amber: clip · green: playing · blinking: queued. Empty pad clears its layer. Shift + pad selects the clip.</td></tr>
+    <tr><td>Clip stop row</td><td>Triggers the column above it.</td></tr>
+    <tr><td>Scene launch</td><td>Clears that row's layer (lit while it plays). Shift + scene 1/2/3/4: scroll up/down/left/right; Shift + scene 5: back to the start.</td></tr>
+    <tr><td>Channel strips</td><td>Strip 1–8 = layer 1–8: fader = opacity, Track select = select, Activator = bypass, Solo = solo, Record arm = crossfader bus none → A (lit) → B (blinking).</td></tr>
+    <tr><td>Master · Stop all</td><td>Master fader: composition opacity · Stop All Clips (APC40): clear everything. On the APC20, Shift sits where Stop All is.</td></tr>
+    <tr><td>APC40 knobs</td><td>Track control: composition dashboard dials. Device control: selected clip's dials (Clip/Track button: selected layer's).</td></tr>
+    <tr><td>APC40 buttons</td><td>Bank arrows scroll rows and columns (Shift: a page). Crossfader. Play/Stop: pause (Shift + Stop: resync). Rec: record. Tap tempo · Nudge ±0.1 BPM (Shift ±1). Cue level: speed. Pan/Send A–C: decks 1–4. MIDI overdub: blackout. Device ◀ ▶: previous/next column.</td></tr>
+    </table></details></div>`;
+}
+function bindControllersList(){
+  for(const input of $$('[data-controller-enabled]'))input.onchange=()=>{const model=input.dataset.controllerEnabled;preferences=writePreferences({...preferences,controllersDisabled:input.checked?preferences.controllersDisabled.filter(item=>item!==model):[...preferences.controllersDisabled,model]});controllers.setEnabled(model,input.checked);renderBrowser();};
+  for(const button of $$('[data-controller-scroll]'))button.onclick=()=>{const row=button.closest('[data-controller]'),device=controllers.devices.get(row?.dataset.controller);if(!device)return;const [layers,columns]=button.dataset.controllerScroll.split(',').map(Number);controllers.scroll(device,layers,columns);};
+}
+function bindControllersPanel(){bindControllersList();}
 // Pro DJ Link: CDJ tempo/beat follow and track triggers ("when this song
 // plays, play this clip in sync"). The main process streams player state at
 // 20 Hz; positions are extrapolated between updates.
@@ -1161,7 +1230,7 @@ function renderBrowser(){
   if(browserTab==='sources')$('#browser').innerHTML=sourcesBrowserHTML();
   if(browserTab==='effects')$('#browser').innerHTML=effectsBrowserHTML();
   if(browserTab==='files'){fileBrowser.render($('#browser'));return;}else fileBrowser.detach();
-  if(browserTab==='controls')$('#browser').innerHTML=shortcuts.panelHTML()+proLinkPanelHTML()+controlExtrasHTML()+`<div class="section"><h3>Performance controls</h3><p class="browser-note">Number keys 1–0 trigger the selected layer; Shift triggers a column. Q–I trigger the top layer; A–K the middle; Z–comma the bottom. Space pauses. Escape clears blackout.</p><button id="enable-midi">${midiAccess?'MIDI connected':'Enable MIDI input'}</button><p id="midi-status" class="browser-note">${midiAccess?[...midiAccess.inputs.values()].map(x=>esc(x.name)).join(', ')||'No MIDI inputs detected':'Connect a controller, then enable MIDI.'}</p></div><div class="section"><h3>MIDI learn</h3><select id="learn-target"><option value="crossfader">Crossfader</option><option value="masterOpacity">Master video</option><option value="masterVolume">Master audio</option>${project.layers.map((l,i)=>`<option value="layer:${l.id}:opacity">${esc(l.name)} video</option>`).join('')}${Array.from({length:project.columns||8},(_,i)=>`<option value="column:${i}">Column ${i+1}</option>`).join('')}</select><button id="midi-learn" class="icon-btn">Learn</button><div id="mappings">${project.mappings.map((m,i)=>`<div class="mapping"><small class="grow">${esc(m.target)} ← ${m.type} ${m.number}</small><button data-unmap="${i}" class="icon-btn">×</button></div>`).join('')}</div></div>${desktop?.startOSC?'<div class="section"><h3>OSC input</h3><div class="row"><input id="osc-port" aria-label="OSC port" type="number" min="1024" max="65535" value="7000" style="width:80px"><button id="osc-start">Start OSC</button><button id="osc-stop">Stop</button></div><p class="browser-note">Local UDP input. /composition/video/fadeout/values, /layer1/audio/pan/values, /layer1/clip1/connect, /layer1/video/opacity/values.</p></div>':''}`;
+  if(browserTab==='controls')$('#browser').innerHTML=shortcuts.panelHTML()+controllersPanelHTML()+proLinkPanelHTML()+controlExtrasHTML()+`<div class="section"><h3>Performance controls</h3><p class="browser-note">Number keys 1–0 trigger the selected layer; Shift triggers a column. Q–I trigger the top layer; A–K the middle; Z–comma the bottom. Space pauses. Escape clears blackout.</p><button id="enable-midi">${midiAccess?'MIDI connected':'Enable MIDI input'}</button><p id="midi-status" class="browser-note">${midiAccess?[...midiAccess.inputs.values()].map(x=>esc(x.name)).join(', ')||'No MIDI inputs detected':'Connect a controller, then enable MIDI.'}</p></div><div class="section"><h3>MIDI learn</h3><select id="learn-target"><option value="crossfader">Crossfader</option><option value="masterOpacity">Master video</option><option value="masterVolume">Master audio</option>${project.layers.map((l,i)=>`<option value="layer:${l.id}:opacity">${esc(l.name)} video</option>`).join('')}${Array.from({length:project.columns||8},(_,i)=>`<option value="column:${i}">Column ${i+1}</option>`).join('')}</select><button id="midi-learn" class="icon-btn">Learn</button><div id="mappings">${project.mappings.map((m,i)=>`<div class="mapping"><small class="grow">${esc(m.target)} ← ${m.type} ${m.number}</small><button data-unmap="${i}" class="icon-btn">×</button></div>`).join('')}</div></div>${desktop?.startOSC?'<div class="section"><h3>OSC input</h3><div class="row"><input id="osc-port" aria-label="OSC port" type="number" min="1024" max="65535" value="7000" style="width:80px"><button id="osc-start">Start OSC</button><button id="osc-stop">Stop</button></div><p class="browser-note">Local UDP input. /composition/video/fadeout/values, /layer1/audio/pan/values, /layer1/clip1/connect, /layer1/video/opacity/values.</p></div>':''}`;
   const sourceExtra=item=>({params:item.dataset.sourceParams?JSON.parse(item.dataset.sourceParams):undefined,name:item.dataset.sourceName});
   for(const item of $$('[data-source]')){item.onpointerenter=()=>{const definition=sourceDefinition(item.dataset.source);if(definition?.glsl)engine.prewarm([definition],{kind:'source',priority:true});};item.onclick=()=>addSource(item.dataset.source,currentLayer(),undefined,sourceExtra(item));item.ondragstart=e=>{e.dataTransfer.setData('application/prism-source',item.dataset.source);e.dataTransfer.setData('application/prism-source-extra',JSON.stringify(sourceExtra(item)));};}
   for(const item of $$('[data-add-effect]')){
@@ -1186,7 +1255,7 @@ function renderBrowser(){
   $('#refresh-devices')?.addEventListener('click',refreshCaptureDevices);
   $('#load-isf-files')?.addEventListener('click',()=>{const input=document.createElement('input');input.type='file';input.accept='.fs,.frag,.glsl';input.multiple=true;input.onchange=async()=>importISFTexts(await Promise.all([...input.files].map(async file=>({name:file.name,text:await file.text()}))));input.click();});
   $('#load-isf-folder')?.addEventListener('click',async()=>{try{const result=await desktop.scanISFFolder();if(result)await importISFTexts(result.files);if(result?.folder&&!preferences.isfFolders.includes(result.folder))preferences=writePreferences({...preferences,isfFolders:[...preferences.isfFolders,result.folder]});}catch(error){toast(`ISF import failed: ${error.message}`,true);}});
-  if(browserTab==='controls'){shortcuts.bindPanel($('#browser'),{prompt:promptText,render:renderBrowser});lastProLinkPanel='';bindProLinkPanel();}
+  if(browserTab==='controls'){shortcuts.bindPanel($('#browser'),{prompt:promptText,render:renderBrowser});lastProLinkPanel='';bindProLinkPanel();bindControllersPanel();}
   $('#import-media')?.addEventListener('click',()=>importFiles());
   for(const item of $$('[data-library]'))item.onclick=()=>placeMedia(mediaLibrary[+item.dataset.library],currentLayer());
   $('#enable-midi')?.addEventListener('click',enableMidi);
@@ -1736,7 +1805,7 @@ function frame(timestamp){
     engine.render(project,frames,t,{beat:transport.beat});
     if(animatedCount&&t-lastAnimationRefresh>1/30){lastAnimationRefresh=t;refreshControls();}
     for(const host of inspectorHosts)if(host.animationStrips?.length)updateAnimationStrips(host,animationContext);
-    if(shortcuts&&t-lastFeedback>.05){lastFeedback=t;shortcuts.syncFeedback();}
+    if(shortcuts&&t-lastFeedback>.05){lastFeedback=t;shortcuts.syncFeedback();controllers?.sync();}
     outputs?.present(t);
     if(outputEditor&&t-(outputEditor.lastUpdate||0)>1/30){outputEditor.lastUpdate=t;outputEditor.update?.($('#output-canvas'),new Map(routedSources(project.advancedOutput).map(source=>[source,engine.readback(source.replace(/^(layer|group):/,''))]).filter(([,frame])=>frame)));}
     if(dmxActive&&project.dmx?.enabled&&t-lastDmx>1/Math.max(1,project.dmx.rate||44)){lastDmx=t;sendDmxFrame();}

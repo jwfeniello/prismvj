@@ -114,7 +114,8 @@ async function setup() {
     // premultiplied composition (`transparent`).
     window.show = async (clip, time, extras = {}, transparent = false) => {
       const frame = { layer, clip, time, position: time / clip.duration, weight: 1, ...extras };
-      for (let attempt = 0; attempt < 400; attempt++) {
+      // Time-based, so a busy machine (parallel test files) still gets the frame.
+      for (const deadline = performance.now() + 15000; performance.now() < deadline;) {
         engine.render(project, [frame], clock += 1 / 60);
         const entry = engine.media.get(clip.id);
         if (entry?.failed) throw new Error(errors.join('\n') || 'Media failed.');

@@ -155,6 +155,8 @@ test('random play mode jumps every interval within the distance, and relative pi
   const project = createProject();
   const deck = project.selectedDeckId, layer = project.layers[0];
   const clip = layer.clips[deck][0];
+  // Random jumps are seeded by the clip id; a fixed id makes them the same on every run.
+  clip.id = 'clip-random-play-test';
   Object.assign(clip, { duration: 10, loop: 'random', randomInterval: 0.5, randomDistance: 1 });
   const transport = new Transport(project);
   transport.trigger(layer.id, clip.id, 0);

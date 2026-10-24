@@ -7,6 +7,7 @@ export function normalizePreferences(value) {
     isfFolders: Array.isArray(value?.isfFolders) ? value.isfFolders.filter(item => typeof item === 'string' && item.length < 4096).slice(0,16) : [],
     oscOutEnabled: value?.oscOutEnabled === true, oscOutHost: typeof value?.oscOutHost === 'string' && /^(\d{1,3}\.){3}\d{1,3}$/.test(value.oscOutHost) ? value.oscOutHost : '127.0.0.1',
     oscOutPort: Number.isInteger(value?.oscOutPort) && value.oscOutPort > 0 && value.oscOutPort < 65536 ? value.oscOutPort : 7001,
+    controllersDisabled: Array.isArray(value?.controllersDisabled) ? value.controllersDisabled.filter(item => typeof item === 'string' && /^[a-z0-9-]{1,32}$/.test(item)).slice(0, 16) : [],
     prolinkNumber: Number.isInteger(value?.prolinkNumber) && value.prolinkNumber >= 1 && value.prolinkNumber <= 15 ? value.prolinkNumber : 5,
     smpteChannel: Number.isInteger(value?.smpteChannel) && value.smpteChannel >= 0 && value.smpteChannel < 8 ? value.smpteChannel : 0,
     smpteFps: ['auto','23.976','24','25','29.97','30'].includes(String(value?.smpteFps)) ? String(value.smpteFps) : 'auto' };
