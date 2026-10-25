@@ -1,0 +1,158 @@
+name: Build
+
+# Every push to main and every pull request runs the tests and builds the
+# Windows zip (kept as a workflow artifact). Pushing a tag such as v0.2.0
+# also publishes that zip on the Releases page. The tag must match the
+# version in package.json.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # native/link/vendor (Ableton Link) carries the license files the release ships.
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Restore Electron download cache
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\electron\Cache
+          key: electron-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-
+
+      - name: Check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match package.json version $version" }
+
+      - uses: ./.github/actions/ffmpeg
+
+      - run: npm ci
+
+      # The WebGL and UI tests use the runner's installed Chrome with SwiftShader.
+      # The step timeouts turn a stuck headless Chrome into a failure instead of a
+      # job that waits out the full hour.
+      - run: npm test
+        timeout-minutes: 15
+
+      - run: npm run test:ui
+        timeout-minutes: 15
+
+      - name: Package
+        run: npm run package
+
+      - name: Check for a signing certificate
+        id: signing
+        env:
+          CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
+        run: '"enabled=$(-not [string]::IsNullOrEmpty($env:CERT))".ToLowerInvariant() >> $env:GITHUB_OUTPUT'
+
+      # Optional. Add a base64-encoded .pfx as the WINDOWS_SIGNING_CERT secret and
+      # its password as WINDOWS_SIGNING_PASSWORD; without them this step is skipped.
+      # Certificates kept on a hardware token or a cloud HSM need their own signing step instead.
+      - name: Sign PrismVJ.exe
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT))
+          try {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $signtool) { throw 'signtool.exe not found' }
+            & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d PrismVJ release\prismvj\PrismVJ-win32-x64\PrismVJ.exe
+            if ($LASTEXITCODE) { throw "signtool failed with exit code $LASTEXITCODE" }
+          } finally {
+            Remove-Item $pfx -Force
+          }
+
+      # Same as the second half of npm run release: FFmpeg, licenses, zip.
+      - name: Bundle
+        run: node scripts/bundle.mjs
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: PrismVJ-win-x64
+          path: release/PrismVJ-*-win-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ startsWith(github.ref, 'refs/tags/v') && 90 || 14 }}
+
+  # The Electron end-to-end tests launch the real app. Several depend on the
+  # network (ISF Library), free Pro DJ Link ports and real window timing, which
+  # hosted runners don't guarantee, so a failure here is reported without
+  # blocking the build or the release.
+  desktop-tests:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Restore Electron download cache
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\electron\Cache
+          key: electron-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-
+
+      - uses: ./.github/actions/ffmpeg
+
+      - run: npm ci
+
+      - run: npm run test:desktop
+        timeout-minutes: 45
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: PrismVJ-win-x64
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            # Tags with a suffix (v0.2.0-beta.1) become pre-releases.
+            flags=()
+            if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" --verify-tag --generate-notes --title "PrismVJ $TAG" "${flags[@]}"
+          fi
+          gh release upload "$TAG" dist/*.zip --clobber

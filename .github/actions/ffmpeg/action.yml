@@ -1,0 +1,48 @@
+name: FFmpeg
+description: Downloads a pinned static FFmpeg GPL build, checks its SHA-256 and sets PRISM_FFMPEG_PATH.
+
+# BtbN keeps daily builds for about two weeks and month-end builds for about
+# two years, so this pins a month-end build. To update, pick a newer month-end
+# autobuild-* release, copy the win64-gpl asset's URL and its sha256 digest.
+inputs:
+  url:
+    description: Download URL of the FFmpeg zip
+    default: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-win64-gpl-9.0.zip
+  sha256:
+    description: SHA-256 of the zip
+    default: a0e45723c72141975f51d8666302e614711745f3102b704ca3f82c897a58d278
+
+runs:
+  using: composite
+  steps:
+    - name: Restore FFmpeg
+      id: cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/ffmpeg
+        key: ffmpeg-${{ inputs.sha256 }}
+
+    - name: Download FFmpeg
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      env:
+        FFMPEG_URL: ${{ inputs.url }}
+        FFMPEG_SHA256: ${{ inputs.sha256 }}
+      run: |
+        $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
+        $dir = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+        Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $zip
+        $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($hash -ne $env:FFMPEG_SHA256) { throw "FFmpeg checksum mismatch: expected $env:FFMPEG_SHA256, got $hash" }
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $dir
+        if ($LASTEXITCODE) { throw "tar failed with exit code $LASTEXITCODE" }
+        Remove-Item $zip
+
+    - name: Use FFmpeg
+      shell: pwsh
+      run: |
+        $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg\*\bin\ffmpeg.exe" | Select-Object -First 1
+        if (-not $exe) { throw 'ffmpeg.exe not found in the extracted build' }
+        & $exe.FullName -hide_banner -version | Select-Object -First 1
+        "PRISM_FFMPEG_PATH=$($exe.FullName)" >> $env:GITHUB_ENV
