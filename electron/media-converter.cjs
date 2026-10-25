@@ -13,6 +13,11 @@ const CACHE_VERSION = 1;
 const THUMBNAIL_TIMEOUT = 20000;
 const MAX_QUEUED_THUMBNAILS = 1000;
 const SEQUENCE_STAT_CONCURRENCY = 32;
+// The keyframe probe reads packet flags from the start of a movie only.
+const KEYFRAME_WINDOW = 20;
+// FFmpeg's reverse filter holds every decoded frame of its input. Longer
+// movies are reversed in segments that fit this budget (at 4 bytes a pixel).
+const REVERSE_MEMORY = 768 * 1024 * 1024;
 
 function abortError(message = 'Media preparation was cancelled.') {
   return Object.assign(new Error(message), { name: 'AbortError' });
@@ -34,6 +39,50 @@ function sourceHasAlpha(stream) {
   const format = String(stream.pix_fmt || '').toLowerCase();
   return /^(rgba|bgra|argb|abgr|yuva|gbrap|ya\d|ayuv|vuya)/.test(format)
     || format === 'pal8' || String(stream.tags?.alpha_mode || '') === '1';
+}
+
+// Browser playback copies: VP9/WebM keeps alpha, H.264/MP4 otherwise.
+function playbackOptions(hasAlpha) {
+  return hasAlpha ? { format: 'webm',
+    video: ['-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-deadline', 'realtime', '-cpu-used', '5',
+      '-row-mt', '1', '-threads', '4', '-crf', '18', '-b:v', '0', '-auto-alt-ref', '0'],
+    audio: ['-c:a', 'libopus', '-b:a', '192k'], container: ['-f', 'webm'] }
+    : { format: 'mp4', video: ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p'],
+      audio: ['-c:a', 'aac', '-b:a', '192k'], container: ['-movflags', '+faststart', '-f', 'mp4'] };
+}
+
+// libvpx is the only FFmpeg VP8/VP9 decoder that reads the WebM alpha side channel.
+function alphaDecoder(stream) {
+  if (String(stream?.tags?.alpha_mode || stream?.tags?.ALPHA_MODE || '') !== '1') return [];
+  return stream.codec_name === 'vp9' ? ['-c:v', 'libvpx-vp9'] : stream.codec_name === 'vp8' ? ['-c:v', 'libvpx'] : [];
+}
+
+const frameRate = value => {
+  const [numerator, denominator = 1] = String(value || '').split('/').map(Number);
+  return numerator > 0 && denominator > 0 ? numerator / denominator : 0;
+};
+
+/**
+ * Longest distance in seconds between keyframes in ffprobe packet lines
+ * ("pts_time,flags"), including the stretch after the last keyframe and
+ * before the first. Null when the lines hold no keyframe.
+ */
+function keyframeSpacing(output) {
+  const keys = [];
+  let first = Infinity, last = -Infinity;
+  for (const line of String(output).split(/\r?\n/)) {
+    const [time, flags = ''] = line.trim().split(',');
+    const seconds = Number(time);
+    if (!time || !Number.isFinite(seconds)) continue;
+    first = Math.min(first, seconds); last = Math.max(last, seconds);
+    if (flags.includes('K')) keys.push(seconds);
+  }
+  if (!keys.length) return null;
+  keys.sort((a, b) => a - b);
+  let interval = Math.max(last - keys[keys.length - 1], keys[0] - first);
+  for (let index = 1; index < keys.length; index++) interval = Math.max(interval, keys[index] - keys[index - 1]);
+  const round = value => Math.round(value * 1000) / 1000;
+  return { interval: round(interval), keyframes: keys.length, window: round(last - first) };
 }
 
 function cacheKey(source, stat) {
@@ -78,9 +127,11 @@ async function discoverExecutable(name, { env = process.env, resourcesPath = '' 
   throw new Error(`MOV and image sequence playback needs FFmpeg and ffprobe. Install FFmpeg or set PRISM_FFMPEG_PATH and PRISM_FFPROBE_PATH to their executables.`);
 }
 
-function createMediaConverter({ cacheDirectory, resourcesPath = '', env = process.env, onProgress = () => {}, thumbnailConcurrency = 2 }) {
+function createMediaConverter({ cacheDirectory, resourcesPath = '', env = process.env, onProgress = () => {}, thumbnailConcurrency = 2, reverseSegmentFrames = 0 }) {
   if (!path.isAbsolute(cacheDirectory)) throw new Error('Media cache must use an absolute directory.');
   const pending = new Map();
+  const reversePending = new Map();
+  const keyframeProbes = new Map();
   const thumbnailPending = new Map();
   const sequencePending = new Map();
   const videoThumbnailPending = new Map();
@@ -104,8 +155,8 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
     try { onProgress(event); } catch {}
     for (const listener of listeners || []) try { listener(event); } catch {}
   };
-  const report = (source, phase, progress = null, error) => {
-    emit({ name: path.basename(source), path: source, phase, progress, ...(error ? { error } : {}) });
+  const report = (source, phase, progress = null, error, kind) => {
+    emit({ name: path.basename(source), path: source, ...(kind ? { kind } : {}), phase, progress, ...(error ? { error } : {}) });
   };
 
   function run(executable, args, { timeout = 30000, onOutput, signal } = {}) {
@@ -321,10 +372,7 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
           : duration > 0 ? Math.min(at, Math.max(0, duration - .05)) : at;
     const alpha = sourceHasAlpha(video);
     const format = alpha ? 'png' : 'jpg';
-    // libvpx is the only FFmpeg VP8/VP9 decoder that reads the WebM alpha side channel.
-    const decoder = String(video.tags?.alpha_mode || '') === '1'
-      ? video.codec_name === 'vp9' ? ['-c:v', 'libvpx-vp9'] : video.codec_name === 'vp8' ? ['-c:v', 'libvpx'] : []
-      : [];
+    const decoder = alphaDecoder(video);
     await fs.mkdir(cacheDirectory, { recursive: true });
     const destination = path.join(cacheDirectory, `${key}.${format}`);
     const temporary = path.join(cacheDirectory, `${key}.${randomUUID()}.part.${format}`);
@@ -381,6 +429,167 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
     videoThumbnailPending.set(key, job);
     try { return await job; } finally { if (videoThumbnailPending.get(key) === job) videoThumbnailPending.delete(key); }
   }
+  // Progress lines from `-progress pipe:1`, as seconds of output written.
+  function progressReader(onSeconds) {
+    let buffer = '';
+    return text => {
+      buffer += text;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop();
+      for (const line of lines) if (line.startsWith('out_time_us=')) {
+        const seconds = Number(line.slice(12)) / 1000000;
+        if (Number.isFinite(seconds)) onSeconds(seconds);
+      }
+    };
+  }
+
+  /**
+   * Writes `source` played backwards (video and first audio track) to
+   * `destination` with a keyframe every 8 frames. FFmpeg's reverse filter
+   * buffers its whole input, so a long constant-rate movie is reversed in
+   * segments, newest first, that are joined without re-encoding; each segment
+   * seeks to an exact frame. `onProgress` receives 0..1 (or null).
+   */
+  async function encodeReverse(source, probe, video, hasAlpha, destination, onProgress = () => {}) {
+    const { ffmpeg, ffprobe } = await tools();
+    const options = playbackOptions(hasAlpha);
+    const decoder = alphaDecoder(video);
+    const hasAudio = !!probe.streams?.some(stream => stream.codec_type === 'audio');
+    const duration = Number(video.duration || probe.format?.duration) || 0;
+    const fps = frameRate(video.avg_frame_rate), nominal = frameRate(video.r_frame_rate);
+    const constant = fps > 0 && nominal > 0 && Math.abs(fps - nominal) / nominal < .001;
+    let frames = Number(video.nb_frames) || 0;
+    if (constant && !frames) {
+      const counted = JSON.parse(await run(ffprobe, ['-v', 'error', '-select_streams', `${video.index}`, '-count_packets',
+        '-show_entries', 'stream=nb_read_packets', '-of', 'json', source], { timeout: 10 * 60 * 1000 }));
+      frames = Number(counted.streams?.[0]?.nb_read_packets) || 0;
+    }
+    const segment = reverseSegmentFrames > 0 ? Math.floor(reverseSegmentFrames)
+      : Math.max(30, Math.min(900, Math.floor(REVERSE_MEMORY / Math.max(1, (video.width || 1920) * (video.height || 1080) * 4))));
+    let lastReportedAt = 0;
+    const progress = (value, force = false) => {
+      if (!force && Date.now() - lastReportedAt < 250) return;
+      lastReportedAt = Date.now();
+      onProgress(value);
+    };
+    if (!constant || !frames || frames <= segment) {
+      await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-nostats', '-n', ...decoder, '-i', source,
+        '-map', `0:${video.index}`, ...(hasAudio ? ['-map', '0:a:0', '-af', 'areverse'] : []), '-map_metadata', '-1',
+        '-vf', 'reverse', ...options.video, '-g', '8', '-fps_mode', 'passthrough',
+        ...(hasAudio ? options.audio : ['-an']), '-progress', 'pipe:1', ...options.container, destination], {
+        timeout: 30 * 60 * 1000,
+        onOutput: progressReader(seconds => progress(duration > 0 ? Math.min(1, seconds / duration) : null)),
+      });
+      return;
+    }
+    // Seeks are relative to the start of the file; the video may start later.
+    const offset = Math.max(0, (Number(video.start_time) || 0) - (Number(probe.format?.start_time) || 0));
+    const work = path.join(cacheDirectory, `${randomUUID()}.reverse-parts`);
+    await fs.mkdir(work, { recursive: true });
+    try {
+      const count = Math.ceil(frames / segment);
+      const parts = [];
+      for (let index = count - 1; index >= 0; index--) {
+        checkOpen();
+        const first = index * segment, length = Math.min(segment, frames - first);
+        const part = path.join(work, `${String(parts.length).padStart(5, '0')}.${options.format}`);
+        // A quarter frame early drops the previous frame and keeps `first`.
+        await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-nostats', '-n', ...decoder,
+          ...(first ? ['-ss', (offset + (first - .25) / fps).toFixed(6)] : []), '-t', ((length + .5) / fps).toFixed(6), '-i', source,
+          '-map', `0:${video.index}`, '-an', '-map_metadata', '-1',
+          '-vf', `trim=end_frame=${length},setpts=PTS-STARTPTS,reverse`, ...options.video, '-g', '8', '-fps_mode', 'passthrough',
+          ...options.container, part], { timeout: 30 * 60 * 1000 });
+        parts.push(part);
+        progress(Math.min(.95, (frames - first) / frames * .95), true);
+      }
+      const list = path.join(work, 'parts.ffconcat');
+      await fs.writeFile(list, `ffconcat version 1.0\n${parts.map(part => `file '${part.replace(/'/g, "'\\''")}'\n`).join('')}`, { flag: 'wx' });
+      await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-nostats', '-n', '-f', 'concat', '-safe', '0', '-i', list,
+        ...(hasAudio ? ['-i', source, '-map', '0:v:0', '-map', '1:a:0', '-af', 'areverse', ...options.audio] : ['-map', '0:v:0', '-an']),
+        '-c:v', 'copy', ...options.container, destination], { timeout: 30 * 60 * 1000 });
+      progress(1, true);
+    } finally { await fs.rm(work, { recursive: true, force: true }).catch(() => {}); }
+  }
+
+  /**
+   * How far apart a movie's keyframes are, from the packet flags in its first
+   * KEYFRAME_WINDOW seconds (nothing is decoded): { interval, keyframes,
+   * window } in seconds, or null without video. Seeking, scrubbing and reverse
+   * playback decode from the previous keyframe, so long intervals stutter.
+   */
+  async function keyframeInterval(source, knownStat) {
+    checkOpen();
+    const absolute = path.resolve(source);
+    const stat = knownStat || await fs.stat(absolute);
+    const key = cacheKey(absolute, stat);
+    if (!keyframeProbes.has(key)) {
+      const job = probeSource(absolute, stat).then(async probe => {
+        const video = probe.streams?.find(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic);
+        if (!video) return null;
+        const { ffprobe } = await tools();
+        return keyframeSpacing(await run(ffprobe, ['-v', 'error', '-select_streams', `${video.index}`, '-read_intervals', `%+${KEYFRAME_WINDOW}`,
+          '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0', absolute], { timeout: THUMBNAIL_TIMEOUT }));
+      });
+      keyframeProbes.set(key, job);
+      job.catch(() => keyframeProbes.delete(key));
+    }
+    return keyframeProbes.get(key);
+  }
+
+  async function makeReverseCopy(source, originalStat, key) {
+    checkOpen();
+    const probe = await probeSource(source, originalStat);
+    const video = probe.streams?.find(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic);
+    if (!video) throw new Error('This file does not contain a video track.');
+    const { format } = playbackOptions(sourceHasAlpha(video));
+    report(source, 'preparing', 0, undefined, 'reverse');
+    await fs.mkdir(cacheDirectory, { recursive: true });
+    const destination = path.join(cacheDirectory, `${key}.reverse-copy.${format}`);
+    const temporary = path.join(cacheDirectory, `${key}.${randomUUID()}.reverse-copy.part.${format}`);
+    try {
+      await encodeReverse(source, probe, video, sourceHasAlpha(video), temporary, fraction => report(source, 'preparing', fraction, undefined, 'reverse'));
+      checkOpen();
+      const sourceStat = await fs.stat(source);
+      if (sourceStat.size !== originalStat.size || sourceStat.mtimeMs !== originalStat.mtimeMs) {
+        throw new Error('The original changed while its reverse copy was made. Import it again after the file finishes copying.');
+      }
+      if (!(await fs.stat(temporary)).size) throw new Error('The reverse encoder produced an empty file.');
+      await fs.rename(temporary, destination);
+      report(source, 'ready', 1, undefined, 'reverse');
+      return destination;
+    } finally { await fs.unlink(temporary).catch(() => {}); }
+  }
+
+  /**
+   * Reverse playback copy of a movie that otherwise plays from its original
+   * file (MP4, WebM, MKV…), so reverse reads a file forwards instead of
+   * seeking back through long GOPs. Returns its path; with `create: false`
+   * only an existing copy is returned (or null). Runs in the conversion queue.
+   */
+  async function reverseCopy(source, knownStat, { create = true } = {}) {
+    checkOpen();
+    const absolute = path.resolve(source);
+    const stat = knownStat || await fs.stat(absolute);
+    if (!stat.isFile()) throw new Error('Media path is not a file.');
+    const key = cacheKey(absolute, stat);
+    for (const format of ['mp4', 'webm']) {
+      const candidate = path.join(cacheDirectory, `${key}.reverse-copy.${format}`);
+      const current = await fs.stat(candidate).catch(() => null);
+      if (current?.isFile() && current.size > 0) return candidate;
+    }
+    if (!create) return null;
+    if (reversePending.has(key)) return reversePending.get(key);
+    report(absolute, 'queued', null, undefined, 'reverse');
+    const job = queue.then(() => makeReverseCopy(absolute, stat, key)).catch(error => {
+      const wrapped = new Error(`Could not make a reverse copy of ${path.basename(absolute)}: ${error.message}`);
+      report(absolute, 'error', null, wrapped.message, 'reverse');
+      throw wrapped;
+    });
+    reversePending.set(key, job);
+    queue = job.catch(() => {});
+    try { return await job; } finally { if (reversePending.get(key) === job) reversePending.delete(key); }
+  }
+
   async function convert(source, originalStat, key) {
     checkOpen();
     let existing = await cached(key);
@@ -394,13 +603,7 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
     const hasAlpha = sourceHasAlpha(video)
       ? video.codec_name === 'dxv' ? await dxvHasTransparency(source, ffmpeg) : true
       : false;
-    const format = hasAlpha ? 'webm' : 'mp4';
-    const videoOptions = hasAlpha
-      ? ['-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-deadline', 'realtime', '-cpu-used', '5',
-        '-row-mt', '1', '-threads', '4', '-crf', '18', '-b:v', '0', '-auto-alt-ref', '0']
-      : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p'];
-    const audioOptions = hasAlpha ? ['-c:a', 'libopus', '-b:a', '192k'] : ['-c:a', 'aac', '-b:a', '192k'];
-    const containerOptions = hasAlpha ? ['-f', 'webm'] : ['-movflags', '+faststart', '-f', 'mp4'];
+    const options = playbackOptions(hasAlpha), { format } = options;
     const duration = Number(video.duration || probe.format?.duration) || 0;
     await fs.mkdir(cacheDirectory, { recursive: true });
     checkOpen();
@@ -426,8 +629,8 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
       if (existing && (existing.hasAlpha !== hasAlpha || existing.format !== format)) existing = null;
       if (!existing) await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-nostats', '-n', '-i', source,
         '-map', `0:${video.index}`, '-map', '0:a:0?', '-map_metadata', '-1',
-        ...videoOptions, '-g', '8', '-fps_mode', 'passthrough',
-        ...audioOptions, '-progress', 'pipe:1', ...containerOptions, temporary], {
+        ...options.video, '-g', '8', '-fps_mode', 'passthrough',
+        ...options.audio, '-progress', 'pipe:1', ...options.container, temporary], {
         timeout: 30 * 60 * 1000,
         onOutput(text) {
           progressBuffer += text;
@@ -447,25 +650,8 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
         },
       });
       if (!existing?.reversePath) {
-        let reverseBuffer = '';
-        await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-nostats', '-n', '-i', source,
-          '-map', `0:${video.index}`, '-map', '0:a:0?', '-map_metadata', '-1',
-          '-vf', 'reverse', '-af', 'areverse', ...videoOptions, '-g', '8', '-fps_mode', 'passthrough',
-          ...audioOptions, '-progress', 'pipe:1', ...containerOptions, reverseTemporary], {
-          timeout: 30 * 60 * 1000,
-          onOutput(text) {
-            reverseBuffer += text;
-            const lines = reverseBuffer.split(/\r?\n/);
-            reverseBuffer = lines.pop();
-            for (const line of lines) if (line.startsWith('out_time_us=')) {
-              const seconds = Number(line.slice(12)) / 1000000;
-              if (Number.isFinite(seconds) && Date.now() - lastReportedAt >= 250) {
-                lastReportedAt = Date.now();
-                report(source, 'preparing', duration > 0 ? Math.min(.95, .45 + seconds / duration * .5) : null);
-              }
-            }
-          },
-        });
+        await encodeReverse(source, probe, video, hasAlpha, reverseTemporary,
+          fraction => report(source, 'preparing', fraction === null ? null : Math.min(.95, .45 + fraction * .5)));
       }
       checkOpen();
       const sourceStat = await fs.stat(source);
@@ -705,11 +891,12 @@ function createMediaConverter({ cacheDirectory, resourcesPath = '', env = proces
     closed = true;
     for (const child of children) child.kill();
     for (const entry of sequencePending.values()) entry.controller.abort();
-    await Promise.allSettled([...pending.values(), ...[...sequencePending.values()].map(entry => entry.job),
+    await Promise.allSettled([...pending.values(), ...reversePending.values(), ...[...sequencePending.values()].map(entry => entry.job),
       ...videoThumbnailPending.values(), ...audioPending.values()]);
   }
 
-  return { prepare, thumbnail, prepareImageSequence, findImageSequence: detectImageSequence, videoThumbnail, gpuCodec, extractAudio, stats, close };
+  return { prepare, thumbnail, prepareImageSequence, findImageSequence: detectImageSequence, videoThumbnail, gpuCodec, extractAudio,
+    keyframeInterval, reverseCopy, stats, close };
 }
 
-module.exports = { createMediaConverter, discoverExecutable, cacheKey, sourceHasAlpha, gpuVideoCodec, findImageSequence, imageSequenceFramePath };
+module.exports = { createMediaConverter, discoverExecutable, cacheKey, sourceHasAlpha, gpuVideoCodec, keyframeSpacing, findImageSequence, imageSequenceFramePath };

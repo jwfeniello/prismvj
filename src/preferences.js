@@ -10,7 +10,9 @@ export function normalizePreferences(value) {
     controllersDisabled: Array.isArray(value?.controllersDisabled) ? value.controllersDisabled.filter(item => typeof item === 'string' && /^[a-z0-9-]{1,32}$/.test(item)).slice(0, 16) : [],
     prolinkNumber: Number.isInteger(value?.prolinkNumber) && value.prolinkNumber >= 1 && value.prolinkNumber <= 15 ? value.prolinkNumber : 5,
     smpteChannel: Number.isInteger(value?.smpteChannel) && value.smpteChannel >= 0 && value.smpteChannel < 8 ? value.smpteChannel : 0,
-    smpteFps: ['auto','23.976','24','25','29.97','30'].includes(String(value?.smpteFps)) ? String(value.smpteFps) : 'auto' };
+    smpteFps: ['auto','23.976','24','25','29.97','30'].includes(String(value?.smpteFps)) ? String(value.smpteFps) : 'auto',
+    // Movies with keyframes over a second apart: ask, always make a reverse copy, or ignore.
+    longGop: ['ask','reverse','ignore'].includes(value?.longGop) ? value.longGop : 'ask' };
 }
 export function readPreferences(storage = localStorage) {
   try { return normalizePreferences(JSON.parse(storage.getItem('prism-preferences')||'null')); }

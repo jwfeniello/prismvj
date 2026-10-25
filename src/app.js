@@ -191,7 +191,7 @@ function showMediaPreparation(item){
   }
   const active=[...mediaPreparations.values()].find(value=>value.phase==='preparing')||mediaPreparations.values().next().value;
   const percent=Number.isFinite(active.progress)?Math.round(Math.max(0,Math.min(1,active.progress))*100):null;
-  const message=`Preparing ${active.name} for playback${percent===null?'…':` · ${percent}%`}${mediaPreparations.size>1?` · ${mediaPreparations.size} files`:''}`;
+  const message=`${active.kind==='reverse'?`Making a reverse copy of ${active.name}`:`Preparing ${active.name} for playback`}${percent===null?'…':` · ${percent}%`}${mediaPreparations.size>1?` · ${mediaPreparations.size} files`:''}`;
   $('span',panel).textContent=message;
   const progress=$('progress',panel);
   if(percent===null)progress.removeAttribute('value');else progress.value=percent/100;
@@ -214,6 +214,7 @@ function preferencesDialog(){
   const labels={clipPanelFollowsTrigger:'Clip panel follows triggered clips',showAudioControls:'Show audio controls',showLayerTransport:'Show transport in each layer',showTransitions:'Show transition controls in each layer',midiClockSync:'Sync BPM to incoming MIDI clock'};
   const deviceSelect=(key,label)=>`<label class="select-field"><span>${label}</span><select data-device-preference="${key}"><option value="">${key==='audioOutputDevice'?'System default':'None'}</option>${preferences[key]?`<option value="${esc(preferences[key])}" selected>Saved device</option>`:''}</select></label>`;
   const dialog=showDialog('Preferences',Object.entries(labels).map(([key,label])=>`<label class="preference-option"><input data-preference="${key}" type="checkbox" ${preferences[key]?'checked':''}>${label}</label>`).join('')
+    +`<h3 style="margin-top:12px">Long keyframe intervals</h3><label class="select-field"><span>When placing a movie</span><select data-text-preference="longGop">${[['ask','Offer HAP or a reverse copy'],['reverse','Always make a reverse copy'],['ignore','Never show the notice']].map(([value,label])=>`<option value="${value}" ${preferences.longGop===value?'selected':''}>${label}</option>`).join('')}</select></label><p class="browser-note">Movies with keyframes over a second apart (typical H.264/H.265 MP4s) stutter in reverse and while scrubbing.</p>`
     +`<h3 style="margin-top:12px">Audio</h3>${deviceSelect('audioOutputDevice','Audio output')}${deviceSelect('audioInputDevice','External FFT input')}<p class="browser-note">The external input drives parameters set to Audio Analysis › external (a DJ feed, band or microphone).</p>`
     +`<h3 style="margin-top:12px">SMPTE timecode (LTC)</h3>${deviceSelect('smpteInputDevice','LTC input')}<label class="select-field"><span>Channel</span><select data-number-preference="smpteChannel">${Array.from({length:8},(_,index)=>`<option value="${index}" ${preferences.smpteChannel===index?'selected':''}>${index+1}</option>`).join('')}</select></label><label class="select-field"><span>Frame rate</span><select data-text-preference="smpteFps">${['auto','23.976','24','25','29.97','30'].map(value=>`<option value="${value}" ${preferences.smpteFps===value?'selected':''}>${value==='auto'?'Detect':value+' fps'}</option>`).join('')}</select></label><p class="browser-note">Clips set to SMPTE transport follow this timecode from their offset.</p>`
     +`<h3 style="margin-top:12px">Pro DJ Link (CDJ / XDJ / DJM)</h3>${[['prolinkEnabled','Connect to Pro DJ Link players'],['prolinkTempo','Follow the master player\'s tempo and beat'],['prolinkOnAir','Track triggers need the channel on air (DJM mixer)']].map(([key,label])=>`<label class="preference-option"><input data-preference="${key}" type="checkbox" ${preferences[key]?'checked':''}>${label}</label>`).join('')}<label class="select-field"><span>Our player number</span><select data-number-preference="prolinkNumber">${Array.from({length:15},(_,index)=>`<option value="${index+1}" ${preferences.prolinkNumber===index+1?'selected':''}>${index+1}</option>`).join('')}</select></label><p class="browser-note">PrismVJ joins the network as a virtual player. Pick a number no real player uses. For track names, use an unused 1–4 (1–6 with CDJ-3000s).</p>`
@@ -1442,8 +1443,51 @@ async function placeMedia(item,layer,index){
     slots[index]=clip;
     if(!mediaLibrary.some(m=>m.path===item.path&&m.url===item.url))mediaLibrary.push(item);
     if(project.selectedDeckId===deckId)selectClip(layer,clip,index);
-    changed();renderAll();requestThumbnails();toast(`Imported ${clip.name}`);return clip;
+    changed();renderAll();requestThumbnails();toast(`Imported ${clip.name}`);noteLongGop(item);return clip;
   }catch(e){engine.remove(clip.id);toast(`Cannot import ${item.name}: ${e.message}`,true);return null;}
+}
+// Movies with keyframes over a second apart (typical H.264/H.265 exports)
+// decode from the previous keyframe on every seek, so reverse playback and
+// scrubbing stutter. Placing one offers HAP or a reverse copy, unless
+// Preferences says to always make the copy or not to ask.
+const LONG_GOP=1,longGopClips=new Map(),longGopSeen=new Set(),reverseCopyJobs=new Map();
+const samePath=(a,b)=>String(a||'').toLowerCase()===String(b||'').toLowerCase();
+function noteLongGop(item){
+  if(!desktop?.makeReverseCopy||!item?.path||!(item.keyframeInterval>LONG_GOP)||item.reverseCopy||preferences.longGop==='ignore'||longGopSeen.has(item.path.toLowerCase()))return;
+  longGopSeen.add(item.path.toLowerCase());
+  if(preferences.longGop==='reverse'){makeReverseCopies([item.path]);return;}
+  longGopClips.set(item.path,item);renderLongGopNotice();
+}
+function renderLongGopNotice(){
+  let notice=$('#long-gop-notice');
+  if(!longGopClips.size){notice?.remove();return;}
+  if(!notice){
+    notice=document.createElement('aside');notice.id='long-gop-notice';notice.className='long-gop-notice';notice.setAttribute('role','status');
+    notice.innerHTML='<button class="long-gop-close" data-gop="dismiss" title="Dismiss" aria-label="Dismiss">×</button><p></p><small>HAP plays smoothly in every direction. A reverse copy keeps this file and fixes reverse playback.</small><div class="long-gop-actions"><button data-gop="hap">Convert to HAP</button><button data-gop="reverse">Make a reverse copy</button></div>';
+    notice.onclick=event=>{
+      const action=event.target.closest('[data-gop]')?.dataset.gop;if(!action)return;
+      const paths=[...longGopClips.keys()];longGopClips.clear();renderLongGopNotice();
+      if(action==='hap')openConverterView(paths,{replace:true});else if(action==='reverse')makeReverseCopies(paths);
+    };
+    document.body.append(notice);
+  }
+  const items=[...longGopClips.values()];
+  $('p',notice).textContent=items.length===1?`${items[0].name} has keyframes ${items[0].keyframeInterval.toFixed(1)} s apart, so reverse playback and scrubbing can stutter.`
+    :`${items.length} clips have keyframes more than ${LONG_GOP} s apart, so reverse playback and scrubbing can stutter.`;
+}
+// Background jobs in the desktop host; clips of that file reverse from the copy once it exists.
+function makeReverseCopies(paths){
+  for(const path of paths){
+    if(reverseCopyJobs.has(path.toLowerCase()))continue;
+    const job=desktop.makeReverseCopy(path).then(item=>{
+      let count=0;
+      for(const layer of project.layers)for(const clips of Object.values(layer.clips))for(const clip of clips)if(clip?.kind==='video'&&samePath(clip.path,path)&&!clip.reverseCopy){clip.reverseCopy=true;count++;}
+      for(const entry of mediaLibrary)if(samePath(entry.path,path))entry.reverseCopy=true;
+      if(count)changed(false);
+      toast(`Reverse copy ready: ${item?.name||path}`);
+    }).catch(error=>toast(error.message,true)).finally(()=>reverseCopyJobs.delete(path.toLowerCase()));
+    reverseCopyJobs.set(path.toLowerCase(),job);
+  }
 }
 
 async function itemFromFile(file){
@@ -1503,14 +1547,15 @@ function applyReconnected(result){
 // Converter (HAP / HAP Alpha / HAP Q), opened over the workspace like Advanced Output.
 let converterView=null;
 const isGpuClip=clip=>/[?&]gpu=/.test(clip?.url||'');
-async function openConverterView(initialPaths=[]){
+// `replace` marks the files as composition clips, so finished conversions replace them.
+async function openConverterView(initialPaths=[],{replace=false}={}){
   if(!desktop?.convertAdd)return toast('The converter needs the desktop app.',true);
-  if(converterView){if(initialPaths.length)converterView.add(initialPaths);return;}
+  if(converterView){if(initialPaths.length)converterView.add(initialPaths,{fromComposition:replace});return;}
   const {openConverter}=await import('./converter/converter.js');
-  if(converterView)return;
+  if(converterView){if(initialPaths.length)converterView.add(initialPaths,{fromComposition:replace});return;}
   const host=document.createElement('div');host.className='converter-overlay';document.body.append(host);
   const escape=event=>{if(event.key==='Escape'&&!event.defaultPrevented&&converterView&&!document.querySelector('dialog[open]'))converterView.close();};
-  converterView=openConverter({host,desktop,toast,initialPaths,
+  converterView=openConverter({host,desktop,toast,initialPaths,initialFromComposition:replace,
     compositionPaths:()=>[...new Set(project.layers.flatMap(layer=>Object.values(layer.clips).flat()).filter(clip=>clip&&clip.kind==='video'&&clip.path&&!isGpuClip(clip)).map(clip=>clip.path))],
     onReplace:(source,output)=>replaceClipMedia(source,output),
     onImport:async output=>{const [item]=await desktop.importPaths([output]);await placeMedia(item,currentLayer());},
@@ -1907,7 +1952,7 @@ window.prismDiagnostics=()=>{
   const frames=transport.tick(now());
   return {project:serializeProject(project),preferences:{...preferences},
     frames:frames.map(frame=>({clipId:frame.clip.id,layerId:frame.layer.id,sourceLayerId:frame.sourceLayerId,voiceId:frame.voiceId,inputId:transport.getState(frame.layer.id)?.inputId,direction:frame.direction,position:frame.position,time:frame.time,weight:frame.weight})),
-    voices:frames.map(frame=>{const voiceId=frame.sourceLayerId!==frame.layer.id?frame.voiceId:undefined;const media=engine.getMedia(frame.clip.id,voiceId),audio=engine.getAudio(frame.clip.id,voiceId);return {clipId:frame.clip.id,layerId:frame.layer.id,voiceId:frame.voiceId,mediaTime:media?.currentTime??null,audioTime:audio?.currentTime??null,mediaPaused:media?.paused??null,audioPaused:audio?.paused??null};}),
+    voices:frames.map(frame=>{const voiceId=frame.sourceLayerId!==frame.layer.id?frame.voiceId:undefined;const media=engine.getMedia(frame.clip.id,voiceId),audio=engine.getAudio(frame.clip.id,voiceId);return {clipId:frame.clip.id,layerId:frame.layer.id,voiceId:frame.voiceId,mediaURL:media?.currentSrc||null,mediaTime:media?.currentTime??null,audioTime:audio?.currentTime??null,mediaPaused:media?.paused??null,audioPaused:audio?.paused??null};}),
     prolink:{running:!!prolinkState.running,joined:!!prolinkState.joined,players:(prolinkState.players||[]).map(player=>({number:player.number,trackId:player.trackId,title:player.track?.title||null,playing:player.playing,position:player.position,master:player.master})),live:[...prolinkLive.entries()].map(([id,entry])=>({id,...entry}))},stats:engine?.getStats?.(),recording:recorder?.state||'inactive',link:{available:link.available,enabled:link.enabled,peers:link.peers,tempo:link.tempo,beat:transport.beat},outputs:outputs?[...outputs.windows.values()].map(entry=>({name:entry.name,width:entry.canvas.width,height:entry.canvas.height})):[]};
 };
 // Renders the composition and every output window once, then samples each

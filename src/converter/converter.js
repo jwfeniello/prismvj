@@ -36,7 +36,7 @@ function wireSettings(settings, presetName) {
   return { ...clone(settings), size, trim: settings.trim.enabled ? { start: settings.trim.start, end: settings.trim.end } : { start: 0, end: 0 }, output: { ...settings.output, label: settings.output.mode === 'subfolder' ? presetName : '' } };
 }
 
-export function openConverter({ host, desktop, storage = localStorage, compositionPaths = () => [], onReplace = () => {}, onImport = null, onClose = () => {}, toast = () => {}, initialPaths = [] }) {
+export function openConverter({ host, desktop, storage = localStorage, compositionPaths = () => [], onReplace = () => {}, onImport = null, onClose = () => {}, toast = () => {}, initialPaths = [], initialFromComposition = false }) {
   const state = {
     tab: 'view', items: [], entries: [], jobs: [], selected: new Set(), selectedEntries: new Set(), selectedJob: null, anchor: null,
     presetName: BUILT_IN[0].name, presets: readPresets(storage), replaced: new Set(), adding: 0, previewFor: null, closed: false,
@@ -55,13 +55,15 @@ export function openConverter({ host, desktop, storage = localStorage, compositi
     return entry.settings.output.mode === 'beside' ? `${baseName(item)} (${FORMAT_LABEL[format]}).mov` : `${baseName(item)}.mov`;
   };
 
-  async function add(promise) {
+  // `fromComposition` marks the files (new or already listed) as composition clips to replace.
+  async function add(promise, { fromComposition = false } = {}) {
     state.adding++; render();
     try {
       const added = await promise;
       const fresh = (added || []).filter(item => !item.error && !state.items.some(existing => existing.source?.path && existing.source.path === item.source?.path));
       const failed = (added || []).filter(item => item.error);
       state.items.push(...fresh);
+      if (fromComposition) for (const item of state.items) if ((added || []).some(entry => !entry.error && entry.source?.path === item.source?.path)) item.fromComposition = true;
       if (failed.length) toast(`${failed.length} file${failed.length === 1 ? '' : 's'} could not be read: ${failed[0].name}: ${failed[0].error}`, true);
       if (fresh.length) { state.selected = new Set(fresh.map(item => item.id)); selectPreview(fresh[0].id); }
       return fresh;
@@ -255,9 +257,7 @@ export function openConverter({ host, desktop, storage = localStorage, compositi
     if (act === 'composition') {
       const paths = compositionPaths();
       if (!paths.length) { toast('This composition has no video files to convert.'); return; }
-      const added = await add(desktop.convertAdd(paths));
-      for (const item of added) item.fromComposition = true;
-      render();
+      await add(desktop.convertAdd(paths), { fromComposition: true });
       return;
     }
     if (act === 'convert') { toConvert([...state.selected]); return; }
@@ -421,6 +421,6 @@ export function openConverter({ host, desktop, storage = localStorage, compositi
 
   render();
   root.focus();
-  if (initialPaths.length) add(desktop.convertAdd(initialPaths));
-  return { close, add: paths => add(desktop.convertAdd(paths)), state };
+  if (initialPaths.length) add(desktop.convertAdd(initialPaths), { fromComposition: initialFromComposition });
+  return { close, add: (paths, options) => add(desktop.convertAdd(paths), options), state };
 }

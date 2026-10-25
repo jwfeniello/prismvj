@@ -165,7 +165,10 @@ function absolutePath(value) {
 const SEQUENCE_FPS = 25;
 const sequenceFps = value => Number.isFinite(value) && value > 0 && value <= 240 ? value : null;
 
-async function registerMedia(filePath, { sequence = null } = {}) {
+// Movies that play from the original file seek back from the previous
+// keyframe on every reverse step; a cached reverse copy replaces that.
+// `inspect` (on import) also reports how far apart the keyframes are.
+async function registerMedia(filePath, { sequence = null, inspect = false } = {}) {
   const absolute = absolutePath(filePath);
   const fps = sequenceFps(sequence);
   const kind = fps ? 'video' : MEDIA.get(path.extname(absolute).toLowerCase());
@@ -183,18 +186,22 @@ async function registerMedia(filePath, { sequence = null } = {}) {
   const prepared = fps ? await converter().prepareImageSequence(absolute, { fps })
     : mov ? await converter().prepare(absolute, stat) : null;
   const playbackPath = prepared?.playbackPath || absolute;
+  const direct = kind === 'video' && !prepared;
+  const reversePath = direct ? await converter().reverseCopy(absolute, stat, { create: false }).catch(() => null) : null;
+  const keyframes = direct && inspect ? await converter().keyframeInterval(absolute, stat).catch(() => null) : null;
+  const asset = prepared ? { playbackPath, reversePath: prepared.reversePath, thumbnailPath: prepared.thumbnailPath }
+    : direct ? { playbackPath, reversePath } : playbackPath;
   // A changed original creates a fresh cache file and URL, leaving any decoder
   // that is still using an older revision undisturbed.
   let token = mediaPaths.get(playbackPath);
   if (!token) {
     token = randomUUID();
-    mediaTokens.set(token, prepared ? { playbackPath, reversePath: prepared.reversePath, thumbnailPath: prepared.thumbnailPath } : playbackPath);
+    mediaTokens.set(token, asset);
     mediaPaths.set(playbackPath, token);
-  } else if (prepared) {
-    mediaTokens.set(token, { playbackPath, reversePath: prepared.reversePath, thumbnailPath: prepared.thumbnailPath });
-  }
+  } else if (prepared || direct) mediaTokens.set(token, asset);
   return { name: fps ? path.basename(path.dirname(absolute)) : path.basename(absolute), path: absolute, kind,
     ...(prepared ? { hasAlpha: prepared.hasAlpha } : {}), ...(fps ? { sequenceFps: fps } : {}),
+    ...(direct ? { reverseCopy: !!reversePath } : {}), ...(keyframes ? { keyframeInterval: keyframes.interval } : {}),
     url: `prism-media://media/${token}/${encodeURIComponent(path.basename(fps ? prepared.playbackPath : absolute))}` };
 }
 
@@ -285,6 +292,7 @@ async function restoreMedia(project) {
       const registered = await registerComponent(item);
       item.media.url = registered.url;
       if (registered.hasAlpha !== undefined) item.media.hasAlpha = registered.hasAlpha;
+      if (item.component === 'video') item.media.reverseCopy = registered.reverseCopy === true;
     }
     catch { item.media.url = ''; missing.push(mediaIdentity(item)); }
   }
@@ -372,6 +380,7 @@ async function reconnectMedia(input, request) {
   const previousPath = item.media.path;
   item.media.path = registered.path; item.media.url = registered.url;
   if (registered.hasAlpha !== undefined) item.media.hasAlpha = registered.hasAlpha;
+  if (item.component === 'video') item.media.reverseCopy = registered.reverseCopy === true;
   return { ...await restoreMedia(restored.project), relinked: [{ ...mediaIdentity(item), previousPath }], ambiguous: [] };
 }
 
@@ -425,6 +434,7 @@ async function relinkProject(input, folder) {
       const previousPath = item.media.path;
       item.media.path = registered.path; item.media.url = registered.url;
       if (registered.hasAlpha !== undefined) item.media.hasAlpha = registered.hasAlpha;
+      if (item.component === 'video') item.media.reverseCopy = registered.reverseCopy === true;
       relinked.push({ ...mediaIdentity(item), previousPath });
     } catch { /* A file removed during scanning remains reported as missing. */ }
   }
@@ -444,7 +454,7 @@ async function importFiles(paths) {
   for (const filePath of paths) {
     try {
       const directory = typeof filePath === 'string' && path.isAbsolute(filePath) && (await fs.stat(filePath).catch(() => null))?.isDirectory();
-      items.push(directory ? await registerSequence(filePath) : await registerMedia(filePath));
+      items.push(directory ? await registerSequence(filePath) : await registerMedia(filePath, { inspect: true }));
     }
     catch (error) { items.push({ name: path.basename(String(filePath)), path: filePath, error: error.message }); }
   }
@@ -687,6 +697,15 @@ function setupIPC() {
   });
   handle('prism:import-paths', importFiles);
   handle('prism:media-thumbnails', mediaThumbnails);
+  // Makes (or reuses) the reverse copy, then re-registers the movie so its
+  // existing URL serves the copy for ?reverse=1.
+  handle('prism:media-reverse-copy', async filePath => {
+    const absolute = absolutePath(filePath);
+    const extension = path.extname(absolute).toLowerCase();
+    if (MEDIA.get(extension) !== 'video' || extension === '.mov') throw new Error('Reverse copies are made for MP4, WebM, MKV, AVI and OGV movies.');
+    await converter().reverseCopy(absolute);
+    return registerMedia(absolute);
+  });
   handle('prism:import-sequence', async (target, fps) => {
     let folder = typeof target === 'string' && target ? target : null;
     if (!folder) {

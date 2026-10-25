@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('desktop', {
   importPaths: paths => ipcRenderer.invoke('prism:import-paths', paths),
   importSequence: (folder, fps) => ipcRenderer.invoke('prism:import-sequence', folder, fps),
   mediaThumbnails: paths => ipcRenderer.invoke('prism:media-thumbnails', paths),
+  makeReverseCopy: path => ipcRenderer.invoke('prism:media-reverse-copy', path),
   onMediaProgress: callback => subscribe('prism:media-progress', callback),
   browseRoots: () => ipcRenderer.invoke('prism:media-roots'),
   browseDirectory: path => ipcRenderer.invoke('prism:media-directory', path),

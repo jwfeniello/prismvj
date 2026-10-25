@@ -130,6 +130,8 @@ export function createClip(kind = 'source', options = {}) {
     // in seconds or beats. Unset keeps the original continuous random scrub.
     // SMPTE transport (Arena, manual p. 60): the clip follows incoming LTC from its offset.
     sequenceFps: typeof input.sequenceFps === 'number' && input.sequenceFps > 0 && input.sequenceFps <= 240 ? input.sequenceFps : null,
+    // The desktop app keeps a reverse playback copy of this movie (set again on every load).
+    reverseCopy: bool(input.reverseCopy),
     smpte: bool(input.smpte), smpteOffset: number(input.smpteOffset, 0, 0, 86400), smpteEnd: choice(input.smpteEnd, ['hold', 'loop', 'stop'], 'hold'),
     randomInterval: input.randomInterval == null ? null : number(input.randomInterval, 1, 0.01, 86400),
     randomDistance: input.randomDistance == null ? null : number(input.randomDistance, 1, 0, 86400),

@@ -14,7 +14,7 @@
     "test:ui": "npm run build && playwright test",
     "package": "npm run build && node scripts/package.mjs",
     "release": "npm run package && node scripts/bundle.mjs",
-    "test:desktop": "npm run build && node --test --test-concurrency=1 tests/startup.test.mjs tests/desktop.test.mjs tests/media-desktop.test.mjs tests/media-converter.test.mjs tests/image-sequence.test.mjs tests/output-desktop.test.mjs tests/features-desktop.test.mjs tests/link-desktop.test.mjs tests/gpu-video-desktop.test.mjs tests/prolink-desktop.test.mjs tests/isf-library-desktop.test.mjs tests/converter-desktop.test.mjs",
+    "test:desktop": "npm run build && node --test --test-concurrency=1 tests/startup.test.mjs tests/desktop.test.mjs tests/media-desktop.test.mjs tests/media-converter.test.mjs tests/keyframes.test.mjs tests/image-sequence.test.mjs tests/output-desktop.test.mjs tests/features-desktop.test.mjs tests/link-desktop.test.mjs tests/gpu-video-desktop.test.mjs tests/prolink-desktop.test.mjs tests/isf-library-desktop.test.mjs tests/converter-desktop.test.mjs tests/long-gop-desktop.test.mjs",
     "test:mov": "npm run build && node scripts/smoke-mov.mjs",
     "test:mov-reverse": "npm run build && node scripts/smoke-reverse-mov.mjs -",
     "test:startup": "node --test tests/startup.test.mjs",
