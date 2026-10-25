@@ -72,7 +72,9 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 
 ## Download
 
-Get `PrismVJ-<version>-win-x64.zip` from the Releases page, extract it anywhere and run `PrismVJ.exe`. FFmpeg is included. Settings and recordings are stored in `%APPDATA%\PrismVJ`.
+Get `PrismVJ-<version>-win-x64.zip` from the [latest release](https://github.com/jwfeniello/prismvj/releases/latest), extract it anywhere and run `PrismVJ.exe`. FFmpeg is included. Settings and recordings are stored in `%APPDATA%\PrismVJ`.
+
+Builds of every commit to `main` are on the [Actions](https://github.com/jwfeniello/prismvj/actions/workflows/build.yml) page: open a run and download the `PrismVJ-win-x64` artifact (you need to be signed in to GitHub).
 
 ## Building from source
 
@@ -89,6 +91,8 @@ npm start
 | `npm run package` | Packaged app in `release/prismvj/PrismVJ-win32-x64` |
 | `npm run release` | Package plus the all-in-one release zip in `release/` (includes FFmpeg from `C:\ffmpeg\bin`, `PATH` or `PRISM_FFMPEG_PATH`) |
 | `npm run build:link` | Rebuild the Ableton Link module (needs Visual Studio C++ build tools and Python) |
+
+GitHub Actions builds the same zip for every push and pull request. Pushing a tag that matches the version in `package.json` (for example `v0.1.0`) publishes it as a release.
 
 ## Keyboard
 
