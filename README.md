@@ -9,6 +9,7 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 ### Playback and media
 - **GPU-decoded HAP and DXV.** Hap, Hap Alpha, Hap Q, Hap Q Alpha, Hap Alpha-Only and DXV3 (normal and high quality, with or without alpha) play from the original file. Compressed DXT/BC textures go straight to the GPU, and reverse, speed changes and scrubbing are instant.
 - **Other formats.** ProRes, Animation and other MOVs are converted through FFmpeg into cached playback copies, keeping alpha and audio. MP4, WebM, animated GIFs, still images and numbered image sequences also play.
+- **Long-GOP movies.** When you place an MP4 or other movie whose keyframes are more than a second apart (typical of H.264 and H.265 exports), PrismVJ offers to convert it to HAP or to make a reverse copy in the background, so reverse playback reads a file built for it instead of seeking back through the keyframes. Preferences can make reverse copies automatically or turn the notice off.
 - **Clip transport:** forward, reverse, pause, loop, ping-pong, random (with interval and distance), play once and eject, play once and hold. Also speed, in/out trimming, six cues, BeatLoopr, and restart or pick-up when you return to a clip.
 - **Timing:** Timeline, BPM Sync and SMPTE timecode transport modes, plus beat snap and quantized triggering.
 - **Audio:** each clip has its own soundtrack with volume and pan. You can pair a separate audio file with any visual, and Linked AV faders move audio and video together.

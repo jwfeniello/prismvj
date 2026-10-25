@@ -9,7 +9,9 @@ import { GpuVideoPlayer } from './gpu-video/player.js';
 import { GpuVideoSurface, GPU_VIDEO_FRAGMENT, GPU_VIDEO_UNIFORMS, gpuVideoFormats } from './gpu-video/gl.js';
 
 const withQuery = (url, query) => `${url}${url.includes('?') ? '&' : '?'}${query}`;
-const reverseMediaURL = clip => clip?.kind === 'video' && /\.mov$/i.test(clip.path || '')
+// Converted MOVs and movies with a reverse copy (clip.reverseCopy) play
+// backwards from a reversed file instead of seeking back frame by frame.
+const reverseMediaURL = clip => clip?.kind === 'video' && (/\.mov$/i.test(clip.path || '') || clip.reverseCopy === true)
   && /^prism-media:/i.test(clip.url || '') ? withQuery(clip.url, 'reverse=1') : null;
 // Desktop registration marks movies whose frames are DXT/BC textures (HAP,
 // DXV) with ?gpu=<codec>. They play from the original file through compressed
