@@ -16,6 +16,7 @@ import { normalizeTrackTriggers, playerFor, clipPosition, trackLabel } from './t
 import { normalizeOutputConfig, screenFromComposition } from './output/output-model.js';
 import { evaluateExpression } from './expression.js';
 import { OutputWindows, routedSources } from './output/windows.js';
+import { connectVideoShare, ShareOutputs } from './output/video-share.js';
 import { Thumbnailer } from './thumbnails.js';
 import { TimecodeInput, clipTimeFromTimecode, parseTimecode, formatTimecode, timecodeToSeconds } from './smpte.js';
 import { normalizeDmxConfig, sampleFixtures, fixtureSampleRect } from './dmx.js';
@@ -84,6 +85,7 @@ const shortcutHolds=new Map();
 let timecode=null,lastTimecodeLabel='';
 // Ableton Link session as last reported by the main process.
 let link={available:false,enabled:false,peers:0,tempo:0,playing:false,receivedAt:0,beat:0,quantum:4},lastLinkTempo=0,lastLinkPlaying=null;
+let videoShare=null,shareOutputs=null,shareSources={spout:[],ndi:[],ndiStatus:null},lastShareScan=0;
 let shortcuts,thumbnailer=null,lastColumn=-1,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
 const oscSent=new Map();
 let lastPaint=0,paintFrames=0,paintStart=0,lastActive='';
@@ -122,6 +124,7 @@ function initialize() {
   }});
   requestThumbnails();
   outputs=new OutputWindows({source:$('#output-canvas'),desktop,engine,onError:message=>toast(message,true),onClosed:()=>{outputOpen=outputs.active;$('#output').classList.toggle('active',outputOpen);}});
+  setupVideoShare();
   desktop?.onDMXInput?.(({universe,data})=>shortcuts.handleDmx(universe,data));
   engine.captureProvider={screen:async params=>{if(desktop?.selectCaptureSource)await desktop.selectCaptureSource(params.device||'');return navigator.mediaDevices.getDisplayMedia({video:true,audio:false});}};
   shortcuts=new ShortcutManager({getProject:()=>project,toast,runAction,targetFor,actionState,retarget,
@@ -383,6 +386,36 @@ async function startTimecode(){
 }
 // Ableton Link (manual: BPM sync with other apps). The main process streams
 // the session; the beat clock follows its phase and tempo changes flow both ways.
+// Spout and NDI® (desktop app). The composition senders follow the Output
+// dialog's switches; Advanced Output screens can also be Spout or NDI senders.
+async function setupVideoShare(){
+  videoShare=await connectVideoShare();
+  if(!videoShare)return;
+  engine.videoShare=videoShare;
+  shareOutputs=new ShareOutputs({share:videoShare,source:$('#output-canvas'),engine,getOptions:()=>outputs.options,onError:message=>toast(message,true)});
+  refreshShareSources();
+  applyCompositionShares();
+  if(browserTab==='sources')renderBrowser();
+}
+function applyCompositionShares(){shareOutputs?.setComposition({spout:preferences.spoutOutput?'PrismVJ':null,ndi:preferences.ndiOutput&&shareSources.ndiStatus?.available?'PrismVJ':null});}
+// Spout senders and NDI sources for the Sources browser. NDI discovery runs in
+// the background, so the list fills in over the first seconds.
+function refreshShareSources(){
+  if(!videoShare)return false;
+  const before=JSON.stringify(shareSources);
+  try{const status=videoShare.status();shareSources={spout:videoShare.spoutSenders(),ndi:status.ndi?.available?videoShare.ndiSources():[],ndiStatus:status.ndi||null};}catch{/* keep the last list */}
+  return JSON.stringify(shareSources)!==before;
+}
+function shareSourcesHTML(){
+  if(!videoShare)return'';
+  const item=(kind,params,name,detail)=>`<div class="browser-item" data-source="${kind}" data-source-params="${esc(JSON.stringify(params))}" data-source-name="${esc(name)}" draggable="true"><span class="pill">${kind==='ndi'?'NDI':'SPT'}</span><strong>${esc(name)}</strong>${detail?`<small>${esc(detail)}</small>`:''}</div>`;
+  const ndi=shareSources.ndiStatus?.available
+    ?shareSources.ndi.map(source=>item('ndi',{source:source.name},source.name,'NDI® source')).join('')||'<p class="browser-note">No NDI® sources found yet.</p>'
+    :'<p class="browser-note">NDI® inputs and outputs need the free NDI Runtime. <button id="get-ndi-runtime" class="icon-btn">Get the NDI® Runtime</button></p>';
+  return shareSources.spout.map(sender=>item('spout',{sender:sender.name},sender.name,`Spout · ${sender.width}×${sender.height}`)).join('')
+    +`<div class="browser-item" data-source="spout" data-source-name="Spout" draggable="true"><span class="pill">SPT</span><strong>Active Spout sender</strong></div>${ndi}<p class="browser-note">NDI® is a registered trademark of Vizrt NDI AB.</p>`;
+}
+
 async function setupLink(){
   if(!desktop?.linkStatus)return;
   const status=await desktop.linkStatus().catch(()=>null);
@@ -1126,15 +1159,16 @@ async function loadISFCollections(){
 }
 function sourcesBrowserHTML(){
   const query=sourceSearch.trim().toLowerCase();
-  const special=['capture','screen','router'];
+  const special=['capture','screen','spout','ndi','router'];
   const items=grouped(listSources().filter(definition=>!special.includes(definition.id)),query).map(([category,list])=>`<details class="browser-group" open><summary>${esc(category)} <span class="muted">${list.length}</span></summary>${list.map(definition=>`<div class="browser-item" data-source="${esc(definition.id)}" draggable="true" title="Drag to a clip slot or click to add to the selected layer"><div class="source-icon clip-art ${esc(definition.id)}"></div><div><strong>${esc(definition.name)}</strong><small>${esc(definition.description||definition.category)}</small></div><span class="spacer"></span><span class="muted">＋</span></div>`).join('')}</details>`).join('');
   const live=`<details class="browser-group" open><summary>Live inputs &amp; routing</summary>
     ${captureDevices.map(device=>`<div class="browser-item" data-source="capture" data-source-params="${esc(JSON.stringify({device:device.deviceId}))}" data-source-name="${esc(device.label||'Camera')}" draggable="true"><span class="pill">CAM</span><strong>${esc(device.label||'Capture device')}</strong></div>`).join('')}
     <div class="browser-item" data-source="capture" data-source-name="Capture device" draggable="true"><span class="pill">CAM</span><strong>Default capture device</strong></div>
     <div class="browser-item" data-source="screen" data-source-name="Screen capture" draggable="true"><span class="pill">SCR</span><strong>Screen capture</strong></div>
+    ${shareSourcesHTML()}
     <div class="browser-item" data-source="router" data-source-name="Video Router" draggable="true"><span class="pill">RT</span><strong>Video Router</strong><small>Layers below, or a chosen layer/group</small></div>
     <div class="browser-item" data-source="effect-clip" data-source-name="Effect clip" draggable="true"><span class="pill">FX</span><strong>Effect clip</strong><small>Adjustment layer for effects</small></div>
-    <button id="refresh-devices" class="icon-btn">Find capture devices</button></details>`;
+    <button id="refresh-devices" class="icon-btn">${videoShare?'Find capture devices and senders':'Find capture devices'}</button></details>`;
   return `<div class="browser-tools"><input id="source-search" type="search" placeholder="Search sources" value="${esc(sourceSearch)}" aria-label="Search sources"></div><div class="browser-note">Drag a source into a clip slot, or click to add it to the selected layer.</div>${live}${items}`;
 }
 async function importISFTexts(files,{quiet=false}={}){
@@ -1149,6 +1183,7 @@ async function importISFTexts(files,{quiet=false}={}){
   return added;
 }
 async function refreshCaptureDevices(){
+  refreshShareSources();
   try{
     if(!navigator.mediaDevices?.enumerateDevices)throw new Error('Capture devices are unavailable here.');
     let devices=(await navigator.mediaDevices.enumerateDevices()).filter(device=>device.kind==='videoinput');
@@ -1184,6 +1219,7 @@ function renderBrowser(){
   for(const button of $$('[data-isf-open]'))button.onclick=()=>desktop?.openISFPage?.(button.dataset.isfOpen);
   for(const button of $$('[data-isf-remove]'))button.onclick=()=>isfRemove(button.dataset.isfRemove);
   $('#refresh-devices')?.addEventListener('click',refreshCaptureDevices);
+  $('#get-ndi-runtime')?.addEventListener('click',()=>videoShare?.openNdiRuntimePage());
   $('#load-isf-files')?.addEventListener('click',()=>{const input=document.createElement('input');input.type='file';input.accept='.fs,.frag,.glsl';input.multiple=true;input.onchange=async()=>importISFTexts(await Promise.all([...input.files].map(async file=>({name:file.name,text:await file.text()}))));input.click();});
   $('#load-isf-folder')?.addEventListener('click',async()=>{try{const result=await desktop.scanISFFolder();if(result)await importISFTexts(result.files);if(result?.folder&&!preferences.isfFolders.includes(result.folder))preferences=writePreferences({...preferences,isfFolders:[...preferences.isfFolders,result.folder]});}catch(error){toast(`ISF import failed: ${error.message}`,true);}});
   if(browserTab==='controls'){shortcuts.bindPanel($('#browser'),{prompt:promptText,render:renderBrowser});lastProLinkPanel='';bindProLinkPanel();}
@@ -1581,11 +1617,15 @@ async function toggleRecording(){
 }
 
 async function openOutput(){
-  if(outputs.active||outputOpen){outputs.closeAll();if(desktop?.closeOutput)await desktop.closeOutput().catch(()=>{});outputOpen=false;$('#output').classList.remove('active');toast('Outputs closed.');return;}
+  if(outputs.active||outputOpen){outputs.closeAll();shareOutputs?.sync(null);if(desktop?.closeOutput)await desktop.closeOutput().catch(()=>{});outputOpen=false;$('#output').classList.remove('active');toast('Outputs closed.');return;}
   displaysCache=desktop?await desktop.getDisplays():[];
-  const configured=project.advancedOutput?.screens?.some(screen=>screen.enabled!==false&&screen.device?.type==='display');
-  const body=`<p>Send the composition to a display. Escape in an output window leaves fullscreen.</p>${displaysCache.length?`<div class="select-field"><label>Display</label><select id="display-choice">${displaysCache.map(d=>`<option value="${d.id}">${esc(d.label)} · ${d.width} × ${d.height}</option>`).join('')}</select></div>`:'<p class="browser-note">In the browser, the output opens in a new window you can drag to another display.</p>'}${configured?'<p class="browser-note">This composition has an Advanced Output setup. “Open Advanced Output screens” uses its screens and slices.</p>':''}`;
+  const configured=project.advancedOutput?.screens?.some(screen=>screen.enabled!==false&&['display','spout','ndi'].includes(screen.device?.type));
+  const ndiReady=!!shareSources.ndiStatus?.available;
+  const shares=videoShare?`<h3 style="margin-top:12px">Share with other apps</h3><label class="preference-option"><input type="checkbox" id="share-spout" ${preferences.spoutOutput?'checked':''}> Spout sender “PrismVJ”</label><label class="preference-option"><input type="checkbox" id="share-ndi" ${preferences.ndiOutput&&ndiReady?'checked':''} ${ndiReady?'':'disabled'}> NDI® source “PrismVJ”</label>${ndiReady?'':'<p class="browser-note">NDI® output needs the free NDI Runtime. <button id="dialog-get-ndi" class="icon-btn">Get the NDI® Runtime</button></p>'}<p class="browser-note">These send the composition and stay on until switched off. Advanced Output screens can also be Spout or NDI® senders.</p>`:'';
+  const body=`<p>Send the composition to a display. Escape in an output window leaves fullscreen.</p>${displaysCache.length?`<div class="select-field"><label>Display</label><select id="display-choice">${displaysCache.map(d=>`<option value="${d.id}">${esc(d.label)} · ${d.width} × ${d.height}</option>`).join('')}</select></div>`:'<p class="browser-note">In the browser, the output opens in a new window you can drag to another display.</p>'}${configured?'<p class="browser-note">This composition has an Advanced Output setup. “Open Advanced Output screens” uses its screens and slices.</p>':''}${shares}`;
   const dialog=showDialog('Output',body,[['Cancel','cancel'],['Advanced Output…','advanced'],...(configured?[['Open Advanced Output screens','configured']]:[]),['Open output','open']]);
+  for(const [selector,key] of [['#share-spout','spoutOutput'],['#share-ndi','ndiOutput']])$(selector,dialog)?.addEventListener('change',event=>{preferences=writePreferences({...preferences,[key]:event.target.checked});applyCompositionShares();});
+  $('#dialog-get-ndi',dialog)?.addEventListener('click',()=>videoShare?.openNdiRuntimePage());
   dialog.addEventListener('close',async()=>{
     const action=dialog.returnValue;
     if(action==='advanced')return openOutputEditor();
@@ -1597,9 +1637,9 @@ async function openOutput(){
       const display=displaysCache.find(item=>String(item.id)===String($('#display-choice',dialog)?.value));
       config={version:1,screens:[{...screen,name:display?.label||'Output',device:display?{type:'display',displayId:String(display.id),width:project.width,height:project.height}:{...screen.device}}]};
     }
-    const opened=outputs.sync(config,{displays:displaysCache});
-    if(!opened&&desktop?.openOutput){await desktop.openOutput(Number($('#display-choice',dialog)?.value));toast('Using the compatibility output window.');}
-    outputOpen=opened>0||!!desktop?.openOutput;$('#output').classList.toggle('active',outputOpen);
+    const opened=outputs.sync(config,{displays:displaysCache}),shared=shareOutputs?.sync(config)||0;
+    if(!opened&&!shared&&desktop?.openOutput){await desktop.openOutput(Number($('#display-choice',dialog)?.value));toast('Using the compatibility output window.');}
+    outputOpen=opened>0||shared>0||!!desktop?.openOutput;$('#output').classList.toggle('active',outputOpen);
   });
 }
 async function openOutputEditor(){
@@ -1613,7 +1653,8 @@ async function openOutputEditor(){
     displays:displaysCache.map(item=>({id:String(item.id),label:item.label,width:item.width,height:item.height})),
     layers:project.layers.map(layer=>({id:layer.id,name:layer.name})),groups:(project.groups||[]).map(group=>({id:group.id,name:group.name})),
     outputOptions:outputs.options,onOutputOptions:options=>outputs.setOptions(options),
-    onChange:next=>{project.advancedOutput=next;changed();if(outputs.active)outputs.sync(next,{displays:displaysCache});else engine.setReadbacks(routedSources(next).map(source=>source.replace(/^(layer|group):/,'')));},
+    shareKinds:videoShare?['spout','ndi']:[],
+    onChange:next=>{project.advancedOutput=next;changed();if(outputOpen)shareOutputs?.sync(next);if(outputs.active)outputs.sync(next,{displays:displaysCache});else engine.setReadbacks(routedSources(next).map(source=>source.replace(/^(layer|group):/,'')));},
     onClose:()=>{if(!outputs.active)engine.setReadbacks([]);done();}});
   engine.setReadbacks(routedSources(config).map(source=>source.replace(/^(layer|group):/,'')));
   const escape=event=>{if(event.key==='Escape'&&!event.defaultPrevented&&outputEditor&&!$('dialog[open]')){document.removeEventListener('keydown',escape);done();}};
@@ -1738,6 +1779,8 @@ function frame(timestamp){
     for(const host of inspectorHosts)if(host.animationStrips?.length)updateAnimationStrips(host,animationContext);
     if(shortcuts&&t-lastFeedback>.05){lastFeedback=t;shortcuts.syncFeedback();}
     outputs?.present(t);
+    shareOutputs?.present(t);
+    if(videoShare&&browserTab==='sources'&&t-lastShareScan>3){lastShareScan=t;if(refreshShareSources()&&!$('#browser').contains(document.activeElement))renderBrowser();}
     if(outputEditor&&t-(outputEditor.lastUpdate||0)>1/30){outputEditor.lastUpdate=t;outputEditor.update?.($('#output-canvas'),new Map(routedSources(project.advancedOutput).map(source=>[source,engine.readback(source.replace(/^(layer|group):/,''))]).filter(([,frame])=>frame)));}
     if(dmxActive&&project.dmx?.enabled&&t-lastDmx>1/Math.max(1,project.dmx.rate||44)){lastDmx=t;sendDmxFrame();}
     if(preferences.oscOutEnabled&&desktop?.sendOSC&&t-lastOscOut>.05){lastOscOut=t;sendOSCFeedback();}if(preview){preview.project.bpm=project.bpm;preview.project.width=project.width;preview.project.height=project.height;preview.engine.render(preview.project,preview.transport.tick(t).map(f=>({...f,clip:{...f.clip,opacity:1,volume:0}})),t);}
@@ -1841,6 +1884,9 @@ window.prismDiagnostics=()=>{
     voices:frames.map(frame=>{const voiceId=frame.sourceLayerId!==frame.layer.id?frame.voiceId:undefined;const media=engine.getMedia(frame.clip.id,voiceId),audio=engine.getAudio(frame.clip.id,voiceId);return {clipId:frame.clip.id,layerId:frame.layer.id,voiceId:frame.voiceId,mediaTime:media?.currentTime??null,audioTime:audio?.currentTime??null,mediaPaused:media?.paused??null,audioPaused:audio?.paused??null};}),
     prolink:{running:!!prolinkState.running,joined:!!prolinkState.joined,players:(prolinkState.players||[]).map(player=>({number:player.number,trackId:player.trackId,title:player.track?.title||null,playing:player.playing,position:player.position,master:player.master})),live:[...prolinkLive.entries()].map(([id,entry])=>({id,...entry}))},stats:engine?.getStats?.(),recording:recorder?.state||'inactive',link:{available:link.available,enabled:link.enabled,peers:link.peers,tempo:link.tempo,beat:transport.beat},outputs:outputs?[...outputs.windows.values()].map(entry=>({name:entry.name,width:entry.canvas.width,height:entry.canvas.height})):[]};
 };
+// Spout/NDI senders and receivers with their frame counts and timings.
+window.prismVideoShare=()=>({available:!!videoShare,status:videoShare?.status()||null,outputs:shareOutputs?.stats()||[],
+  inputs:[...(engine?.media?.values()||[])].filter(entry=>entry.kind==='share'&&entry.element.handle).map(entry=>({name:entry.name,sequence:entry.element.handle.sequence,uploaded:entry.sequence,uploadMs:entry.uploadMs,width:entry.width||0,height:entry.height||0,info:entry.element.handle.info()}))});
 // Renders the composition and every output window once, then samples each
 // at its centre (for automated output checks).
 window.prismOutputProbe=()=>{

@@ -1,6 +1,6 @@
 # PrismVJ
 
-PrismVJ is a free, open-source alternative to Resolume™ Arena for live video performance on Windows. It does as much as possible on the GPU: HAP and DXV movies decode straight to textures, and mixing, effects and projection mapping run in WebGL2 shaders. It plays along with CDJs over Pro DJ Link, runs thousands of community shaders from the ISF library, and has Ableton Link, DMX (Art-Net and sACN), MIDI, OSC and SMPTE timecode.
+PrismVJ is a free, open-source alternative to Resolume™ Arena for live video performance on Windows. It does as much as possible on the GPU: HAP and DXV movies decode straight to textures, and mixing, effects and projection mapping run in WebGL2 shaders. It plays along with CDJs over Pro DJ Link, runs thousands of community shaders from the ISF library, shares video with other apps over Spout and NDI®, and has Ableton Link, DMX (Art-Net and sACN), MIDI, OSC and SMPTE timecode.
 
 ![PrismVJ main window](docs/screenshots/main.png)
 
@@ -38,7 +38,7 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 - **19 audio effects:** EQ, filters, delay, reverb, distortion, compressor, limiter, chorus, phaser, flanger, auto pan and more.
 - **40 generators:** shapes, patterns, fractals, particles, lasers, audio spectrum and waveform, colour bars and a test card.
 - **Text Animator** with per-character animation.
-- **Live inputs** from capture devices and screen capture.
+- **Live inputs** from capture devices, screen capture, Spout senders and NDI® sources. The Sources browser lists the Spout senders and NDI sources it finds.
 - **ISF Library**: search, preview and install over 10,000 effects, generators and transitions from [editor.isf.video](https://editor.isf.video/shaders) straight from the effects browser. Installed shaders load every time PrismVJ starts.
 - **Full ISF support**: multi-pass, persistent and float buffers, custom pass sizes, vertex shaders, audio waveform and FFT inputs, extra image inputs, imported images and transitions, which work as layer blend modes, clip transitions and crossfader mixes. Shaders also import from `.fs` files and folders.
 
@@ -55,6 +55,14 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 - Soft-edge blending with gamma, power and luminance.
 - Per-slice colour correction, a test card, identify, output delay, and presets.
 - Output windows get the composition from the GPU every frame.
+- A screen can also be a Spout sender or an NDI® source, with its own name and resolution.
+
+### Sharing video with other apps
+- **Spout output:** the composition goes out as the Spout sender "PrismVJ", for TouchDesigner, Resolume, OBS and other Spout apps on the same computer.
+- **NDI® output:** the composition goes out as the NDI source "PrismVJ" on the network.
+- **Spout and NDI inputs:** any Spout sender or NDI source plays in a clip slot like a camera.
+- Switch the composition senders on in the Output dialog. They stay on until you switch them off.
+- NDI needs the free NDI Runtime from [ndi.video](https://ndi.video/) (PrismVJ offers the download link when it is missing). Spout needs nothing extra.
 
 ![Advanced Output](docs/screenshots/advanced-output.png)
 
@@ -71,7 +79,7 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 
 ## Download
 
-Get `PrismVJ-<version>-win-x64.zip` from the Releases page, extract it anywhere and run `PrismVJ.exe`. FFmpeg is included. Settings and recordings are stored in `%APPDATA%\PrismVJ`.
+Get `PrismVJ-<version>-win-x64.zip` from the Releases page, extract it anywhere and run `PrismVJ.exe`. FFmpeg is included. Settings and recordings are stored in `%APPDATA%\PrismVJ`. For NDI, also install the [NDI Runtime](https://ndi.link/NDIRedistV6).
 
 ## Building from source
 
@@ -88,6 +96,7 @@ npm start
 | `npm run package` | Packaged app in `release/prismvj/PrismVJ-win32-x64` |
 | `npm run release` | Package plus the all-in-one release zip in `release/` (includes FFmpeg from `C:\ffmpeg\bin`, `PATH` or `PRISM_FFMPEG_PATH`) |
 | `npm run build:link` | Rebuild the Ableton Link module (needs Visual Studio C++ build tools and Python) |
+| `npm run build:video` | Rebuild the Spout and NDI module (same requirements) |
 
 ## Keyboard
 
@@ -116,6 +125,6 @@ PrismVJ is free software released under the [GNU General Public License v3.0 or 
 
 ## Third-party software
 
-PrismVJ includes [Ableton Link](https://github.com/Ableton/link) (GPLv2+), [Electron](https://www.electronjs.org/) (MIT) and, in release builds, [FFmpeg](https://ffmpeg.org/) (GPL). The Pro DJ Link support is based on Deep Symmetry's [dysentery](https://github.com/Deep-Symmetry/dysentery) protocol analysis and [prolink-connect](https://github.com/evanpurkhiser/prolink-connect) (MIT). Shaders from editor.isf.video belong to their authors. The licenses are in the `licenses` folder of each release.
+PrismVJ includes [Ableton Link](https://github.com/Ableton/link) (GPLv2+), [Electron](https://www.electronjs.org/) (MIT), [Spout](https://spout.zeal.co/)'s SpoutDX (BSD 2-Clause), the NDI® SDK headers (MIT) and, in release builds, [FFmpeg](https://ffmpeg.org/) (GPL). The NDI runtime is not included: PrismVJ loads the NDI Runtime you install from NDI. NDI® is a registered trademark of Vizrt NDI AB. The Pro DJ Link support is based on Deep Symmetry's [dysentery](https://github.com/Deep-Symmetry/dysentery) protocol analysis and [prolink-connect](https://github.com/evanpurkhiser/prolink-connect) (MIT). Shaders from editor.isf.video belong to their authors. The licenses are in the `licenses` folder of each release.
 
 Resolume is a trademark of Resolume BV. PrismVJ is not affiliated with or endorsed by Resolume.

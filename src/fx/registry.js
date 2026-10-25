@@ -69,6 +69,14 @@ export const SPECIAL_SOURCES = Object.freeze([
     { key: 'device', label: 'Screen or window', type: 'text', default: '' },
     { key: 'cursor', label: 'Show cursor', type: 'bool', default: true },
   ] },
+  // Frames from other applications (desktop app). An empty sender follows
+  // Spout's active sender; NDI sources are named "MACHINE (Source)".
+  { id: 'spout', name: 'Spout', category: 'Live', kind: 'spout', params: [
+    { key: 'sender', label: 'Sender', type: 'text', default: '' },
+  ] },
+  { id: 'ndi', name: 'NDI®', category: 'Live', kind: 'ndi', params: [
+    { key: 'source', label: 'Source', type: 'text', default: '' },
+  ] },
   { id: 'router', name: 'Video Router', category: 'Routing', kind: 'router', params: [
     { key: 'input', label: 'Input', type: 'text', default: 'below' },
     { key: 'inputOpacity', label: 'Input opacity', type: 'bool', default: true },

@@ -179,14 +179,38 @@ const busOf = value => value === 'A' || value === 'a' ? 'A' : value === 'B' || v
 const groupGain = (group, fader, curve = 'overlap') => crossfadeGain(busOf(group), fader, curve);
 // Older projects and direct callers store a single `amount` instead of params.
 const effectParams = effect => effect.params || (effect.amount !== undefined ? { amount: effect.amount } : {});
-// Capture devices and screen capture behave like video media without a file.
-const liveSource = clip => clip?.kind === 'source' && ['capture', 'screen'].includes(sourceDefinition(clip.source)?.kind);
+// Capture devices, screen capture, Spout and NDI behave like video media without a file.
+const shareSource = clip => clip?.kind === 'source' && ['spout', 'ndi'].includes(sourceDefinition(clip.source)?.kind);
+const liveSource = clip => shareSource(clip) || (clip?.kind === 'source' && ['capture', 'screen'].includes(sourceDefinition(clip.source)?.kind));
 const hasMedia = clip => (clip.kind !== 'source' && clip.kind !== 'effect') || liveSource(clip);
-const mediaURL = clip => liveSource(clip)
+const mediaURL = clip => shareSource(clip) ? `share:${clip.source}:${clip.params?.sender || clip.params?.source || ''}` : liveSource(clip)
   ? `capture:${clip.source}:${clip.params?.device || ''}:${clip.params?.width || 1280}x${clip.params?.height || 720}:${clip.params?.cursor !== false}` : clip.url || clip.path;
 const LOG_BINS = 64;
 const auxiliaryId = (role, ownerId) => JSON.stringify([role, ownerId]);
 const voiceMediaId = (clipId, voiceId) => voiceId && voiceId !== clipId ? auxiliaryId('voice', voiceId) : clipId;
+
+// Stands in for a <video> element for Spout/NDI entries. The receiver runs
+// while the clip plays and for a few seconds after, so a quick re-trigger
+// shows frames at once.
+class ShareElement {
+  constructor(open, onError) { Object.assign(this, { open, onError, handle: null, idle: null, videoWidth: 0, videoHeight: 0, currentTime: 0, readyState: 4, paused: true, muted: true, seeking: false, duration: Infinity }); }
+  play() {
+    clearTimeout(this.idle); this.idle = null;
+    this.paused = false;
+    if (!this.handle) try { this.handle = this.open(); } catch (error) { this.onError(error); }
+    return Promise.resolve();
+  }
+  pause() {
+    this.paused = true;
+    if (this.handle && !this.idle) this.idle = setTimeout(() => { this.idle = null; if (this.paused) this.close(); }, 3000);
+  }
+  close() { clearTimeout(this.idle); this.idle = null; this.handle?.close(); this.handle = null; }
+  set srcObject(_value) {}
+  removeEventListener() {}
+  removeAttribute() {}
+  load() {}
+  getVideoPlaybackQuality() { return { droppedVideoFrames: 0 }; }
+}
 
 // A camera looking at the composition center with a 60 degree vertical field
 // of view. Invert the projected plane so every fragment samples the actual
@@ -515,7 +539,7 @@ export class LiveEngine {
     // Decode both tracks independently. The audio defines the shared timeline;
     // the video's native duration is retained for stretching it onto that clock.
     const mainAsset = gpuCodec(clip) && !gpu ? { ...clip, url: this._mediaURL(clip), loadTimeout: CONVERTED_TIMEOUT } : audioAsset ? { ...clip } : clip;
-    const main = liveSource(clip) ? this._prepareCapture(clip, mediaId) : !hasMedia(clip) ? Promise.resolve(null)
+    const main = shareSource(clip) ? this._prepareShare(clip, mediaId) : liveSource(clip) ? this._prepareCapture(clip, mediaId) : !hasMedia(clip) ? Promise.resolve(null)
       : gpu ? this._prepareGpu(clip, mediaId) : this._prepareMedia(mainAsset, mediaId, 'main', clip.id, mediaId);
     const paired = audioAsset ? this._prepareMedia({ ...audioAsset, kind: 'audio', name: audioAsset.name || `${clip.name || 'Clip'} audio` }, pairId, 'audio', clip.id, mediaId) : Promise.resolve(null);
     const reversed = reversedURL ? this._prepareMedia({ ...mainAsset, url: reversedURL }, reverseId, 'reverse', clip.id, mediaId) : Promise.resolve(null);
@@ -576,6 +600,55 @@ export class LiveEngine {
     return entry.promise;
   }
 
+  // Spout / NDI receivers (output/video-share.js, set as this.videoShare by the
+  // app). Frames arrive bottom row first and upload as they change.
+  _prepareShare(clip, key) {
+    const url = mediaURL(clip), previous = this.media.get(key);
+    if (previous && previous.url === url) { previous.lastUsed = ++this.mediaClock; return previous.promise; }
+    if (previous) this._removeMedia(key);
+    const kind = sourceDefinition(clip.source).kind, name = String(kind === 'spout' ? clip.params?.sender || '' : clip.params?.source || '');
+    const entry = { id: key, ownerId: clip.id, cacheGroup: key, role: 'main', name: clip.name || name || kind, kind: 'share', live: true, url, texture: null,
+      ready: false, failed: false, dirty: true, hasAlpha: true, alphaKnown: true, handle: null, sequence: 0, uploadMs: 0, gain: 0, active: false, cancel: null, lastUsed: ++this.mediaClock };
+    const fail = error => { entry.failed = true; this._error(`media-${key}`, `Cannot open ${entry.name}: ${error.message}`); };
+    const element = entry.element = new ShareElement(() => this.videoShare.input(kind, name), fail);
+    this.media.set(key, entry);
+    try {
+      if (!this.videoShare) throw new Error(`${kind === 'ndi' ? 'NDI®' : 'Spout'} needs the desktop app.`);
+      if (kind === 'ndi' && !name) throw new Error('Choose an NDI® source.');
+      entry.cancel = () => element.close();
+      entry.ready = true;
+      entry.promise = Promise.resolve(element);
+    } catch (error) {
+      fail(error);
+      entry.promise = Promise.reject(error);
+    }
+    return entry.promise;
+  }
+
+  _uploadShare(entry) {
+    const handle = entry.element.handle, frame = handle?.latest;
+    if (!frame) return entry.texture;
+    if (entry.handle !== handle) { entry.handle = handle; entry.sequence = -1; }
+    if (entry.sequence === handle.sequence && entry.texture) return entry.texture;
+    const started = performance.now();
+    const gl = this.gl, pixels = new Uint8Array(frame.buffer, 0, frame.width*frame.height*4);
+    if (!entry.texture) entry.texture = this._texture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    if (entry.width !== frame.width || entry.height !== frame.height) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, frame.width, frame.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      entry.width = frame.width; entry.height = frame.height;
+    } else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, frame.width, frame.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    entry.sequence = handle.sequence;
+    entry.uploadMs += (performance.now() - started - entry.uploadMs)*0.1;
+    entry.hasAlpha = frame.alpha;
+    entry.element.videoWidth = frame.width; entry.element.videoHeight = frame.height;
+    entry.element.currentTime = entry.sequence;
+    return entry.texture;
+  }
+
   async prepareMask(owner) {
     if (this.disposed) throw new Error('The engine has been disposed.');
     if (!owner.mask) return null;
@@ -588,7 +661,7 @@ export class LiveEngine {
   _gpuVideo(clip) { return this.gpuFormats?.dxt1 ? gpuCodec(clip) : null; }
   _mediaURL(clip) { return gpuCodec(clip) && !this._gpuVideo(clip) ? withQuery(clip.url, 'converted=1') : mediaURL(clip); }
   _reverseURL(clip) { return this._gpuVideo(clip) ? null : reverseMediaURL(clip); }
-  _entryKind(clip) { return liveSource(clip) ? 'video' : this._gpuVideo(clip) ? 'gpu' : clip.kind; }
+  _entryKind(clip) { return shareSource(clip) ? 'share' : liveSource(clip) ? 'video' : this._gpuVideo(clip) ? 'gpu' : clip.kind; }
 
   // GPU-decoded movie: frames are fetched and decompressed by workers and
   // uploaded as compressed textures. Its element mirrors a <video> for callers.
@@ -829,6 +902,7 @@ export class LiveEngine {
     const gl = this.gl;
     if (!entry.ready || entry.failed || entry.kind === 'audio') return null;
     if (entry.kind === 'gpu') return this._uploadGpu(entry);
+    if (entry.kind === 'share') return this._uploadShare(entry);
     const element = entry.animation?.frameAt(time) || entry.element;
     if (entry.kind === 'video' && element.readyState < 2) return entry.texture;
     if (!entry.texture) { entry.texture = this._texture(); entry.dirty = true; }

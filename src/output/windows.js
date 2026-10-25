@@ -9,6 +9,22 @@ export function routedSources(config) {
   return [...new Set((config?.screens || []).flatMap(screen => (screen.slices || []).map(slice => slice.input?.source)).filter(source => /^(layer|group):/.test(source || '')))];
 }
 
+// Hands a screen's mapper its inputs: the composition canvas, plus layer and
+// group outputs, which arrive as asynchronous pixel readbacks from the
+// editor's engine (each new frame is uploaded once).
+export function feedSlices(entry, screen, composition, engine) {
+  entry.mapper.setSource('composition', composition);
+  entry.versions ||= new Map();
+  for (const slice of screen.slices || []) {
+    const source = slice.input?.source;
+    if (!source || source === 'composition' || !/^(layer|group):/.test(source)) continue;
+    const id = source.replace(/^(layer|group):/, ''), version = engine?.readbackVersion(id) || 0;
+    if (entry.versions.get(source) === version) continue;
+    const frame = engine?.readback(id);
+    if (frame) { entry.mapper.setSource(source, frame); entry.versions.set(source, version); }
+  }
+}
+
 const frameName = screen => `prism-output-${String(screen.id).toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40) || 'screen'}`;
 
 export class OutputWindows {
@@ -34,7 +50,8 @@ export class OutputWindows {
     this.config = config;
     // Slices fed by a single layer or group need that output read back.
     this.engine?.setReadbacks(routedSources(config).map(source => source.replace(/^(layer|group):/, '')));
-    const wanted = (config?.screens || []).filter(screen => screen.enabled !== false && (screen.device?.type === 'display' || !this.desktop));
+    // Spout and NDI screens are senders (video-share.js), not windows.
+    const wanted = (config?.screens || []).filter(screen => screen.enabled !== false && (screen.device?.type === 'display' || (!this.desktop && screen.device?.type === 'virtual')));
     for (const id of [...this.windows.keys()]) if (!wanted.some(screen => screen.id === id)) this.close(id);
     for (const screen of wanted) {
       const entry = this.windows.get(screen.id) || this._open(screen);
@@ -96,18 +113,7 @@ export class OutputWindows {
       if (entry.child.closed) { this._forget(id); continue; }
       const screen = entry.screen, width = screen.device?.width || entry.canvas.width, height = screen.device?.height || entry.canvas.height;
       if (entry.canvas.width !== width || entry.canvas.height !== height) { entry.canvas.width = width; entry.canvas.height = height; entry.mapper.resize?.(width, height); }
-      entry.mapper.setSource('composition', this.source);
-      // Layer/group inputs arrive as asynchronous pixel readbacks from the
-      // editor's engine; each new frame is uploaded once.
-      entry.versions ||= new Map();
-      for (const slice of screen.slices || []) {
-        const source = slice.input?.source;
-        if (!source || source === 'composition' || !/^(layer|group):/.test(source)) continue;
-        const id = source.replace(/^(layer|group):/, ''), version = this.engine?.readbackVersion(id) || 0;
-        if (entry.versions.get(source) === version) continue;
-        const frame = this.engine?.readback(id);
-        if (frame) { entry.mapper.setSource(source, frame); entry.versions.set(source, version); }
-      }
+      feedSlices(entry, screen, this.source, this.engine);
       try { entry.mapper.render(screen, { ...this.options, label: screen.name, time }); }
       catch (error) { this.onError(`Output ${screen.name}: ${error.message}`); }
     }

@@ -9,6 +9,7 @@ import { OutputMapper } from './mapper.js';
 export const PRESET_KEY = 'prism-output-presets';
 const COLORS = ['#84ffd4', '#ff8a5c', '#7ab8ff', '#ffd45c', '#d38cff', '#5cffa1', '#ff6fa8', '#5ce1ff'];
 const CORNER_SIGNS = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+const shareName = kind => kind === 'ndi' ? 'NDI®' : 'Spout';
 const clone = value => JSON.parse(JSON.stringify(value));
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const round = (value, digits = 3) => Math.round(value * 10 ** digits) / 10 ** digits;
@@ -32,7 +33,7 @@ function writePresets(storage, presets) {
   try { storage?.setItem(PRESET_KEY, JSON.stringify(presets)); return true; } catch { return false; }
 }
 
-export function openAdvancedOutput({ host, config: initialConfig, compositionCanvas, compositionSize = {}, displays = [], layers = [], groups = [], onChange = () => {}, onClose = () => {}, outputOptions: initialOptions = {}, onOutputOptions = () => {}, storage } = {}) {
+export function openAdvancedOutput({ host, config: initialConfig, compositionCanvas, compositionSize = {}, displays = [], layers = [], groups = [], onChange = () => {}, onClose = () => {}, outputOptions: initialOptions = {}, onOutputOptions = () => {}, storage, shareKinds = [] } = {}) {
   if (!host) throw new TypeError('openAdvancedOutput needs a host element.');
   const doc = host.ownerDocument, win = doc.defaultView;
   const store = storage === undefined ? (() => { try { return win.localStorage; } catch { return null; } })() : storage;
@@ -313,6 +314,9 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       // Each physical output can only drive one screen.
       for (const other of config.screens) if (other !== screen && other.device.type === 'display' && other.device.displayId === display.id) other.device = { type: 'virtual', width: other.device.width, height: other.device.height };
       screen.device = { type: 'display', displayId: String(display.id).slice(0, 256), width: clamp(Math.round(display.width), 1, OUTPUT_LIMITS.dimension), height: clamp(Math.round(display.height), 1, OUTPUT_LIMITS.dimension) };
+    } else if (shareKinds.includes(value)) {
+      // Spout or NDI sender, named after the screen until renamed.
+      checkpoint(); screen.device = { type: value, name: old.name || screen.name, width: old.width, height: old.height };
     } else { checkpoint(); screen.device = { type: 'virtual', width: old.width, height: old.height }; }
     rescaleScreen(screen, old.width, old.height);
     changed(true);
@@ -888,6 +892,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   const detach = node => node?.parentNode?.removeChild(node);
   function deviceLabel(screen) {
     if (screen.device.type === 'display') { const d = displays.find(x => x.id === screen.device.displayId); return `${d?.label || screen.device.displayId} · ${screen.device.width}×${screen.device.height}`; }
+    if (shareKinds.includes(screen.device.type)) return `${shareName(screen.device.type)} “${screen.device.name}” · ${screen.device.width}×${screen.device.height}`;
     return `Virtual · ${screen.device.width}×${screen.device.height}`;
   }
   function startRename(target, nameNode) {
@@ -919,6 +924,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     event.preventDefault();
     openMenu(event.clientX, event.clientY, [
       { label: 'Virtual output', run: () => setDevice(screen, 'virtual') },
+      ...shareKinds.map(kind => ({ label: `${shareName(kind)} sender`, run: () => setDevice(screen, kind) })),
       ...displays.map(d => ({ label: `${d.label || d.id} (${d.width}×${d.height})${config.screens.some(s => s !== screen && s.device.displayId === d.id) ? ' · in use' : ''}`, run: () => setDevice(screen, `display:${d.id}`) })),
       '-',
       { label: 'Rename', run: () => { const node = tree.querySelector(`[data-screen="${screen.id}"] .ao-name`); if (node) startRename(screen, node); } },
@@ -1071,8 +1077,15 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   function screenPanels(screen) {
     const targets = () => [currentScreen()];
     const deviceSelect = el('select', { id: 'ao-device', onchange: () => setDevice(currentScreen(), deviceSelect.value) },
-      el('option', { value: 'virtual' }, 'Virtual output'), displays.map(d => el('option', { value: `display:${d.id}` }, `${d.label || d.id} (${d.width}×${d.height})`)));
-    deviceSelect.value = screen.device.type === 'display' ? `display:${screen.device.displayId}` : 'virtual';
+      el('option', { value: 'virtual' }, 'Virtual output'), shareKinds.map(kind => el('option', { value: kind }, `${shareName(kind)} sender`)),
+      displays.map(d => el('option', { value: `display:${d.id}` }, `${d.label || d.id} (${d.width}×${d.height})`)));
+    deviceSelect.value = screen.device.type === 'display' ? `display:${screen.device.displayId}` : shareKinds.includes(screen.device.type) ? screen.device.type : 'virtual';
+    const senderInput = el('input', { type: 'text', value: screen.device.name || '', maxLength: 128, onchange: event => {
+      const value = event.target.value.trim().slice(0, 128);
+      if (!value || value === currentScreen().device.name) { event.target.value = currentScreen().device.name; return; }
+      checkpoint(); currentScreen().device.name = value; changed(true);
+    } });
+    blurOnEnter(senderInput);
     // Resolution edits rescale the screen's slices and masks proportionally.
     const sizeInput = key => {
       const input = el('input', { type: 'text', inputMode: 'numeric', dataset: { path: `device.${key}` }, disabled: screen.device.type === 'display' });
@@ -1090,7 +1103,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     const nameInput = el('input', { type: 'text', value: screen.name, maxLength: 128, onchange: event => { checkpoint(); screen.name = event.target.value.trim().slice(0, 128) || screen.name; changed(true); } });
     blurOnEnter(nameInput);
     return [
-      section('Screen', field('Name', nameInput), field('Device', deviceSelect), field('Resolution', el('div', { class: 'ao-pair' }, sizeInput('width'), sizeInput('height'))),
+      section('Screen', field('Name', nameInput), field('Device', deviceSelect), ...(shareKinds.includes(screen.device.type) ? [field('Sender name', senderInput)] : []), field('Resolution', el('div', { class: 'ao-pair' }, sizeInput('width'), sizeInput('height'))),
         el('div', { class: 'ao-checks' }, check('Enabled', 'enabled', targets, true)),
         rangeField('Delay (ms)', 'delay', targets, 0, 100, 1), rangeField('Black level', 'blackLevel', targets, 0, 1)),
       section('Colour', ...colourFields(targets)),
