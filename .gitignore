@@ -7,3 +7,4 @@ docs/manual*.txt
 *.log
 native/link/build/
 electron/native/stale-*.node
+native/video/build/

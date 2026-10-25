@@ -125,3 +125,16 @@ test('screen delay is stored in milliseconds and clamped to 0-100', () => {
   assert.equal(normalizeOutputConfig({ version: 1, screens: [{ delay: -5 }] }, comp).screens[0].delay, 0);
   assert.equal(normalizeOutputConfig({ version: 1, screens: [{ delay: 'x' }] }, comp).screens[0].delay, 0);
 });
+test('screens can be Spout or NDI senders with a sender name', () => {
+  const config = normalizeOutputConfig({ version: 1, screens: [
+    { id: 'a', name: 'Stage', device: { type: 'spout', name: 'Stage left', width: 1920, height: 1080, displayId: 'ignored' } },
+    { id: 'b', name: 'Stream', device: { type: 'ndi', width: 1280, height: 720 } },
+    { id: 'c', name: 'Other', device: { type: 'unknown', name: 'x' } },
+  ] }, comp);
+  assert.deepEqual(config.screens.map(screen => screen.device), [
+    { type: 'spout', name: 'Stage left', width: 1920, height: 1080 },
+    { type: 'ndi', name: 'Stream', width: 1280, height: 720 },
+    { type: 'virtual', width: 1280, height: 720 },
+  ]);
+  assert.equal(normalizeOutputConfig({ version: 1, screens: [{ id: 'a', device: { type: 'spout', name: 'n'.repeat(300) } }] }, comp).screens[0].device.name.length, 128);
+});

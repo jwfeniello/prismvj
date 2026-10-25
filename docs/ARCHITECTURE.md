@@ -2,7 +2,7 @@
 
 Windows desktop performance application based on the behavior in the supplied Resolume 4 manual. The full manual scope is tracked in REQUIREMENTS.md; initial implementation is not a claim of complete parity.
 
-Electron provides isolated native file dialogs, atomic project writes, recovery, media URLs, display output, and OSC networking. The renderer uses ES modules, WebGL2 compositing, HTML media decoding and Web Audio. No remote application content is loaded.
+Electron provides isolated native file dialogs, atomic project writes, recovery, media URLs, display output, and OSC networking. The renderer uses ES modules, WebGL2 compositing, HTML media decoding and Web Audio. No remote application content is loaded. The editor's renderer has context isolation but no OS sandbox: its preload loads the Spout/NDI module (`native/video`) so 1080p frames reach it without IPC (see IMPLEMENTATION-STATUS, 2026-10-22).
 
 ## Shared contract
 

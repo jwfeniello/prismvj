@@ -464,8 +464,10 @@ async function importFiles(paths) {
 function windowOptions(extra = {}) {
   return {
     backgroundColor: '#111319', autoHideMenuBar: true,
+    // No OS sandbox: the preload loads the Spout/NDI module (native/video) so
+    // frames reach it without IPC. Page scripts still have no Node access.
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true,
-      nodeIntegration: false, sandbox: true, webSecurity: true, backgroundThrottling: false,
+      nodeIntegration: false, sandbox: false, webSecurity: true, backgroundThrottling: false,
       navigateOnDragDrop: false, spellcheck: false }, ...extra,
   };
 }
@@ -914,6 +916,8 @@ function setupIPC() {
     shell.openExternal(url);
     return true;
   });
+  // NDI's download page for its free runtime (not shipped with PrismVJ).
+  handle('prism:open-ndi-runtime', () => { shell.openExternal('https://ndi.link/NDIRedistV6'); return true; });
   handle('prism:capture-sources', async () => (await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 0, height: 0 } }))
     .slice(0, 64).map(source => ({ id: source.id, name: source.name, screen: source.id.startsWith('screen:') })));
   handle('prism:capture-select', id => { captureSourceId = typeof id === 'string' ? id.slice(0, 200) : ''; return true; });

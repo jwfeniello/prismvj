@@ -158,8 +158,11 @@ function normalizeScreen(raw, index, ctx, unique) {
   const width = integer(device.width, ctx.compositionWidth, 1, OUTPUT_LIMITS.dimension);
   const height = integer(device.height, ctx.compositionHeight, 1, OUTPUT_LIMITS.dimension);
   const displayId = device.type === 'display' ? string(device.displayId, '', 256) : '';
-  const screen = { id: unique(raw.id, 'screen'), name: string(raw.name, `Screen ${index + 1}`, 128), enabled: bool(raw.enabled, true), folded: bool(raw.folded),
-    device: displayId ? { type: 'display', displayId, width, height } : { type: 'virtual', width, height },
+  const name = string(raw.name, `Screen ${index + 1}`, 128);
+  // Spout and NDI devices send the screen to other applications under a sender name.
+  const shared = device.type === 'spout' || device.type === 'ndi' ? { type: device.type, name: string(device.name, name, 128) || name } : null;
+  const screen = { id: unique(raw.id, 'screen'), name, enabled: bool(raw.enabled, true), folded: bool(raw.folded),
+    device: displayId ? { type: 'display', displayId, width, height } : shared ? { ...shared, width, height } : { type: 'virtual', width, height },
     delay: number(raw.delay, 0, 0, 100), blackLevel: number(raw.blackLevel, 0, 0, 1) };
   colour(raw, screen);
   const sliceCtx = { ...ctx, screenWidth: width, screenHeight: height };

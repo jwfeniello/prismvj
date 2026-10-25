@@ -677,7 +677,7 @@ function drawOverlay(screen, options, width, height, deviceWidth, deviceHeight) 
   if (options.showFPS) lines.push(`${Math.round(options.fps || 0)} fps`);
   if (options.testCard) lines.push(new Date().toLocaleTimeString());
   if (options.showInfo) {
-    lines.push(screen.name, `${screen.device.type === 'display' ? `Display ${screen.device.displayId}` : 'Virtual output'}`,
+    lines.push(screen.name, `${screen.device.type === 'display' ? `Display ${screen.device.displayId}` : screen.device.type === 'spout' ? `Spout: ${screen.device.name}` : screen.device.type === 'ndi' ? `NDI®: ${screen.device.name}` : 'Virtual output'}`,
       `Output ${deviceWidth} × ${deviceHeight}`, `Window ${options.canvasWidth} × ${options.canvasHeight}`, `Renderer ${options.renderer}`);
   }
   if (lines.length) {

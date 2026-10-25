@@ -1,5 +1,40 @@
 # Implementation status
 
+## 2026-10-22 Spout and NDI® inputs and outputs
+
+Spout and NDI live in a native module, `native/video` (`prism_video.node`, built by `npm run build:video` and shipped beside `app.asar` like Ableton Link). Spout uses the official SpoutDX sources (Spout 2.007.018, vendored unmodified). NDI is loaded at run time from the NDI Runtime the user installed: `NDI_RUNTIME_DIR_V6`, then `NDI_RUNTIME_DIR_V5`, then the DLL search path, or `PRISM_NDI_LIBRARY` for development. Every sender and receiver has its own thread; JavaScript only copies frames in and out.
+
+**Why the renderer has no OS sandbox now.** Chromium cannot hand a WebGL texture to native code, so outputs need a CPU readback, and a 1080p frame is 8 MB. Measured with the sandbox on, no route out of the renderer reached 60 fps. `ipcRenderer.send` reached 30–35 fps and used ~40% of a core in the browser process. A worker MessagePort to a utility process delivered 20 fps. A loopback WebSocket managed ~33 fps and `fetch` to a custom protocol ~20 fps. Offscreen shared-texture rendering works (60 fps, NT handles) but not for `window.open` children, so it cannot see the editor's WebGL. `beginFrameSubscription` is capped at 30 fps. The editor window therefore runs with `sandbox: false` and keeps context isolation and `nodeIntegration: false`. The preload loads the module, and the page and preload exchange frames over a private MessageChannel that moves buffers without copying (contextBridge would copy ~7.5 ms per frame).
+
+**Readback.** `new VideoFrame(canvas)` costs ~0.15 ms on the main thread. A worker copies the frame into a BGRA WebGPU texture, then into a mappable buffer, and maps it asynchronously: about 1 ms of worker time per 1080p frame and ~20–25 ms latency. Requesting `onSubmittedWorkDone` alongside the map cuts Chromium's map latency from ~70 ms to ~20 ms. Alternatives measured: `VideoFrame.copyTo` saturates the GPU process's main thread (~15 ms per frame, ~95% of a core at 60 fps). A WebGL pixel-pack ring blocks the calling thread for 4.5 ms (main thread) to 16 ms (worker) in `getBufferSubData`. `copyTo` remains the fallback without WebGPU.
+
+**Inputs.** The receiver thread keeps the newest frame. The preload checks every 4 ms and copies it bottom row first, ready for WebGL. The engine uploads it with `texSubImage2D` when it changes (~0.7 ms on the render thread at 1080p). A receiver runs while its clip plays and closes 3 s after it stops.
+
+Measured on this machine (Ryzen 9 5900XT, RTX 2060 SUPER, Windows 10, Electron 44.7), 1080p at 60 fps:
+
+| Path | Rate | Timing | Added CPU (% of one core) |
+| --- | --- | --- | --- |
+| Native loopback, Spout | 59.6 fps received | `send()` 0.6 ms; send → receive 5–6 ms median, 7–8 ms p95 | 21–26% for sender + receiver in one process |
+| Native loopback, NDI | 60 fps after connecting (540/540 frames) | `send()` 0.6 ms (encode 3.9–4.7 ms on the sender thread); send → receive 23 ms median, 26 ms p95 | ~53% for sender + receiver (NDI encode and decode) |
+| App → Spout receiver | 60.0 fps | readback 24–25 ms; native send 0.64 ms | renderer +20%, GPU process +17% |
+| App → NDI receiver | 60.0 fps | readback 25 ms; NDI send 4.7 ms | renderer +57% (includes NDI's encoder), GPU process +17% |
+| Spout sender → app clip | 59.8–60.2 fps | receive 3–5 ms on the receiver thread; upload 0.7 ms | renderer +41%, GPU process +9% versus a solid-colour clip |
+| NDI source → app clip | 60.2 fps | receive 0.6–0.7 ms plus NDI decode; upload 0.8 ms | about renderer +20% versus a solid-colour clip |
+
+The editor kept 60 FPS throughout. "Added CPU" compares the same 1080p composition with and without the share, using Electron's cumulative CPU time over 6 s. NDI was measured with the NDI 5.5.1 runtime that Resolume Arena installs (`PRISM_NDI_LIBRARY`), because no NDI Runtime is installed on this machine. In-app numbers come from `tests/video-share-desktop.test.mjs`; native loopback numbers come from `scripts/bench-video-share.mjs`.
+
+**Licensing.**
+- Spout: SpoutDX and the SpoutGL files are BSD 2-Clause, which is GPL-compatible. The license ships in `licenses/Spout-LICENSE.txt`.
+- NDI headers: the NDI SDK headers in `native/video/vendor/ndi` are MIT-licensed per file, which is GPL-compatible. The headers state that using any part of the SDK means accepting the NDI SDK license. The NDI runtime is not distributed; PrismVJ loads the copy the user installs.
+- NDI SDK license terms that matter here:
+  - A fee applies above USD 50,000 of revenue from the bundled product in 12 months. Free distribution stays below that.
+  - The NDI® trademark may only be used to state compatibility, with a notice that it is NDI's mark. The UI and README carry "NDI® is a registered trademark of Vizrt NDI AB."
+  - SDK files may not be redistributed except those the documentation allows.
+  - Products that distribute the SDK must pass on restrictions against reverse engineering the SDK. That clause attaches to the SDK, which PrismVJ does not ship.
+- GPL fit: PrismVJ follows OBS's DistroAV plugin here. It ships GPL code plus MIT headers, and the user installs the proprietary runtime separately. PrismVJ works without it. One open question is whether running against the proprietary runtime makes a combined work under the GPL. The PrismVJ copyright holders can settle it with a GPL-3.0 section 7 additional permission allowing use with the NDI runtime. That decision belongs to the copyright holders and has not been made. FFmpeg's past NDI problem came from shipping the NDI library in builds, which PrismVJ does not do.
+
+Verification: `npm test` 305 passed and 1 skipped (the NDI loopback, with no NDI runtime installed); it includes the native loopback (`video-share.test.mjs`) and page-side (`video-share.webgl.test.mjs`) suites. `npm run test:desktop` 56 passed and 2 skipped (the NDI cases). With `PRISM_NDI_LIBRARY` set, all four `video-share-desktop` cases and both native NDI loopback tests passed. `npm run package` and `npm run release` ship `prism_video.node` beside `app.asar`, and the packaged exe sent Spout to an outside receiver at 59 fps.
+
 ## 2026-10-18 GPU-native HAP and DXV playback
 
 HAP and DXV3 MOVs no longer get transcoded playback copies. Import runs only ffprobe (about 70 ms) and registers the original file. Worker threads read frames by byte range and undo the HAP Snappy/chunk layer or the DXV LZ/opcode layer. The compositor then uploads the resulting DXT/BC blocks with `compressedTexSubImage2D`. Forward, reverse, speed and scrubbing all pick frames straight from the transport, with decoding running ahead of the playhead in the playback direction. The soundtrack is extracted once to FLAC, forward and reversed. GPUs without S3TC fall back to the converted copy on demand, and `PRISM_GPU_VIDEO=0` forces conversion for every MOV. Details are in [MEDIA.md](MEDIA.md#gpu-decoded-movies).
