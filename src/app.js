@@ -110,7 +110,7 @@ function initialize() {
     <section class="inspector-panel clip-panel"><div class="transport-tabs"><button data-inspector="clip" class="active">Clip</button></div><div data-inspector-panel="clip" class="inspector-content"></div></section>
     <div class="layout-splitter vertical" data-layout-splitter="panel-2" role="separator" aria-label="Resize clip and browser panels" aria-orientation="vertical" tabindex="0"></div>
     <section class="browser-panel"><div class="browser-tabs"><button data-browser="files">Files</button><button data-browser="effects">Effects</button><button data-browser="sources" class="active">Sources</button><button data-browser="controls">Control</button></div><div id="browser" class="browser-content"></div></section></main>
-    <footer class="statusbar"><span class="status-dot"></span><span id="status-text">Ready</span><span class="spacer"></span><span id="timecode-status" hidden></span><span id="memory-status"></span><span id="beat-status">BEAT 1.1</span><span>PRISMVJ 0.1</span></footer>`;
+    <footer class="statusbar"><span class="status-dot"></span><span id="status-text">Ready</span><span class="spacer"></span><span id="timecode-status" hidden></span><span id="memory-status"></span><span id="beat-status">BEAT 1.1</span><span>PRISMVJ 0.2</span></footer>`;
   $('.deckbar').after($('[data-layout-splitter="workspace"]'),$('.toolbar'));
   installResizableLayout($('#app'));
   inspectorHosts.push(...$$('[data-inspector-panel]'));
