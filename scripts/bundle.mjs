@@ -62,9 +62,13 @@ if (ffmpegDir) {
     : 'FFmpeg not bundled (set PRISM_FFMPEG_PATH to a static build). The app will use the ffmpeg on PATH if there is one.');
 }
 
+// Electron's license: from the electron package's dist folder, or the copy
+// electron-packager put at the top of the app (replaced by PrismVJ's below).
+const electronLicenses = [path.join(path.dirname(createRequire(import.meta.url).resolve('electron/package.json')), 'dist', 'LICENSE'), path.join(appDir, 'LICENSE')];
+const electronLicense = electronLicenses.find(file => existsSync(file) && /Electron contributors/i.test(readFileSync(file, 'utf8'))) || electronLicenses[0];
 const notices = [
   [path.join(root, 'LICENSE'), 'PrismVJ-LICENSE.txt'],
-  [path.join(path.dirname(createRequire(import.meta.url).resolve('electron/package.json')), 'dist', 'LICENSE'), 'Electron-LICENSE.txt'],
+  [electronLicense, 'Electron-LICENSE.txt'],
   [path.join(root, 'native', 'link', 'vendor', 'LICENSE.md'), 'AbletonLink-LICENSE.md'],
   [path.join(root, 'native', 'link', 'vendor', 'GNU-GPL-v2.0.md'), 'AbletonLink-GNU-GPL-v2.0.md'],
 ];
