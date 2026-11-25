@@ -155,12 +155,14 @@ jobs:
 
       # Ubuntu 24.04 restricts the user namespaces Chromium's sandbox uses, and a
       # CI checkout has no setuid-root chrome-sandbox, so the smoke run goes
-      # without the sandbox (the shipped prismvj.sh makes the same choice).
+      # without the sandbox (the shipped prismvj.sh makes the same choice). The
+      # runner has no GPU, so WebGL2 renders with SwiftShader.
       - name: Launch the packaged app
         timeout-minutes: 5
         env:
           ELECTRON_DISABLE_SANDBOX: '1'
           PRISM_EXPECT_NATIVE: '1'
+          PRISM_SMOKE_SOFTWARE_GL: '1'
         run: xvfb-run -a -s "-screen 0 1920x1080x24" node scripts/smoke-package.mjs
 
       - name: Upload tar.gz

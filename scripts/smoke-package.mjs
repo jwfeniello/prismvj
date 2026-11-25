@@ -13,6 +13,7 @@ const packageFolder = path.dirname(executable);
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'prism-package-smoke-'));
 const profile = path.join(temporary, 'profile');
 let application;
+const pageErrors = [];
 
 try {
   assert.ok((await stat(executable)).size > 0, 'The packaged executable must exist before running this smoke test.');
@@ -25,9 +26,10 @@ try {
   // The packaged binary resolves all application code itself, from an unrelated
   // working directory. No workspace app argument or development server is used.
   application = await electron.launch({ executablePath: executable,
-    args: ['--autoplay-policy=no-user-gesture-required'], cwd: temporary, env, timeout: 30000 });
+    // PRISM_SMOKE_SOFTWARE_GL=1 renders WebGL2 with SwiftShader, for machines without a GPU (CI).
+    args: ['--autoplay-policy=no-user-gesture-required', ...(process.env.PRISM_SMOKE_SOFTWARE_GL ? ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] : [])],
+    cwd: temporary, env, timeout: 30000 });
   const page = await application.firstWindow();
-  const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.waitForFunction(() => typeof window.prismDiagnostics === 'function'
     && window.prismDiagnostics().stats.frames >= 3, null, { timeout: 20000 });
@@ -114,6 +116,7 @@ try {
     isolatedProfile: true, allWindowsHidden: true, developerServerUsed: false, resizableLayoutRestored: true }));
 } catch (error) {
   console.error('PACKAGED_SMOKE_FAIL', error.stack || error.message);
+  if (pageErrors.length) console.error('Page errors:\n' + pageErrors.join('\n'));
   process.exitCode = 1;
 } finally {
   await application?.close();
