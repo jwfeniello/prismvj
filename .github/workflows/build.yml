@@ -110,7 +110,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: true
+          # Building Link needs its own asio-standalone submodule as well.
+          submodules: recursive
 
       - uses: actions/setup-node@v7
         with:
