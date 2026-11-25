@@ -2,16 +2,26 @@
 // sharing on Windows, https://spout.zeal.co, BSD-2-Clause, via SpoutDX) and
 // NDI® (network video, https://ndi.video). The NDI runtime is not part of
 // PrismVJ: it is loaded at run time from the NDI Runtime the user installed.
+// Spout exists only on Windows; Linux and macOS builds have NDI alone.
 //
 // Every sender and receiver owns a worker thread, so JavaScript only ever
 // copies a frame into or out of a buffer. A sender keeps the newest frame and
 // drops older ones it had no time for; a receiver keeps the newest frame.
 #include <node_api.h>
 
+#ifdef _WIN32
+#define PRISM_SPOUT 1
 #include "SpoutDX.h"
+#include <set>
+#else
+#include <dlfcn.h>
+#include <cstdlib>
+#endif
 #include "Processing.NDI.Lib.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -79,10 +89,18 @@ bool bytes(napi_env env, napi_value value, uint8_t** data, size_t* length) {
 
 // ---- NDI runtime -----------------------------------------------------------
 
+#ifdef _WIN32
+using LibraryHandle = HMODULE;
+const char kPathSeparator = '\\';
+#else
+using LibraryHandle = void*;
+const char kPathSeparator = '/';
+#endif
+
 struct NdiRuntime {
   std::mutex lock;
   bool tried = false;
-  HMODULE module = nullptr;
+  LibraryHandle module = nullptr;
   const NDIlib_v6* lib = nullptr;
   std::string path, error, version;
   NDIlib_find_instance_t finder = nullptr;
@@ -90,13 +108,50 @@ struct NdiRuntime {
 NdiRuntime ndi;
 
 std::string environment(const char* name) {
+#ifdef _WIN32
   char value[MAX_PATH * 2] = {};
   DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
   return length && length < sizeof(value) ? std::string(value, length) : std::string();
+#else
+  const char* value = std::getenv(name);
+  return value ? std::string(value).substr(0, 4096) : std::string();
+#endif
 }
 
-// PRISM_NDI_LIBRARY names a DLL explicitly; otherwise the NDI 6 and NDI 5
-// runtime folders the NDI installers register, then the DLL search path.
+LibraryHandle openLibrary(const std::string& path) {
+#ifdef _WIN32
+  return LoadLibraryExA(path.c_str(), nullptr, path.find('\\') != std::string::npos ? LOAD_WITH_ALTERED_SEARCH_PATH : 0);
+#else
+  return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+void* librarySymbol(LibraryHandle module, const char* name) {
+#ifdef _WIN32
+  return reinterpret_cast<void*>(GetProcAddress(module, name));
+#else
+  return dlsym(module, name);
+#endif
+}
+void closeLibrary(LibraryHandle module) {
+#ifdef _WIN32
+  FreeLibrary(module);
+#else
+  dlclose(module);
+#endif
+}
+std::string libraryPath(LibraryHandle module, const std::string& fallback) {
+#ifdef _WIN32
+  char resolved[MAX_PATH] = {};
+  return GetModuleFileNameA(module, resolved, MAX_PATH) ? std::string(resolved) : fallback;
+#else
+  (void)module;
+  return fallback;
+#endif
+}
+
+// PRISM_NDI_LIBRARY names the library explicitly; otherwise the NDI 6 and
+// NDI 5 runtime folders the NDI installers register, then the system's
+// library search path (on Linux also libndi.so.5 and the unversioned name).
 const NDIlib_v6* loadNdi() {
   std::lock_guard<std::mutex> guard(ndi.lock);
   if (ndi.tried) return ndi.lib;
@@ -104,23 +159,25 @@ const NDIlib_v6* loadNdi() {
   std::vector<std::string> candidates;
   if (auto explicitPath = environment("PRISM_NDI_LIBRARY"); !explicitPath.empty()) candidates.push_back(explicitPath);
   for (const char* folder : { NDILIB_REDIST_FOLDER, "NDI_RUNTIME_DIR_V5" })
-    if (auto directory = environment(folder); !directory.empty()) candidates.push_back(directory + "\\" NDILIB_LIBRARY_NAME);
+    if (auto directory = environment(folder); !directory.empty()) candidates.push_back(directory + kPathSeparator + NDILIB_LIBRARY_NAME);
   candidates.push_back(NDILIB_LIBRARY_NAME);
+#if !defined(_WIN32) && !defined(__APPLE__)
+  candidates.push_back("libndi.so.5");
+  candidates.push_back("libndi.so");
+#endif
   for (const auto& candidate : candidates) {
-    HMODULE module = LoadLibraryExA(candidate.c_str(), nullptr, candidate.find('\\') != std::string::npos ? LOAD_WITH_ALTERED_SEARCH_PATH : 0);
+    LibraryHandle module = openLibrary(candidate);
     if (!module) continue;
     using Loader = const NDIlib_v6* (*)(void);
-    auto load = reinterpret_cast<Loader>(GetProcAddress(module, "NDIlib_v6_load"));
-    if (!load) load = reinterpret_cast<Loader>(GetProcAddress(module, "NDIlib_v5_load"));
+    auto load = reinterpret_cast<Loader>(librarySymbol(module, "NDIlib_v6_load"));
+    if (!load) load = reinterpret_cast<Loader>(librarySymbol(module, "NDIlib_v5_load"));
     const NDIlib_v6* lib = load ? load() : nullptr;
     if (!lib || !lib->initialize || !lib->initialize()) {
       ndi.error = lib ? "This CPU is not supported by NDI." : "The NDI library has no loader entry point.";
-      FreeLibrary(module);
+      closeLibrary(module);
       continue;
     }
-    char resolved[MAX_PATH] = {};
-    GetModuleFileNameA(module, resolved, MAX_PATH);
-    ndi.module = module; ndi.lib = lib; ndi.path = resolved; ndi.error.clear();
+    ndi.module = module; ndi.lib = lib; ndi.path = libraryPath(module, candidate); ndi.error.clear();
     ndi.version = lib->version ? lib->version() : "";
     return lib;
   }
@@ -178,6 +235,7 @@ struct Sender {
   }
 };
 
+#ifdef PRISM_SPOUT
 void Sender::runSpout() {
   spoutDX spout;
   if (!spout.OpenDirectX11()) { started("", "DirectX 11 is not available for Spout."); return; }
@@ -193,6 +251,9 @@ void Sender::runSpout() {
   spout.ReleaseSender();
   spout.CloseDirectX11();
 }
+#else
+void Sender::runSpout() { started("", "Spout is only available on Windows."); }
+#endif
 
 void Sender::runNdi() {
   const NDIlib_v6* lib = loadNdi();
@@ -258,6 +319,7 @@ struct Receiver {
   }
 };
 
+#ifdef PRISM_SPOUT
 void Receiver::runSpout() {
   spoutDX spout;
   if (!spout.OpenDirectX11()) { std::lock_guard<std::mutex> guard(lock); error = "DirectX 11 is not available for Spout."; return; }
@@ -285,6 +347,9 @@ void Receiver::runSpout() {
   spout.ReleaseReceiver();
   spout.CloseDirectX11();
 }
+#else
+void Receiver::runSpout() { std::lock_guard<std::mutex> guard(lock); error = "Spout is only available on Windows."; }
+#endif
 
 void Receiver::runNdi() {
   const NDIlib_v6* lib = loadNdi();
@@ -404,6 +469,9 @@ napi_value createSender(napi_env env, napi_callback_info info, Sender::Kind kind
   std::string name = toString(env, argv[0], kind == Sender::Spout ? 255 : 200);
   if (name.empty()) name = "PrismVJ";
   if (kind == Sender::Ndi && !loadNdi()) { fail(env, ndi.error); return nullptr; }
+#ifndef PRISM_SPOUT
+  if (kind == Sender::Spout) { fail(env, "Spout is only available on Windows."); return nullptr; }
+#endif
   auto* sender = new Sender();
   sender->kind = kind; sender->requested = name;
   sender->thread = std::thread([sender] { sender->run(); });
@@ -484,6 +552,9 @@ napi_value createReceiver(napi_env env, napi_callback_info info, Receiver::Kind 
     if (source.empty()) { fail(env, "Choose an NDI source."); return nullptr; }
     if (!loadNdi()) { fail(env, ndi.error); return nullptr; }
   }
+#ifndef PRISM_SPOUT
+  if (kind == Receiver::Spout) { fail(env, "Spout is only available on Windows."); return nullptr; }
+#endif
   auto* receiver = new Receiver();
   receiver->kind = kind; receiver->source = source;
   if (type == napi_string) receiver->url = toString(env, argv[1]);
@@ -498,8 +569,12 @@ napi_value CreateNdiReceiver(napi_env env, napi_callback_info info) { return cre
 
 // ---- Discovery -------------------------------------------------------------
 
-// spoutSenders() → [{ name, width, height, format }]
+// spoutSenders() → [{ name, width, height, format }] (empty without Spout)
 napi_value SpoutSenders(napi_env env, napi_callback_info) {
+#ifndef PRISM_SPOUT
+  napi_value empty; napi_create_array(env, &empty);
+  return empty;
+#else
   spoutSenderNames names;
   std::set<std::string> list;
   names.GetSenderNames(&list);
@@ -516,6 +591,7 @@ napi_value SpoutSenders(napi_env env, napi_callback_info) {
     napi_set_element(env, result, index++, item);
   }
   return result;
+#endif
 }
 
 // ndiStatus() → { available, version, path, error, runtimeURL }

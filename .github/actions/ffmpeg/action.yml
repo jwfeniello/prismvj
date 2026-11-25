@@ -1,16 +1,23 @@
 name: FFmpeg
-description: Downloads a pinned static FFmpeg GPL build, checks its SHA-256 and sets PRISM_FFMPEG_PATH.
+description: Downloads a pinned static FFmpeg GPL build for the runner's OS, checks its SHA-256 and sets PRISM_FFMPEG_PATH.
 
 # BtbN keeps daily builds for about two weeks and month-end builds for about
 # two years, so this pins a month-end build. To update, pick a newer month-end
-# autobuild-* release, copy the win64-gpl asset's URL and its sha256 digest.
+# autobuild-* release and copy the win64-gpl and linux64-gpl assets' URLs and
+# sha256 digests.
 inputs:
-  url:
-    description: Download URL of the FFmpeg zip
+  windows-url:
+    description: Download URL of the Windows FFmpeg zip
     default: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-win64-gpl-9.0.zip
-  sha256:
-    description: SHA-256 of the zip
+  windows-sha256:
+    description: SHA-256 of the Windows zip
     default: a0e45723c72141975f51d8666302e614711745f3102b704ca3f82c897a58d278
+  linux-url:
+    description: Download URL of the Linux FFmpeg tar.xz
+    default: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n9.0.2-17-g2a571b6068-linux64-gpl-9.0.tar.xz
+  linux-sha256:
+    description: SHA-256 of the Linux tar.xz
+    default: 68ee646831adaae2495618346f3bba94ff207ff83bbd34d643e7004730d66269
 
 runs:
   using: composite
@@ -20,14 +27,14 @@ runs:
       uses: actions/cache@v6
       with:
         path: ${{ runner.temp }}/ffmpeg
-        key: ffmpeg-${{ inputs.sha256 }}
+        key: ffmpeg-${{ runner.os == 'Windows' && inputs.windows-sha256 || inputs.linux-sha256 }}
 
     - name: Download FFmpeg
-      if: steps.cache.outputs.cache-hit != 'true'
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
       shell: pwsh
       env:
-        FFMPEG_URL: ${{ inputs.url }}
-        FFMPEG_SHA256: ${{ inputs.sha256 }}
+        FFMPEG_URL: ${{ inputs.windows-url }}
+        FFMPEG_SHA256: ${{ inputs.windows-sha256 }}
       run: |
         $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
         $dir = Join-Path $env:RUNNER_TEMP 'ffmpeg'
@@ -39,10 +46,36 @@ runs:
         if ($LASTEXITCODE) { throw "tar failed with exit code $LASTEXITCODE" }
         Remove-Item $zip
 
+    - name: Download FFmpeg
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+      shell: bash
+      env:
+        FFMPEG_URL: ${{ inputs.linux-url }}
+        FFMPEG_SHA256: ${{ inputs.linux-sha256 }}
+      run: |
+        set -euo pipefail
+        archive="$RUNNER_TEMP/ffmpeg.tar.xz"
+        curl -fsSL --retry 3 -o "$archive" "$FFMPEG_URL"
+        echo "$FFMPEG_SHA256  $archive" | sha256sum --check --strict
+        mkdir -p "$RUNNER_TEMP/ffmpeg"
+        tar -xJf "$archive" -C "$RUNNER_TEMP/ffmpeg"
+        rm "$archive"
+
     - name: Use FFmpeg
+      if: runner.os == 'Windows'
       shell: pwsh
       run: |
         $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg\*\bin\ffmpeg.exe" | Select-Object -First 1
         if (-not $exe) { throw 'ffmpeg.exe not found in the extracted build' }
         & $exe.FullName -hide_banner -version | Select-Object -First 1
         "PRISM_FFMPEG_PATH=$($exe.FullName)" >> $env:GITHUB_ENV
+
+    - name: Use FFmpeg
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        exe="$(ls -d "$RUNNER_TEMP"/ffmpeg/*/bin/ffmpeg | head -n 1)"
+        if [ -z "$exe" ]; then echo 'ffmpeg not found in the extracted build' >&2; exit 1; fi
+        "$exe" -hide_banner -version | head -n 1
+        echo "PRISM_FFMPEG_PATH=$exe" >> "$GITHUB_ENV"

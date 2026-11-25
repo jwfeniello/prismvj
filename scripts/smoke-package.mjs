@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { _electron as electron } from '@playwright/test';
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-const executable = process.argv[2] ? path.resolve(process.argv[2]) : path.join(root, 'release', 'prismvj', 'PrismVJ-win32-x64', 'PrismVJ.exe');
+const executable = process.argv[2] ? path.resolve(process.argv[2])
+  : path.join(root, 'release', 'prismvj', `PrismVJ-${process.platform}-${process.arch}`, process.platform === 'win32' ? 'PrismVJ.exe' : 'PrismVJ');
 const packageFolder = path.dirname(executable);
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'prism-package-smoke-'));
 const profile = path.join(temporary, 'profile');
@@ -66,6 +67,15 @@ try {
   assert.equal(initial.canvasHeight, 720);
   assert.equal(initial.nodeAccessible, false);
 
+  // PRISM_EXPECT_NATIVE=1 (set by CI) requires the native bridges built for
+  // this platform to load from the package's resources folder.
+  const bridges = await page.evaluate(async () => ({ video: desktop.videoShare.status(), link: await desktop.linkStatus() }));
+  if (process.env.PRISM_EXPECT_NATIVE) {
+    assert.equal(bridges.video.available, true, `The packaged video bridge must load: ${bridges.video.error || ''}`);
+    assert.equal(bridges.video.spout, process.platform === 'win32');
+    assert.equal(bridges.link.available, true, `The packaged Ableton Link bridge must load: ${bridges.link.error || ''}`);
+  }
+
   // Exercises the packaged native module loader and disk write path as well.
   assert.equal(await page.evaluate(() => desktop.autosave(prismDiagnostics().project)), true);
   const [media] = await page.evaluate(paths => desktop.importPaths(paths), [mediaPath]);
@@ -100,6 +110,7 @@ try {
   assert.deepEqual(pageErrors, []);
   assert.ok((await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => window.isVisible()))).every(visible => !visible));
   console.log('PACKAGED_SMOKE_PASS', JSON.stringify({ executable, appPath: native.appPath, initial, media: seek, rangeStatus: range.status,
+    nativeBridges: { video: bridges.video.available, spout: bridges.video.spout, ndiRuntime: !!bridges.video.ndi?.available, link: bridges.link.available },
     isolatedProfile: true, allWindowsHidden: true, developerServerUsed: false, resizableLayoutRestored: true }));
 } catch (error) {
   console.error('PACKAGED_SMOKE_FAIL', error.stack || error.message);

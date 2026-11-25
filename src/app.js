@@ -87,7 +87,9 @@ const shortcutHolds=new Map();
 let timecode=null,lastTimecodeLabel='';
 // Ableton Link session as last reported by the main process.
 let link={available:false,enabled:false,peers:0,tempo:0,playing:false,receivedAt:0,beat:0,quantum:4},lastLinkTempo=0,lastLinkPlaying=null;
-let videoShare=null,shareOutputs=null,shareSources={spout:[],ndi:[],ndiStatus:null},lastShareScan=0;
+let videoShare=null,shareOutputs=null,shareSources={spout:[],ndi:[],ndiStatus:null,spoutSupported:false},lastShareScan=0;
+// Spout is Windows-only; Linux and macOS builds share video over NDI alone.
+const spoutSupported=()=>{try{return !!videoShare?.status().spout;}catch{return false;}};
 let shortcuts,controllers=null,thumbnailer=null,lastColumn=-1,outputs=null,effectKind='video',captureDevices=[],outputEditor=null,displaysCache=[],lastDmx=0,dmxActive=false,lastOscOut=0;
 const oscSent=new Map();
 let lastPaint=0,paintFrames=0,paintStart=0,lastActive='';
@@ -403,13 +405,13 @@ async function setupVideoShare(){
   applyCompositionShares();
   if(browserTab==='sources')renderBrowser();
 }
-function applyCompositionShares(){shareOutputs?.setComposition({spout:preferences.spoutOutput?'PrismVJ':null,ndi:preferences.ndiOutput&&shareSources.ndiStatus?.available?'PrismVJ':null});}
+function applyCompositionShares(){shareOutputs?.setComposition({spout:preferences.spoutOutput&&spoutSupported()?'PrismVJ':null,ndi:preferences.ndiOutput&&shareSources.ndiStatus?.available?'PrismVJ':null});}
 // Spout senders and NDI sources for the Sources browser. NDI discovery runs in
 // the background, so the list fills in over the first seconds.
 function refreshShareSources(){
   if(!videoShare)return false;
   const before=JSON.stringify(shareSources);
-  try{const status=videoShare.status();shareSources={spout:videoShare.spoutSenders(),ndi:status.ndi?.available?videoShare.ndiSources():[],ndiStatus:status.ndi||null};}catch{/* keep the last list */}
+  try{const status=videoShare.status();shareSources={spout:status.spout?videoShare.spoutSenders():[],ndi:status.ndi?.available?videoShare.ndiSources():[],ndiStatus:status.ndi||null,spoutSupported:!!status.spout};}catch{/* keep the last list */}
   return JSON.stringify(shareSources)!==before;
 }
 function shareSourcesHTML(){
@@ -418,8 +420,11 @@ function shareSourcesHTML(){
   const ndi=shareSources.ndiStatus?.available
     ?shareSources.ndi.map(source=>item('ndi',{source:source.name},source.name,'NDI® source')).join('')||'<p class="browser-note">No NDI® sources found yet.</p>'
     :'<p class="browser-note">NDI® inputs and outputs need the free NDI Runtime. <button id="get-ndi-runtime" class="icon-btn">Get the NDI® Runtime</button></p>';
-  return shareSources.spout.map(sender=>item('spout',{sender:sender.name},sender.name,`Spout · ${sender.width}×${sender.height}`)).join('')
-    +`<div class="browser-item" data-source="spout" data-source-name="Spout" draggable="true"><span class="pill">SPT</span><strong>Active Spout sender</strong></div>${ndi}<p class="browser-note">NDI® is a registered trademark of Vizrt NDI AB.</p>`;
+  const spout=shareSources.spoutSupported
+    ?shareSources.spout.map(sender=>item('spout',{sender:sender.name},sender.name,`Spout · ${sender.width}×${sender.height}`)).join('')
+      +'<div class="browser-item" data-source="spout" data-source-name="Spout" draggable="true"><span class="pill">SPT</span><strong>Active Spout sender</strong></div>'
+    :'';
+  return `${spout}${ndi}<p class="browser-note">NDI® is a registered trademark of Vizrt NDI AB.</p>`;
 }
 
 async function setupLink(){
@@ -1735,7 +1740,8 @@ async function openOutput(){
   displaysCache=desktop?await desktop.getDisplays():[];
   const configured=project.advancedOutput?.screens?.some(screen=>screen.enabled!==false&&['display','spout','ndi'].includes(screen.device?.type));
   const ndiReady=!!shareSources.ndiStatus?.available;
-  const shares=videoShare?`<h3 style="margin-top:12px">Share with other apps</h3><label class="preference-option"><input type="checkbox" id="share-spout" ${preferences.spoutOutput?'checked':''}> Spout sender “PrismVJ”</label><label class="preference-option"><input type="checkbox" id="share-ndi" ${preferences.ndiOutput&&ndiReady?'checked':''} ${ndiReady?'':'disabled'}> NDI® source “PrismVJ”</label>${ndiReady?'':'<p class="browser-note">NDI® output needs the free NDI Runtime. <button id="dialog-get-ndi" class="icon-btn">Get the NDI® Runtime</button></p>'}<p class="browser-note">These send the composition and stay on until switched off. Advanced Output screens can also be Spout or NDI® senders.</p>`:'';
+  const spoutOk=spoutSupported();
+  const shares=videoShare?`<h3 style="margin-top:12px">Share with other apps</h3>${spoutOk?`<label class="preference-option"><input type="checkbox" id="share-spout" ${preferences.spoutOutput?'checked':''}> Spout sender “PrismVJ”</label>`:''}<label class="preference-option"><input type="checkbox" id="share-ndi" ${preferences.ndiOutput&&ndiReady?'checked':''} ${ndiReady?'':'disabled'}> NDI® source “PrismVJ”</label>${ndiReady?'':'<p class="browser-note">NDI® output needs the free NDI Runtime. <button id="dialog-get-ndi" class="icon-btn">Get the NDI® Runtime</button></p>'}<p class="browser-note">These send the composition and stay on until switched off. Advanced Output screens can also be ${spoutOk?'Spout or NDI®':'NDI®'} senders.</p>`:'';
   const body=`<p>Send the composition to a display. Escape in an output window leaves fullscreen.</p>${displaysCache.length?`<div class="select-field"><label>Display</label><select id="display-choice">${displaysCache.map(d=>`<option value="${d.id}">${esc(d.label)} · ${d.width} × ${d.height}</option>`).join('')}</select></div>`:'<p class="browser-note">In the browser, the output opens in a new window you can drag to another display.</p>'}${configured?'<p class="browser-note">This composition has an Advanced Output setup. “Open Advanced Output screens” uses its screens and slices.</p>':''}${shares}`;
   const dialog=showDialog('Output',body,[['Cancel','cancel'],['Advanced Output…','advanced'],...(configured?[['Open Advanced Output screens','configured']]:[]),['Open output','open']]);
   for(const [selector,key] of [['#share-spout','spoutOutput'],['#share-ndi','ndiOutput']])$(selector,dialog)?.addEventListener('change',event=>{preferences=writePreferences({...preferences,[key]:event.target.checked});applyCompositionShares();});
@@ -1767,7 +1773,7 @@ async function openOutputEditor(){
     displays:displaysCache.map(item=>({id:String(item.id),label:item.label,width:item.width,height:item.height})),
     layers:project.layers.map(layer=>({id:layer.id,name:layer.name})),groups:(project.groups||[]).map(group=>({id:group.id,name:group.name})),
     outputOptions:outputs.options,onOutputOptions:options=>outputs.setOptions(options),
-    shareKinds:videoShare?['spout','ndi']:[],
+    shareKinds:videoShare?(spoutSupported()?['spout','ndi']:['ndi']):[],
     onChange:next=>{project.advancedOutput=next;changed();if(outputOpen)shareOutputs?.sync(next);if(outputs.active)outputs.sync(next,{displays:displaysCache});else engine.setReadbacks(routedSources(next).map(source=>source.replace(/^(layer|group):/,'')));},
     onClose:()=>{if(!outputs.active)engine.setReadbacks([]);done();}});
   engine.setReadbacks(routedSources(config).map(source=>source.replace(/^(layer|group):/,'')));

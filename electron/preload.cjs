@@ -21,7 +21,7 @@ let video = null, videoError = null;
 function videoBridge() {
   if (video || videoError) return video;
   const path = require('node:path');
-  const candidates = [process.resourcesPath && path.join(process.resourcesPath, 'prism_video.node'), path.join(__dirname, 'native', 'prism_video.node')].filter(Boolean);
+  const candidates = [process.resourcesPath && path.join(process.resourcesPath, 'prism_video.node'), path.join(__dirname, 'native', `${process.platform}-${process.arch}`, 'prism_video.node'), path.join(__dirname, 'native', 'prism_video.node')].filter(Boolean);
   for (const candidate of candidates) {
     try { video = require(candidate); videoError = null; break; }
     catch (error) { videoError = error; }

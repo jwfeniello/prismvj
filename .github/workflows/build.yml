@@ -1,9 +1,9 @@
 name: Build
 
 # Every push to main and every pull request runs the tests and builds the
-# Windows zip (kept as a workflow artifact). Pushing a tag such as v0.2.0
-# also publishes that zip on the Releases page. The tag must match the
-# version in package.json.
+# Windows zip and the Linux tar.gz (kept as workflow artifacts). Pushing a tag
+# such as v0.2.0 also publishes both on the Releases page. The tag must match
+# the version in package.json.
 on:
   push:
     branches: [main]
@@ -101,6 +101,76 @@ jobs:
           compression-level: 0
           retention-days: ${{ startsWith(github.ref, 'refs/tags/v') && 90 || 14 }}
 
+  # Linux x64: builds Ableton Link and NDI for Linux (Spout is Windows-only),
+  # packages the app with a static FFmpeg, and launches the packaged app under
+  # a virtual display before uploading the tar.gz.
+  build-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Restore Electron download cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-
+
+      - name: Check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2; exit 1; fi
+
+      - uses: ./.github/actions/ffmpeg
+
+      - name: Install the virtual display
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
+
+      - run: npm ci
+
+      - name: Build the native modules (Ableton Link; NDI)
+        run: npm run build:link && npm run build:video
+
+      # The WebGL tests use the runner's Google Chrome with SwiftShader.
+      - run: npm test
+        timeout-minutes: 15
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+
+      - name: Package
+        run: npm run package
+
+      - name: Bundle
+        run: node scripts/bundle.mjs
+
+      # Ubuntu 24.04 restricts the user namespaces Chromium's sandbox uses, and a
+      # CI checkout has no setuid-root chrome-sandbox, so the smoke run goes
+      # without the sandbox (the shipped prismvj.sh makes the same choice).
+      - name: Launch the packaged app
+        timeout-minutes: 5
+        env:
+          ELECTRON_DISABLE_SANDBOX: '1'
+          PRISM_EXPECT_NATIVE: '1'
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" node scripts/smoke-package.mjs
+
+      - name: Upload tar.gz
+        uses: actions/upload-artifact@v7
+        with:
+          name: PrismVJ-linux-x64
+          path: release/PrismVJ-*-linux-x64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ startsWith(github.ref, 'refs/tags/v') && 90 || 14 }}
+
   # The Electron end-to-end tests launch the real app. Several depend on the
   # network (ISF Library), free Pro DJ Link ports and real window timing, which
   # hosted runners don't guarantee, so a failure here is reported without
@@ -133,14 +203,15 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: PrismVJ-win-x64
+          pattern: PrismVJ-*
+          merge-multiple: true
           path: dist
 
       - name: Publish the release
@@ -155,4 +226,4 @@ jobs:
             if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
             gh release create "$TAG" --verify-tag --generate-notes --title "PrismVJ $TAG" "${flags[@]}"
           fi
-          gh release upload "$TAG" dist/*.zip --clobber
+          gh release upload "$TAG" dist/*.zip dist/*.tar.gz --clobber

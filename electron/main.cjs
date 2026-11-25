@@ -917,7 +917,9 @@ function setupIPC() {
     return true;
   });
   // NDI's download page for its free runtime (not shipped with PrismVJ).
-  handle('prism:open-ndi-runtime', () => { shell.openExternal('https://ndi.link/NDIRedistV6'); return true; });
+  // Windows and macOS have NDI Runtime installers; on Linux libndi.so.6 comes with the NDI SDK.
+  const ndiRuntimePage = { win32: 'https://ndi.link/NDIRedistV6', darwin: 'https://ndi.link/NDIRedistV6Apple' }[process.platform] || 'https://ndi.video/for-developers/ndi-sdk/';
+  handle('prism:open-ndi-runtime', () => { shell.openExternal(ndiRuntimePage); return true; });
   handle('prism:capture-sources', async () => (await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 0, height: 0 } }))
     .slice(0, 64).map(source => ({ id: source.id, name: source.name, screen: source.id.startsWith('screen:') })));
   handle('prism:capture-select', id => { captureSourceId = typeof id === 'string' ? id.slice(0, 200) : ''; return true; });

@@ -8,3 +8,6 @@ docs/manual*.txt
 native/link/build/
 electron/native/stale-*.node
 native/video/build/
+# Native builds for other platforms come from CI (npm run build:link / build:video)
+electron/native/linux-*/
+electron/native/darwin-*/

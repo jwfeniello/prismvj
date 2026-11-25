@@ -1,6 +1,6 @@
 # PrismVJ
 
-PrismVJ is a free, open-source alternative to Resolume™ Arena for live video performance on Windows. It does as much as possible on the GPU: HAP and DXV movies decode straight to textures, and mixing, effects and projection mapping run in WebGL2 shaders. It plays along with CDJs over Pro DJ Link, runs thousands of community shaders from the ISF library, shares video with other apps over Spout and NDI®, and has Ableton Link, DMX (Art-Net and sACN), MIDI, OSC and SMPTE timecode.
+PrismVJ is a free, open-source alternative to Resolume™ Arena for live video performance on Windows and Linux. It does as much as possible on the GPU: HAP and DXV movies decode straight to textures, and mixing, effects and projection mapping run in WebGL2 shaders. It plays along with CDJs over Pro DJ Link, runs thousands of community shaders from the ISF library, shares video with other apps over Spout and NDI®, and has Ableton Link, DMX (Art-Net and sACN), MIDI, OSC and SMPTE timecode.
 
 ![PrismVJ main window](docs/screenshots/main.png)
 
@@ -59,11 +59,11 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 - A screen can also be a Spout sender or an NDI® source, with its own name and resolution.
 
 ### Sharing video with other apps
-- **Spout output:** the composition goes out as the Spout sender "PrismVJ", for TouchDesigner, Resolume, OBS and other Spout apps on the same computer.
+- **Spout output (Windows):** the composition goes out as the Spout sender "PrismVJ", for TouchDesigner, Resolume, OBS and other Spout apps on the same computer.
 - **NDI® output:** the composition goes out as the NDI source "PrismVJ" on the network.
 - **Spout and NDI inputs:** any Spout sender or NDI source plays in a clip slot like a camera.
 - Switch the composition senders on in the Output dialog. They stay on until you switch them off.
-- NDI needs the free NDI Runtime from [ndi.video](https://ndi.video/) (PrismVJ offers the download link when it is missing). Spout needs nothing extra.
+- NDI needs the free NDI Runtime from [ndi.video](https://ndi.video/) (PrismVJ offers the download link when it is missing). Spout is Windows-only and needs nothing extra.
 
 ![Advanced Output](docs/screenshots/advanced-output.png)
 
@@ -81,13 +81,26 @@ PrismVJ is a free, open-source alternative to Resolume™ Arena for live video p
 
 ## Download
 
-Get `PrismVJ-<version>-win-x64.zip` from the [latest release](https://github.com/jwfeniello/prismvj/releases/latest), extract it anywhere and run `PrismVJ.exe`. FFmpeg is included. Settings and recordings are stored in `%APPDATA%\PrismVJ`. For NDI, also install the [NDI Runtime](https://ndi.link/NDIRedistV6).
+**Windows (x64):** get `PrismVJ-<version>-win-x64.zip` from the [latest release](https://github.com/jwfeniello/prismvj/releases/latest), extract it anywhere and run `PrismVJ.exe`. FFmpeg is included. Settings and recordings are stored in `%APPDATA%\PrismVJ`. For NDI, also install the [NDI Runtime](https://ndi.link/NDIRedistV6).
 
-Builds of every commit to `main` are on the [Actions](https://github.com/jwfeniello/prismvj/actions/workflows/build.yml) page: open a run and download the `PrismVJ-win-x64` artifact (you need to be signed in to GitHub).
+**Linux (x64):** get `PrismVJ-<version>-linux-x64.tar.gz` from the same release, extract it and start `prismvj.sh` in the `PrismVJ-linux-x64` folder:
+
+```sh
+tar -xzf PrismVJ-<version>-linux-x64.tar.gz
+./PrismVJ-linux-x64/prismvj.sh
+```
+
+FFmpeg is included. Settings and recordings are stored in `~/.config/PrismVJ`. Ableton Link, NDI, DMX, MIDI, OSC, Pro DJ Link and the Converter work as on Windows; Spout is Windows-only. NDI needs `libndi.so.6` from the [NDI SDK for Linux](https://ndi.video/for-developers/ndi-sdk/), either on the library path or in the folder named by `NDI_RUNTIME_DIR_V6`. Where the distribution restricts unprivileged user namespaces (Ubuntu 24.04 and later), `prismvj.sh` starts PrismVJ without Chromium's sandbox. To keep the sandbox, run this once in the `PrismVJ-linux-x64` folder:
+
+```sh
+sudo chown root:root chrome-sandbox && sudo chmod 4755 chrome-sandbox
+```
+
+Builds of every commit to `main` are on the [Actions](https://github.com/jwfeniello/prismvj/actions/workflows/build.yml) page: open a run and download the `PrismVJ-win-x64` or `PrismVJ-linux-x64` artifact (you need to be signed in to GitHub).
 
 ## Building from source
 
-Requires Node.js 22+ and npm.
+Requires Node.js 22+ and npm. The native modules need Python plus the Visual Studio C++ build tools on Windows, or `make` and `g++` on Linux. The Windows builds are checked in; on Linux run `npm run build:link` and `npm run build:video` before packaging.
 
 ```powershell
 npm ci
@@ -97,12 +110,12 @@ npm start
 
 | Command | Result |
 | --- | --- |
-| `npm run package` | Packaged app in `release/prismvj/PrismVJ-win32-x64` |
-| `npm run release` | Package plus the all-in-one release zip in `release/` (includes FFmpeg from `C:\ffmpeg\bin`, `PATH` or `PRISM_FFMPEG_PATH`) |
-| `npm run build:link` | Rebuild the Ableton Link module (needs Visual Studio C++ build tools and Python) |
-| `npm run build:video` | Rebuild the Spout and NDI module (same requirements) |
+| `npm run package` | Packaged app in `release/prismvj/PrismVJ-<platform>-x64` |
+| `npm run release` | Package plus the all-in-one release archive in `release/`: a zip on Windows (FFmpeg from `C:\ffmpeg\bin`, `PATH` or `PRISM_FFMPEG_PATH`), a tar.gz on Linux (FFmpeg from `PRISM_FFMPEG_PATH`, ideally a static build) |
+| `npm run build:link` | Rebuild the Ableton Link module |
+| `npm run build:video` | Rebuild the video sharing module (Spout and NDI on Windows, NDI on Linux) |
 
-GitHub Actions builds the same zip for every push and pull request. Pushing a tag that matches the version in `package.json` (for example `v0.1.0`) publishes it as a release.
+GitHub Actions builds the Windows zip and the Linux tar.gz for every push and pull request. Pushing a tag that matches the version in `package.json` (for example `v0.1.0`) publishes both as a release.
 
 ## Keyboard
 

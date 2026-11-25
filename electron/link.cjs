@@ -11,7 +11,7 @@ let native = null, loadError = null, timer = null;
 // development checkout loads it from electron/native.
 function bridge() {
   if (native || loadError) return native;
-  const candidates = [process.resourcesPath && path.join(process.resourcesPath, 'prism_link.node'), path.join(__dirname, 'native', 'prism_link.node')].filter(Boolean);
+  const candidates = [process.resourcesPath && path.join(process.resourcesPath, 'prism_link.node'), path.join(__dirname, 'native', `${process.platform}-${process.arch}`, 'prism_link.node'), path.join(__dirname, 'native', 'prism_link.node')].filter(Boolean);
   for (const candidate of candidates) {
     try { native = require(candidate); loadError = null; break; }
     catch (error) { loadError = error; }

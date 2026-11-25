@@ -1,7 +1,9 @@
-// Packages PrismVJ for Windows. Uses electron-packager's API directly:
-// npm runs scripts through cmd.exe, which strips the "^" anchors that CLI
+// Packages PrismVJ for this platform (Windows or Linux; PRISM_PLATFORM and
+// PRISM_ARCH override it). Uses electron-packager's API directly: npm runs
+// scripts through cmd.exe on Windows, which strips the "^" anchors that CLI
 // --ignore patterns need. The native modules (Ableton Link; Spout and NDI)
-// ship beside app.asar.
+// ship beside app.asar, built for the target platform by npm run build:link
+// and build:video (Windows copies are checked in under electron/native).
 import { packager } from '@electron/packager';
 import { existsSync, mkdirSync, renameSync } from 'node:fs';
 import path from 'node:path';
@@ -11,7 +13,10 @@ const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const out = process.argv[2] || 'release/prismvj';
 const tmpdir = path.resolve(root, '..', 'resolume-data', 'packager-tmp');
 mkdirSync(tmpdir, { recursive: true });
-const natives = ['prism_link', 'prism_video'].map(name => path.join(root, 'electron', 'native', `${name}.node`));
+const platform = process.env.PRISM_PLATFORM || process.platform;
+const arch = process.env.PRISM_ARCH || process.arch;
+const nativeDir = path.join(root, 'electron', 'native', ...(platform === 'win32' ? [] : [`${platform}-${arch}`]));
+const natives = ['prism_link', 'prism_video'].map(name => path.join(nativeDir, `${name}.node`));
 const shipped = natives.filter(file => existsSync(file));
 
 // Antivirus scanners briefly lock the freshly written exe, which makes the
@@ -29,10 +34,10 @@ async function finishMove(error) {
 const RUNTIME = new Set(['package.json', 'electron', 'dist', 'src', 'node_modules']);
 
 const paths = await packager({
-  dir: root, name: 'PrismVJ', platform: 'win32', arch: 'x64', out: path.join(root, out), overwrite: true, tmpdir,
+  dir: root, name: 'PrismVJ', platform, arch, out: path.join(root, out), overwrite: true, tmpdir,
   // Ship only what the app loads at runtime; everything else in the folder stays out.
   ignore: file => !!file && (!RUNTIME.has(file.split('/')[1]) || file === '/electron/native' || file.startsWith('/electron/native/')),
   extraResource: shipped,
 }).catch(finishMove);
 const missing = natives.filter(file => !shipped.includes(file)).map(file => path.basename(file));
-console.log(`Wrote new app to: ${path.relative(root, paths[0])}${missing.length ? ` (not built: ${missing.join(', ')})` : ' (with Ableton Link, Spout and NDI)'}`);
+console.log(`Wrote new app to: ${path.relative(root, paths[0])}${missing.length ? ` (not built: ${missing.join(', ')})` : ` (with Ableton Link, ${platform === 'win32' ? 'Spout and NDI' : 'NDI'})`}`);
