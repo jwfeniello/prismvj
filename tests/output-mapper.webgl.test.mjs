@@ -453,6 +453,115 @@ test('screen delay shows the frame from delay ms ago and keeps zero delay copy-f
   await page.close();
 });
 
+test('advanced output editor: group rotation, bezier tangents, nudge scope, polygon match and overlay redraws', { skip: !browserAvailable }, async () => {
+  const page = await setup();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const result = await page.evaluate(async () => {
+    const { openAdvancedOutput } = await import('/output/editor.js');
+    const pageErrors = [];
+    window.addEventListener('error', event => pageErrors.push(event.message));
+    const host = document.createElement('div');
+    host.style.cssText = 'position:fixed;inset:0;z-index:5';
+    document.body.append(host);
+    const first = createScreen({ id: 'scr1', slices: [
+      { id: 'a', name: 'A', input: { rect: { x: 10, y: 10, width: 40, height: 20 } }, output: { warp: { mode: 'bezier', cols: 3, rows: 3 } } },
+      { id: 'b', name: 'B', input: { rect: { x: 60, y: 30, width: 40, height: 40 } } },
+      { id: 'p', name: 'P', type: 'polygon', input: { points: [{ x: 20, y: 50 }, { x: 60, y: 50 }, { x: 40, y: 80 }] }, output: { points: [{ x: 100, y: 10 }, { x: 150, y: 10 }, { x: 120, y: 40 }] } },
+    ] }, ctx);
+    const second = createScreen({ id: 'scr2', slices: [{ id: 'c', name: 'C', input: { rect: { x: 0, y: 0, width: 50, height: 50 } } }] }, ctx);
+    const api = openAdvancedOutput({ host, config: { version: 1, screens: [first, second] }, compositionCanvas: src, compositionSize: { width: 160, height: 90 }, storage: null });
+    const root = host.querySelector('#ao-root');
+    for (let i = 0; i < 100 && getComputedStyle(root).display !== 'grid'; i++) await new Promise(resolve => setTimeout(resolve, 20));
+    const frames = n => new Promise(resolve => { const step = () => n-- > 0 ? requestAnimationFrame(step) : resolve(); step(); });
+    const overlay = host.querySelector('#ao-stage-overlay');
+    const pointer = (type, x, y, extra = {}) => {
+      const p = api.contentToClient(x, y);
+      overlay.dispatchEvent(new PointerEvent(type, { clientX: p.x, clientY: p.y, button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 1, bubbles: true, ...extra }));
+    };
+    const dragContent = (from, to) => { pointer('pointerdown', ...from); pointer('pointermove', (from[0] + to[0]) / 2, (from[1] + to[1]) / 2); pointer('pointermove', ...to); pointer('pointerup', ...to); };
+    const slice = id => api.getConfig().screens.flatMap(s => s.slices).find(s => s.id === id);
+    const field = path => host.querySelector(`[data-path="${path}"]`);
+    const setField = (path, value) => { const input = field(path); input.value = value; input.dispatchEvent(new Event('change', { bubbles: true })); };
+    const key = name => window.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true }));
+
+    // 1. Group rotation: the Rotate box shows the angle, 0 turns it back, + is relative, size stays.
+    api.select(['a', 'b']);
+    const original = ['a', 'b'].map(id => slice(id).input);
+    const widthBefore = field('selection.width').value;
+    setField('selection.rotation', '30');
+    const shown30 = field('selection.rotation').value, width30 = field('selection.width').value, rotations30 = ['a', 'b'].map(id => slice(id).input.rotation);
+    setField('selection.rotation', '+15');
+    const shown45 = field('selection.rotation').value, rotations45 = ['a', 'b'].map(id => slice(id).input.rotation);
+    setField('selection.rotation', '0');
+    const shown0 = field('selection.rotation').value, back = ['a', 'b'].map(id => slice(id).input);
+
+    // 2. Arrow keys move only the selection on the current screen.
+    api.select(['a']); api.select(['c']);
+    const cBefore = slice('c').input.rect.x, aBefore = slice('a').input.rect.x;
+    host.querySelector('[data-item="a"]').dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: true }));
+    const selection = api.selection;
+    api.select(['a', 'c']);
+    const screenNow = api.getConfig().screens.find(s => s.slices.some(x => x.id === 'c')).id;
+    key('ArrowRight');
+    const nudged = { a: slice('a').input.rect.x - aBefore, c: slice('c').input.rect.x - cBefore };
+
+    // 3. Match output to input keeps a polygon's output corners in sync.
+    api.select(['p', 'b']);
+    api.setTab('output');
+    host.querySelector('[data-action="match-output-to-input"]').click();
+    const polygon = slice('p');
+
+    // 4. Bezier warp: tangent handles on the active point; either end sets the axis tangent.
+    api.select(['a']);
+    host.querySelector('[data-mode="points"]').click();
+    const a = slice('a'), H = quadHomography(a.output.corners);
+    const at = (x, y) => applyHomography(H, x, y);
+    const centre = a.output.warp.points[4], centreStage = at(centre.x, centre.y);
+    pointer('pointerdown', centreStage.x, centreStage.y); pointer('pointerup', centreStage.x, centreStage.y);
+    const tangents = warpTangents(a.output.warp);
+    const plus = at(centre.x + tangents.hu[4].x, centre.y + tangents.hu[4].y);
+    dragContent([plus.x, plus.y], [plus.x + 6, plus.y + 4]);
+    const afterPlus = slice('a').output.warp.points[4];
+    const minus = at(centre.x - afterPlus.hu.x, centre.y - afterPlus.hu.y);
+    dragContent([minus.x, minus.y], [minus.x - 3, minus.y]);
+    const afterMinus = slice('a').output.warp.points[4];
+    const target = applyHomography(invertHomography(H), minus.x - 3, minus.y), expectedMinus = { x: -(target.x - afterPlus.x), y: -(target.y - afterPlus.y) };
+    const warpRender = slice('a').output.warp;
+
+    // 5. The output overlay redraws when only the selection changes.
+    await frames(3);
+    const before = overlay.toDataURL();
+    api.select(['b']);
+    await frames(3);
+    const after = overlay.toDataURL();
+    api.close();
+    return { original, widthBefore, shown30, width30, rotations30, shown45, rotations45, shown0, back, selection, screenNow, nudged, polygon, afterPlus, afterMinus, expectedMinus, warpRender, overlayChanged: before !== after, pageErrors };
+  });
+  const near = (actual, expected, label, tolerance = 0.01) => assert.ok(Math.abs(actual - expected) <= tolerance, `${label}: ${actual} vs ${expected}`);
+  assert.equal(result.shown30, '30', 'the Rotate box shows the group angle');
+  assert.equal(result.width30, result.widthBefore, 'the group frame turns with the selection instead of growing');
+  for (const rotation of result.rotations30) near(rotation, 30, 'each slice turns 30 degrees');
+  assert.equal(result.shown45, '45', '+15 adds to the current angle');
+  for (const rotation of result.rotations45) near(rotation, 45, 'each slice turns to 45 degrees');
+  assert.equal(result.shown0, '0', 'typing 0 shows 0');
+  result.back.forEach((input, index) => {
+    near(input.rotation, 0, 'typing 0 turns the group back');
+    for (const k of ['x', 'y', 'width', 'height']) near(input.rect[k], result.original[index].rect[k], `slice ${index} ${k} returns`, 0.05);
+  });
+  assert.equal(result.screenNow, 'scr2');
+  assert.deepEqual(result.nudged, { a: 0, c: 1 }, 'the arrow key moves only the slice on the current screen');
+  const xs = result.polygon.output.points.map(p => p.x), ys = result.polygon.output.points.map(p => p.y);
+  const expectedCorners = [[Math.min(...xs), Math.min(...ys)], [Math.max(...xs), Math.min(...ys)], [Math.max(...xs), Math.max(...ys)], [Math.min(...xs), Math.max(...ys)]];
+  assert.deepEqual(result.polygon.output.corners.map(p => [p.x, p.y]), expectedCorners, 'polygon output corners follow its matched points');
+  assert.ok(result.afterPlus.hu, 'dragging the + tangent handle stores an explicit tangent');
+  assert.equal(result.afterPlus.hv, undefined, 'the other axis keeps its automatic tangent');
+  near(result.afterMinus.hu.x, result.expectedMinus.x, 'dragging the - end sets the same tangent, mirrored', 0.02);
+  near(result.afterMinus.hu.y, result.expectedMinus.y, 'dragging the - end sets the same tangent, mirrored', 0.02);
+  assert.ok(result.afterMinus.hu.x > result.afterPlus.hu.x, 'pulling the - end outward lengthens the tangent');
+  assert.ok(result.overlayChanged, 'selecting another slice redraws the output overlay');
+  assert.deepEqual(result.pageErrors, []);
+});
+
 test('advanced output editor: multi-select scale/rotate, selection fields, match pair and list drag reordering', { skip: !browserAvailable }, async () => {
   const page = await setup();
   await page.setViewportSize({ width: 1280, height: 800 });

@@ -3,7 +3,7 @@
 // a properties panel, presets, import/export and undo.
 import { evaluateExpression } from '../expression.js';
 import { normalizeOutputConfig, createScreen, createSlice, createPolygonSlice, createMask, duplicateSlice, shapePoints, rectCorners, boundsOf, identityWarpPoints, uid, OUTPUT_LIMITS } from './output-model.js';
-import { quadHomography, applyHomography, invertHomography, createWarpEvaluator, sliceOutputOutline, sliceInputOutline, pointInPolygon, polygonBounds, flattenPath, snapValue, isSimplePolygon } from './geometry.js';
+import { quadHomography, applyHomography, invertHomography, createWarpEvaluator, warpTangents, sliceOutputOutline, sliceInputOutline, pointInPolygon, polygonBounds, flattenPath, snapValue, isSimplePolygon } from './geometry.js';
 import { OutputMapper } from './mapper.js';
 
 export const PRESET_KEY = 'prism-output-presets';
@@ -45,6 +45,12 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   let tab = 'input', mode = 'transform', snapping = true, zoom = 1, pan = { x: 0, y: 0 };
   let drag = null, drawing = null, activePoint = null, spaceHeld = false, renaming = null, closed = false, raf = 0, menu = null, listDrag = null;
   let compCanvas = compositionCanvas || null;
+  // A multi-selection's frame keeps the angle it was turned to until the
+  // selection or stage changes, so the Rotate box shows it and 0 turns it back.
+  let groupTurn = { key: '', deg: 0 };
+  // Stage rectangle, re-measured on resize and at the start of pointer input
+  // rather than on every animation frame.
+  let stageRect = null, revision = 0, drawnSignature = '', drawnAt = 0;
   const options = { testCard: false, identify: false, showFPS: false, showInfo: false, ...initialOptions };
   const undoStack = [], redoStack = [];
   const listeners = [];
@@ -145,6 +151,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   }
   function restore(json) {
     config = normalizeOutputConfig(JSON.parse(json), comp);
+    groupTurn = { key: '', deg: 0 };
     if (!config.screens.some(s => s.id === screenId)) screenId = config.screens[0]?.id;
     selected = new Set([...selected].filter(id => find(id)));
     activePoint = null;
@@ -154,6 +161,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   function redo() { if (!redoStack.length) return; undoStack.push(JSON.stringify(config)); restore(redoStack.pop()); }
 
   function emit() {
+    revision++;
     mapper?.invalidate();
     try { onChange(clone(config)); } catch (error) { hint.textContent = `Output change failed: ${error.message}`; }
   }
@@ -343,7 +351,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   }
   function matchInputShape(slice, screen) {
     const fx = screen.device.width / comp.compositionWidth, fy = screen.device.height / comp.compositionHeight;
-    if (slice.type === 'polygon') { slice.output.points = slice.input.points.map(p => ({ x: p.x * fx, y: p.y * fy })); return; }
+    if (slice.type === 'polygon') { slice.output.points = slice.input.points.map(p => ({ x: p.x * fx, y: p.y * fy })); slice.output.corners = rectCorners(boundsOf(slice.output.points)); return; }
     slice.output.corners = rectCorners(slice.input.rect).map(p => ({ x: p.x * fx, y: p.y * fy }));
     const w = slice.output.warp;
     slice.output.warp = { mode: w.mode, cols: w.cols, rows: w.rows, points: identityWarpPoints(w.cols, w.rows) };
@@ -447,8 +455,9 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
 
   // ---- Stage geometry ---------------------------------------------------------
   const contentSize = () => tab === 'input' ? { width: comp.compositionWidth, height: comp.compositionHeight } : { width: currentScreen().device.width, height: currentScreen().device.height };
+  function measure() { stageRect = stage.getBoundingClientRect(); return stageRect; }
   function view() {
-    const rect = stage.getBoundingClientRect(), size = contentSize(), pad = 28;
+    const rect = stageRect || measure(), size = contentSize(), pad = 28;
     const fit = Math.max(0.01, Math.min((rect.width - pad * 2) / size.width, (rect.height - pad * 2) / size.height));
     const scale = fit * zoom;
     return { scale, ox: (rect.width - size.width * scale) / 2 + pan.x, oy: (rect.height - size.height * scale) / 2 + pan.y, rect, size };
@@ -516,14 +525,23 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
 
   // Multi-selection: the items transformable on the current stage and their shared bounding box.
   const groupItems = () => selectedItems().filter(f => f.screen.id === currentScreen().id && (tab === 'output' || f.kind === 'slice'));
+  const groupKey = items => `${tab}|${currentScreen().id}|${items.map(f => f.item.id).sort().join(',')}`;
+  const groupDegrees = items => groupTurn.key === groupKey(items) ? groupTurn.deg : 0;
+  function setGroupDegrees(items, deg) {
+    const turned = ((deg + 180) % 360 + 360) % 360 - 180;
+    groupTurn = { key: groupKey(items), deg: round(turned, 4) || 0 };
+  }
+  // The selection's bounding box, aligned to the group's current angle.
   function groupFrame(items) {
-    const b = polygonBounds(items.flatMap(outlineOf));
-    return { cx: b.x + b.width / 2, cy: b.y + b.height / 2, w: b.width, h: b.height, rot: 0 };
+    const rot = groupDegrees(items) * Math.PI / 180;
+    const b = polygonBounds(items.flatMap(outlineOf).map(p => rotate(p, -rot)));
+    const c = rotate({ x: b.x + b.width / 2, y: b.y + b.height / 2 }, rot);
+    return { cx: c.x, cy: c.y, w: b.width, h: b.height, rot };
   }
   function transformGroup(items, f0, f1) { for (const found of items) applyAffine(found, { ...found, item: clone(found.item) }, f0, f1, true); }
   function transformDrag(f1) {
     drag.current = f1;
-    if (drag.members) for (const m of drag.members) applyAffine(m.found, { ...m.found, item: m.snapshot }, drag.frame, f1, true);
+    if (drag.members) { for (const m of drag.members) applyAffine(m.found, { ...m.found, item: m.snapshot }, drag.frame, f1, true); setGroupDegrees(drag.members.map(m => m.found), f1.rot * 180 / Math.PI); }
     else applyAffine(drag.found, { ...drag.found, item: drag.snapshot }, drag.frame, f1);
   }
 
@@ -557,7 +575,17 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     if (slice.type === 'polygon') { pathHandles(slice.output.points, 'opoly', false); return handles; }
     slice.output.corners.forEach((p, index) => handles.push({ kind: 'corner', index, x: p.x, y: p.y, big: true }));
     const warp = slice.output.warp, H = quadHomography(slice.output.corners);
-    if (H && (warp.mode === 'grid' || warp.mode === 'bezier')) warp.points.forEach((p, index) => { const q = applyHomography(H, p.x, p.y); handles.push({ kind: 'warp', index, x: q.x, y: q.y }); });
+    if (H && (warp.mode === 'grid' || warp.mode === 'bezier')) {
+      warp.points.forEach((p, index) => { const q = applyHomography(H, p.x, p.y); handles.push({ kind: 'warp', index, x: q.x, y: q.y }); });
+      // Bezier grids: tangent handles on the active grid point, at point ± tangent along each axis.
+      if (warp.mode === 'bezier' && activePoint?.kind === 'warp' && warp.points[activePoint.index]) {
+        const index = activePoint.index, p = warp.points[index], { hu, hv } = warpTangents(warp), anchor = applyHomography(H, p.x, p.y);
+        for (const [handle, t, sign] of [['hu+', hu[index], 1], ['hu-', hu[index], -1], ['hv+', hv[index], 1], ['hv-', hv[index], -1]]) {
+          const q = applyHomography(H, p.x + sign * t.x, p.y + sign * t.y);
+          handles.push({ kind: 'warp', index, handle, x: q.x, y: q.y, anchor });
+        }
+      }
+    }
     return handles;
   }
   function pathFor(kind, found) {
@@ -571,6 +599,12 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       const H = quadHomography(slice.output.corners), inv = H && invertHomography(H);
       if (!inv) return;
       const q = applyHomography(inv, p.x, p.y), old = slice.output.warp.points[h.index];
+      if (h.handle) {
+        // One tangent per axis: either end sets it and the other end mirrors.
+        const sign = h.handle.endsWith('-') ? -1 : 1, key = h.handle.slice(0, 2);
+        slice.output.warp.points[h.index] = { ...old, [key]: { x: clamp(sign * (q.x - old.x), -4, 4), y: clamp(sign * (q.y - old.y), -4, 4) } };
+        return;
+      }
       slice.output.warp.points[h.index] = { ...old, x: clamp(q.x, -4, 5), y: clamp(q.y, -4, 5) };
       return;
     }
@@ -646,6 +680,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   function onPointerDown(event) {
     if (closed) return;
     closeMenu();
+    measure();
     overlay.focus({ preventScroll: true });
     const v = view(), p = toContent(v, event.clientX, event.clientY);
     try { overlay.setPointerCapture(event.pointerId); } catch { /* synthetic events have no capturable pointer */ }
@@ -731,6 +766,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     drag = null;
   }
   function onDoubleClick(event) {
+    measure();
     const v = view(), p = toContent(v, event.clientX, event.clientY);
     if (drawing) { finishDrawing(); return; }
     const found = primary();
@@ -741,6 +777,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
     for (const kind of kinds) if (insertPoint(found, kind, p, 8 / v.scale)) { changed(true); return; }
   }
   function onWheel(event) {
+    measure();
     event.preventDefault();
     const before = toContent(view(), event.clientX, event.clientY);
     zoom = clamp(zoom * (event.deltaY < 0 ? 1.15 : 1 / 1.15), 0.2, 20);
@@ -755,8 +792,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       const h = pointHandles().find(x => x.kind === activePoint.kind && x.index === activePoint.index && x.handle === activePoint.handle);
       if (h) setHandle(found, h, { x: h.x + dx, y: h.y + dy }, true);
     } else {
-      for (const item of selectedItems()) {
-        if (tab === 'input' && item.kind === 'mask') continue;
+      for (const item of groupItems()) {
         const f = frameOf(item);
         applyAffine(item, { ...item, item: clone(item.item) }, f, { ...f, cx: f.cx + dx, cy: f.cy + dy });
       }
@@ -791,18 +827,12 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   function draw() {
     const v = view(), dpr = win.devicePixelRatio || 1;
     const w = Math.max(1, Math.round(v.rect.width * dpr)), h = Math.max(1, Math.round(v.rect.height * dpr));
-    if (overlay.width !== w || overlay.height !== h) { overlay.width = w; overlay.height = h; }
-    const ctx = overlay.getContext('2d');
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const resized = overlay.width !== w || overlay.height !== h;
+    if (resized) { overlay.width = w; overlay.height = h; }
     const screen = currentScreen(), s = v.scale, size = v.size;
     const box = { x: v.ox, y: v.oy, w: size.width * s, h: size.height * s };
-    if (tab === 'input') {
-      if (glCanvas.style.display !== 'none') glCanvas.style.display = 'none';
-      ctx.fillStyle = '#000'; ctx.fillRect(box.x, box.y, box.w, box.h);
-      if (compCanvas) try { ctx.imageSmoothingEnabled = s < 1; ctx.drawImage(compCanvas, box.x, box.y, box.w, box.h); } catch { /* source not ready */ }
-    } else if (mapper) {
+    if (tab === 'output' && mapper) {
+      // The live output preview renders every frame on its own canvas.
       const style = glCanvas.style, px = `${Math.round(box.x)}px`, py = `${Math.round(box.y)}px`, pw = `${Math.round(box.w)}px`, ph = `${Math.round(box.h)}px`;
       if (style.display) style.display = '';
       if (style.left !== px) style.left = px;
@@ -811,6 +841,22 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       if (style.height !== ph) style.height = ph;
       mapper.resize(Math.max(1, Math.min(size.width, Math.round(box.w * dpr))), Math.max(1, Math.min(size.height, Math.round(box.h * dpr))));
       mapper.render(screen, { testCard: options.testCard });
+    }
+    if (tab === 'output') {
+      const signature = [revision, mode, screenId, [...selected].join(','), activePoint ? `${activePoint.kind}:${activePoint.index}:${activePoint.handle || ''}` : '',
+        zoom, pan.x, pan.y, w, h, drawing?.points.length || 0, drag?.type === 'marquee' ? `${drag.end.x},${drag.end.y}` : '', drag?.current ? JSON.stringify(drag.current) : '', options.testCard].join('|');
+      const now = win.performance?.now?.() ?? Date.now();
+      if (!resized && signature === drawnSignature && now - drawnAt < 500) return;
+      drawnSignature = signature; drawnAt = now;
+    } else drawnSignature = '';
+    const ctx = overlay.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (tab === 'input') {
+      if (glCanvas.style.display !== 'none') glCanvas.style.display = 'none';
+      ctx.fillStyle = '#000'; ctx.fillRect(box.x, box.y, box.w, box.h);
+      if (compCanvas) try { ctx.imageSmoothingEnabled = s < 1; ctx.drawImage(compCanvas, box.x, box.y, box.w, box.h); } catch { /* source not ready */ }
     }
     ctx.strokeStyle = '#5a5a5a'; ctx.lineWidth = 1; ctx.strokeRect(box.x - 0.5, box.y - 0.5, box.w + 1, box.h + 1);
     ctx.fillStyle = '#929292'; ctx.font = '10px Segoe UI, Arial, sans-serif'; ctx.textBaseline = 'bottom';
@@ -1176,7 +1222,7 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   // Multi-selection: X/Y/W/H edit the selection's bounding box on the current stage;
   // Rotate turns the whole selection around its centre by the typed angle.
   function selectionPanel() {
-    const read = (f, key) => key === 'x' ? f.cx - f.w / 2 : key === 'y' ? f.cy - f.h / 2 : key === 'width' ? f.w : key === 'height' ? f.h : 0;
+    const read = (f, key) => key === 'x' ? f.cx - f.w / 2 : key === 'y' ? f.cy - f.h / 2 : key === 'width' ? f.w : key === 'height' ? f.h : f.rot * 180 / Math.PI;
     const boxInput = key => {
       const input = el('input', { type: 'text', inputMode: 'decimal', dataset: { path: `selection.${key}` }, title: key === 'rotation' ? 'Rotate the selection around its centre (degrees)' : undefined });
       const value = () => { const items = groupItems(); return items.length ? String(round(read(groupFrame(items), key), 2)) : ''; };
@@ -1192,7 +1238,9 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
         else if (key === 'width') { f1.w = Math.max(1, next); f1.cx = f0.cx - f0.w / 2 + f1.w / 2; }
         else if (key === 'height') { f1.h = Math.max(1, next); f1.cy = f0.cy - f0.h / 2 + f1.h / 2; }
         else f1.rot = clamp(next, -36000, 36000) * Math.PI / 180;
-        checkpoint(); transformGroup(items, f0, f1); changed(false);
+        checkpoint(); transformGroup(items, f0, f1);
+        if (key === 'rotation') setGroupDegrees(items, f1.rot * 180 / Math.PI);
+        changed(false);
         input.value = value();
       });
       blurOnEnter(input); input.syncValue();
@@ -1239,12 +1287,16 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
   listen(win, 'keyup', onKeyUp);
   listen(doc, 'pointerdown', event => { if (menu && !menu.contains(event.target)) closeMenu(); });
   renderPresets(); renderTree(); renderProps(); syncToolbar();
+  const resizeObserver = win.ResizeObserver ? new win.ResizeObserver(() => measure()) : null;
+  resizeObserver?.observe(stage);
+  listen(win, 'resize', measure);
   raf = win.requestAnimationFrame(loop);
 
   function close(fromUser = false) {
     if (closed) return;
     closed = true;
     win.cancelAnimationFrame(raf);
+    resizeObserver?.disconnect();
     for (const unlisten of listeners.splice(0)) unlisten();
     closeMenu();
     mapper?.dispose(); mapper = null;
@@ -1267,12 +1319,12 @@ export function openAdvancedOutput({ host, config: initialConfig, compositionCan
       checkpoint(); config = normalized;
       if (!config.screens.some(s => s.id === screenId)) screenId = config.screens[0].id;
       selected = new Set([...selected].filter(id => find(id)));
-      mapper?.invalidate(); renderTree(); renderProps();
+      revision++; mapper?.invalidate(); renderTree(); renderProps();
     },
     getOutputOptions: () => ({ ...options }),
     setTab, select: ids => select(ids), undo, redo,
     // Stage content coordinates → client coordinates (integration/testing helper).
-    contentToClient(x, y) { const v = view(), p = toStage(v, { x, y }); return { x: v.rect.left + p.x, y: v.rect.top + p.y }; },
+    contentToClient(x, y) { measure(); const v = view(), p = toStage(v, { x, y }); return { x: v.rect.left + p.x, y: v.rect.top + p.y }; },
     get tab() { return tab; },
     get selection() { return [...selected]; },
   };

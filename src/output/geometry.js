@@ -71,6 +71,27 @@ export function invertHomography(H) {
 // ---- Warp grids (unit-square space) ------------------------------------
 const bern = t => { const s = 1 - t; return [s * s * s, 3 * s * s * t, 3 * s * t * t, t * t * t]; };
 
+// Bezier warp tangents per grid point, along the grid's u and v axes: the
+// point's own `hu`/`hv` handle when it has one, otherwise a Catmull-Rom
+// style tangent from its neighbours. Patch control points are point ± tangent.
+export function warpTangents(warp) {
+  const { cols, rows, points } = warp;
+  const P = (i, j) => points[j * cols + i];
+  const tangent = (i, j, axis) => {
+    const p = P(i, j), handle = axis === 'u' ? p.hu : p.hv;
+    if (handle) return handle;
+    const count = axis === 'u' ? cols : rows, k = axis === 'u' ? i : j;
+    const at = n => axis === 'u' ? P(n, j) : P(i, n);
+    const prev = at(Math.max(0, k - 1)), next = at(Math.min(count - 1, k + 1));
+    const span = (Math.min(count - 1, k + 1) - Math.max(0, k - 1)) * 3;
+    return { x: (next.x - prev.x) / span, y: (next.y - prev.y) / span };
+  };
+  return {
+    hu: points.map((_, n) => tangent(n % cols, Math.floor(n / cols), 'u')),
+    hv: points.map((_, n) => tangent(n % cols, Math.floor(n / cols), 'v')),
+  };
+}
+
 // Returns (u, v) => {x, y}. Grid = bilinear cells, bezier = bicubic patches whose
 // tangents come from explicit `hu`/`hv` handles or Catmull-Rom style neighbours.
 export function createWarpEvaluator(warp) {
@@ -84,17 +105,7 @@ export function createWarpEvaluator(warp) {
     const a = P(i, j), b = P(i + 1, j), c = P(i, j + 1), d = P(i + 1, j + 1);
     return { x: (1 - t) * ((1 - s) * a.x + s * b.x) + t * ((1 - s) * c.x + s * d.x), y: (1 - t) * ((1 - s) * a.y + s * b.y) + t * ((1 - s) * c.y + s * d.y) };
   };
-  const tangent = (i, j, axis) => {
-    const p = P(i, j), handle = axis === 'u' ? p.hu : p.hv;
-    if (handle) return handle;
-    const count = axis === 'u' ? cols : rows, k = axis === 'u' ? i : j;
-    const at = n => axis === 'u' ? P(n, j) : P(i, n);
-    const prev = at(Math.max(0, k - 1)), next = at(Math.min(count - 1, k + 1));
-    const span = (Math.min(count - 1, k + 1) - Math.max(0, k - 1)) * 3;
-    return { x: (next.x - prev.x) / span, y: (next.y - prev.y) / span };
-  };
-  const hu = points.map((_, n) => tangent(n % cols, Math.floor(n / cols), 'u'));
-  const hv = points.map((_, n) => tangent(n % cols, Math.floor(n / cols), 'v'));
+  const { hu, hv } = warpTangents(warp);
   const patches = new Map();
   const patch = (i, j) => {
     const key = j * cols + i;
