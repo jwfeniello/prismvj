@@ -86,7 +86,7 @@ test('16 columns scroll with aligned headers and files remain usable at 1360 by 
       const head = document.querySelector('.column-heads button:nth-child(5)').getBoundingClientRect();
       const clip = document.querySelector('.clips button:nth-child(5)').getBoundingClientRect();
       const list = document.querySelector('.file-entries'), number = document.querySelector('.number-value');
-      return { horizontal: bank.scrollWidth > bank.clientWidth, aligned: Math.abs(head.x-clip.x), layerLeft: document.querySelector('.layer-head').getBoundingClientRect().x, listHeight: list.clientHeight, scrolling: list.scrollHeight > list.clientHeight, noOverflow: document.documentElement.scrollWidth === 1360, numberWidth: number.clientWidth };
+      return { horizontal: bank.scrollWidth > bank.clientWidth, aligned: Math.abs(head.x-clip.x), layerLeft: document.querySelector('.layer-head').getBoundingClientRect().x, listHeight: list.clientHeight, scrolling: list.scrollHeight > list.clientHeight, noOverflow: document.documentElement.scrollWidth === 1360, numberWidth: number.offsetWidth };
     });
     assert.equal(result.horizontal, true);
     assert.ok(result.aligned < 1, JSON.stringify(result));
@@ -94,6 +94,7 @@ test('16 columns scroll with aligned headers and files remain usable at 1360 by 
     assert.ok(result.listHeight > 120, JSON.stringify(result));
     assert.equal(result.scrolling, true);
     assert.equal(result.noOverflow, true);
-    assert.ok(result.numberWidth >= 60);
+    // The rendered number box (offsetWidth: newer Chrome leaves an input's padding out of clientWidth).
+    assert.ok(result.numberWidth >= 60, JSON.stringify(result));
   } finally { await page.close(); }
 });
